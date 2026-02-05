@@ -104,10 +104,11 @@ def eval_libero(args: Args) -> None:
         # Initialize LIBERO environment and task description
         env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
 
-        # Start episodes
         task_episodes, task_successes = 0, 0
         for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
-            logging.info(f"\nTask: {task_description}")
+            logging.info(
+                f"\nTask id: {task_id}, episode: {episode_idx}, description: {task_description}"
+            )
 
             # Reset environment
             client_model.reset(task_description=task_description)  # Reset the client connection
@@ -168,6 +169,10 @@ def eval_libero(args: Args) -> None:
                     "image": [observation["observation.primary"][0], observation["observation.wrist_image"][0]],
                     "lang": observation["instruction"][0],
                 }
+
+                logging.info(
+                    f"Sending to policy server | task_id={task_id}, episode={episode_idx}, lang='{example_dict['lang']}'"
+                )
 
                 
                 start_time = time.time()

@@ -6,8 +6,8 @@ from pathlib import Path
 # The data format should follow the general multimodal VLM format, for example:
 # https://github.com/QwenLM/Qwen2.5-VL/blob/main/qwen-vl-finetune/README.md
 
-json_root = f"./playground/Datasets/LLaVA-OneVision-COCO/llava_jsons"
-image_root = f"./playground/Datasets/LLaVA-OneVision-COCO/images"
+json_root = "/2025233147/zzq/SpatialVLA_llava3d/playground/Datasets/LLaVA-OneVision-COCO/llava_jsons"
+image_root = "/2025233147/zzq/SpatialVLA_llava3d/playground/Datasets/LLaVA-OneVision-COCO/images"
 
 SHAREGPT4V_COCO = {
     "annotation_path": f"{json_root}/sharegpt4v_coco.json",

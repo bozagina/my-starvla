@@ -1,23 +1,24 @@
 #!/bin/bash
 
-cd /mnt/petrelfs/yejinhui/Projects/starVLA
-conda activate starVLA
+cd /2025233147/zzq/SpatialVLA_llava3d/starVLA
 
 ###########################################################################################
 # === Please modify the following paths according to your environment ===
-export LIBERO_HOME=/mnt/petrelfs/share/yejinhui/Projects/LIBERO
+export LIBERO_HOME=/2025233147/zzq/SpatialVLA_llava3d/starVLA/examples/Projects/LIBERO
 export LIBERO_CONFIG_PATH=${LIBERO_HOME}/libero
-export LIBERO_Python=/mnt/petrelfs/share/yejinhui/Envs/miniconda3/envs/lerobot/bin/python
+export LIBERO_Python=$(which python)
 
-export PYTHONPATH=$PYTHONPATH:${LIBERO_HOME} # let eval_libero find the LIBERO tools
-export PYTHONPATH=$(pwd):${PYTHONPATH} # let LIBERO find the websocket tools from main repo
+# 让 Python 能找到 LIBERO 和 starVLA 这两个包
+export PYTHONPATH=$PYTHONPATH:${LIBERO_HOME}
+export PYTHONPATH=$(pwd):${PYTHONPATH}
 
+export MUJOCO_GL=osmesa
+export PYOPENGL_PLATFORM=osmesa
 
 host="127.0.0.1"
 base_port=5694
 unnorm_key="franka"
-your_ckpt=./results/Checkpoints/1208_libero_all_QwenPI_qwen3/checkpoints/steps_50000_pytorch_model.pt
-export DEBUG=true
+your_ckpt=./results/Checkpoints/1229_libero4in1_MapAnythingLlava3DPI_s42_20260201_042829/checkpoints/steps_20000_pytorch_model.pt
 
 folder_name=$(echo "$your_ckpt" | awk -F'/' '{print $(NF-2)"_"$(NF-1)"_"$NF}')
 # === End of environment variable configuration ===

@@ -70,18 +70,23 @@ def setup_directories(cfg) -> Path:
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(output_dir / "checkpoints", exist_ok=True)
 
-        # # save config
-        # OmegaConf.save(cfg, output_dir / "config.yaml")
-        # with open(output_dir / "config.yaml", "r") as f_yaml, open(output_dir / "config.json", "w") as f_json:
-        #     yaml_cfg = yaml.safe_load(f_yaml)
-        #     json.dump(yaml_cfg, f_json, indent=2)
+        # save config (both yaml and json for easy inspection)
+        try:
+            OmegaConf.save(cfg, output_dir / "config.yaml")
+            with open(output_dir / "config.yaml", "r") as f_yaml, open(
+                output_dir / "config.json", "w"
+            ) as f_json:
+                yaml_cfg = yaml.safe_load(f_yaml)
+                json.dump(yaml_cfg, f_json, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to save config to {output_dir}: {e}")
 
     return output_dir
 
 
 def build_model(cfg) -> torch.nn.Module:
     """build model framework"""
-    logger.info(f"Loading Base VLM `{cfg.framework.qwenvl.base_vlm}` from ID/Path")
+    logger.info(f"Loading Base VLM `{cfg.framework.mapanything_llava3d.base_vlm}` from ID/Path")
     model = build_framework(cfg)
 
     return model
@@ -144,6 +149,21 @@ class VLATrainer(TrainerUtils):
         # training status tracking
         self.completed_steps = 0
         self.total_batch_size = self._calculate_total_batch_size()
+        self.best_metric = None
+        self.steps_since_improvement = 0
+        trackers = getattr(self.config, "trackers", None)
+        backend = None
+        if trackers is not None:
+            try:
+                if "swanlab" in trackers:
+                    backend = "swanlab"
+                elif "wandb" in trackers:
+                    backend = "wandb"
+            except TypeError:
+                backend = None
+        if backend is None:
+            backend = "wandb"
+        self.logger_backend = backend
     
     def prepare_training(self):
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -175,6 +195,9 @@ class VLATrainer(TrainerUtils):
             self.vla_train_dataloader,
         )
 
+        base_model = self.accelerator.unwrap_model(self.model)
+        self._register_grad_hooks(base_model)
+
         self._init_wandb()
 
 
@@ -203,7 +226,18 @@ class VLATrainer(TrainerUtils):
 
     def _init_wandb(self):
         """initialize Weights & Biases"""
-        if self.accelerator.is_main_process:
+        if not self.accelerator.is_main_process:
+            return
+        if getattr(self, "logger_backend", None) == "swanlab":
+            import swanlab
+            cfg_dict = OmegaConf.to_container(self.config, resolve=True)
+            swanlab.init(
+                project=self.config.wandb_project,
+                workspace=self.config.wandb_entity,
+                experiment_name=self.config.run_id,
+                config=cfg_dict,
+            )
+        else:
             wandb.init(
                 name=self.config.run_id,
                 dir=os.path.join(self.config.output_dir, "wandb"),
@@ -296,11 +330,40 @@ class VLATrainer(TrainerUtils):
                 # add learning rate 
                 metrics["learning_rate"] = self.lr_scheduler.get_last_lr()[0] # see lr group in yaml.trainer.learning_rate
 
+                geom_vision_only_steps = getattr(self.config.trainer, "geom_vision_only_steps", 0)
+                lang_freeze_steps = getattr(self.config.trainer, "lang_freeze_steps", 0)
+                phase = 0
+                if geom_vision_only_steps and self.completed_steps < geom_vision_only_steps:
+                    phase = 1
+                elif lang_freeze_steps and self.completed_steps < lang_freeze_steps:
+                    phase = 2
+                metrics["debug/training_phase"] = phase
+
                 # add epoch info
                 metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
 
-                # record to W&B
-                wandb.log(metrics, step=self.completed_steps)
+                # 1) 本地 JSONL 日志（方便离线 debug）
+                try:
+                    metrics_path = os.path.join(self.config.output_dir, "metrics.jsonl")
+                    with open(metrics_path, "a") as f:
+                        f.write(json.dumps(metrics) + "\n")
+                except Exception as e:
+                    logger.warning(f"Failed to write local metrics.jsonl: {e}")
+
+                # 2) 远端日志（SwanLab / WandB）
+                backend = getattr(self, "logger_backend", None)
+                if backend == "swanlab":
+                    try:
+                        import swanlab
+                        swanlab.log(metrics, step=self.completed_steps)
+                    except Exception as e:
+                        logger.warning(f"Failed to log metrics to SwanLab: {e}")
+                elif backend == "wandb":
+                    try:
+                        wandb.log(metrics, step=self.completed_steps)
+                    except Exception as e:
+                        logger.warning(f"Failed to log metrics to WandB: {e}")
+
                 # debug output
                 logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
 
@@ -370,6 +433,20 @@ class VLATrainer(TrainerUtils):
             step_metrics["model_time"] = t_end_model - t_start_model
             self._log_metrics(step_metrics)
 
+            stop_training = False
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                stop_training = self._check_early_stopping(step_metrics)
+
+            if dist.is_initialized():
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                stop_flag = torch.tensor(int(stop_training), device=device)
+                dist.broadcast(stop_flag, src=0)
+                stop_training = bool(stop_flag.item())
+
+            if stop_training:
+                logger.info("Stopping training loop due to early stopping")
+                break
+
             # save checkpoint
             if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
                 self._save_checkpoint()
@@ -424,6 +501,305 @@ class VLATrainer(TrainerUtils):
             logger.info(f"  Gradient accumulation steps = {self.config.trainer.gradient_accumulation_steps}")
             logger.info(f"  Total batch size = {self.total_batch_size}")
 
+    def _register_grad_hooks(self, base_model=None):
+        """register backward hooks on key modules to track output gradient norms (compatible with ZeRO)."""
+        if base_model is None:
+            base_model = self.model
+        modules = []
+        action_model = getattr(base_model, "action_model", None)
+        if action_model is not None:
+            dit = getattr(action_model, "model", None)
+            if dit is not None:
+                modules.append(dit)
+            action_decoder = getattr(action_model, "action_decoder", None)
+            if action_decoder is not None:
+                modules.append(action_decoder)
+        vlm_interface = getattr(base_model, "mapanythingllava3d_vlm_interface", None)
+        vlm_model = getattr(vlm_interface, "model", None) if vlm_interface is not None else None
+        if vlm_model is not None:
+            for name in [
+                "geometric_projector",
+                "fusion_projector",
+                "vision_projector",
+            ]:
+                module = getattr(vlm_model, name, None)
+                if module is not None:
+                    modules.append(module)
+
+        handles = []
+
+        def make_hook():
+            def hook(module, grad_input, grad_output):
+                if not grad_output:
+                    return
+                out_grad = grad_output[0]
+                if out_grad is None:
+                    return
+                g = out_grad.detach().float()
+                if g.numel() == 0:
+                    return
+                sq = g * g
+                module._last_grad_l2 = sq.sum().sqrt().item()
+                module._last_grad_rms = sq.mean().sqrt().item()
+
+            return hook
+
+        for m in modules:
+            try:
+                h = m.register_full_backward_hook(make_hook())
+                handles.append(h)
+            except Exception:
+                continue
+        self._grad_hook_handles = handles
+
+    def _check_early_stopping(self, metrics: dict) -> bool:
+        es_cfg = getattr(self.config.trainer, "early_stopping", None)
+        if not es_cfg or not getattr(es_cfg, "enabled", False):
+            return False
+
+        metric_name = getattr(es_cfg, "metric", "action_dit_loss")
+        mode = getattr(es_cfg, "mode", "min")
+        patience = getattr(es_cfg, "patience", 10000)
+        min_delta = getattr(es_cfg, "min_delta", 0.0)
+
+        if metric_name not in metrics:
+            return False
+
+        value = float(metrics[metric_name])
+
+        if self.best_metric is None:
+            self.best_metric = value
+            self.steps_since_improvement = 0
+            logger.info(f"Early stopping initialized on metric {metric_name} with value {value:.6f}")
+            return False
+
+        improved = (value < self.best_metric - min_delta) if mode == "min" else (value > self.best_metric + min_delta)
+
+        if improved:
+            self.best_metric = value
+            self.steps_since_improvement = 0
+            logger.info(f"Early stopping metric {metric_name} improved to {value:.6f}")
+            return False
+
+        self.steps_since_improvement += 1
+
+        if self.steps_since_improvement >= patience:
+            logger.info(
+                f"Early stopping triggered on metric {metric_name}: "
+                f"no improvement for {self.steps_since_improvement} steps"
+            )
+            return True
+
+        return False
+    
+    def _collect_debug_norm_metrics(self, metrics: dict):
+        """Collect parameter / gradient / weight stats for VLM, vision, geom and action model."""
+        if not self.accelerator.is_main_process:
+            return
+
+        try:
+            rank = dist.get_rank() if dist.is_initialized() else -1
+        except Exception:
+            rank = -1
+        metrics["debug/grad_collect_called"] = 1
+        metrics["debug/grad_collect_rank"] = int(rank)
+
+        def module_norms(module):
+            if module is None:
+                return None, None
+            param_sq = 0.0
+            grad_sq = 0.0
+            grad_count = 0
+            for p in module.parameters():
+                if not p.requires_grad:
+                    continue
+                if p.data is not None:
+                    w = p.data.float()
+                    param_sq += torch.sum(w * w).item()
+                if p.grad is not None:
+                    g = p.grad.detach().float()
+                    grad_sq += torch.sum(g * g).item()
+                    grad_count += 1
+            if param_sq == 0.0 and grad_sq == 0.0:
+                return None, None
+            param_norm = param_sq**0.5 if param_sq > 0.0 else None
+            hook_grad_l2 = getattr(module, "_last_grad_l2", None)
+            if hook_grad_l2 is not None:
+                grad_norm = float(hook_grad_l2)
+            else:
+                grad_norm = grad_sq**0.5 if grad_count > 0 else None
+            return param_norm, grad_norm
+
+        def module_grad_debug(name, module):
+            info = {"n_params": 0, "n_grad": 0, "n_grad_nonzero": 0}
+            if module is None:
+                metrics[f"debug/grad_info/{name}_n_params"] = 0
+                metrics[f"debug/grad_info/{name}_n_grad"] = 0
+                metrics[f"debug/grad_info/{name}_n_grad_nonzero"] = 0
+                return
+            for p in module.parameters():
+                if not p.requires_grad:
+                    continue
+                info["n_params"] += 1
+                if p.grad is not None:
+                    info["n_grad"] += 1
+                    with torch.no_grad():
+                        v = p.grad.detach().float()
+                        if v.abs().sum().item() > 0.0:
+                            info["n_grad_nonzero"] += 1
+            metrics[f"debug/grad_info/{name}_n_params"] = int(info["n_params"])
+            metrics[f"debug/grad_info/{name}_n_grad"] = int(info["n_grad"])
+            metrics[f"debug/grad_info/{name}_n_grad_nonzero"] = int(info["n_grad_nonzero"])
+
+        def weight_grad_stats(module):
+            if module is None:
+                return None, None, None, None
+            param_sq = 0.0
+            param_count = 0
+            grad_sq = 0.0
+            grad_count = 0
+            for p in module.parameters():
+                if not p.requires_grad:
+                    continue
+                if p.data is not None:
+                    w = p.data.float()
+                    param_sq += torch.sum(w * w).item()
+                    param_count += w.numel()
+                if p.grad is not None:
+                    g = p.grad.detach().float()
+                    grad_sq += torch.sum(g * g).item()
+                    grad_count += g.numel()
+            if param_count == 0 and grad_count == 0:
+                return None, None, None, None
+            w_l2 = param_sq**0.5 if param_sq > 0.0 else None
+            w_rms = (param_sq / param_count)**0.5 if param_sq > 0.0 and param_count > 0 else None
+            hook_grad_l2 = getattr(module, "_last_grad_l2", None)
+            hook_grad_rms = getattr(module, "_last_grad_rms", None)
+            if hook_grad_l2 is not None:
+                g_l2 = float(hook_grad_l2)
+            else:
+                g_l2 = grad_sq**0.5 if grad_count > 0 else None
+            if hook_grad_rms is not None:
+                g_rms = float(hook_grad_rms)
+            else:
+                g_rms = (grad_sq / grad_count)**0.5 if grad_count > 0 else None
+            return w_l2, w_rms, g_l2, g_rms
+
+        try:
+            base_model = self.accelerator.unwrap_model(self.model)
+            action_model = getattr(base_model, "action_model", None)
+            dit = getattr(action_model, "model", None) if action_model is not None else None
+            action_decoder = getattr(action_model, "action_decoder", None) if action_model is not None else None
+
+            vlm_interface = getattr(base_model, "mapanythingllava3d_vlm_interface", None)
+            vlm_model = getattr(vlm_interface, "model", None) if vlm_interface is not None else None
+            vlm_language = getattr(vlm_model, "language_model", None) if vlm_model is not None else vlm_model
+
+            module_grad_debug("dit", dit)
+            dit_param, dit_grad = module_norms(dit)
+            if dit_param is not None:
+                metrics["debug/param_norm/dit"] = dit_param
+            if dit_grad is not None:
+                metrics["debug/grad_norm/dit"] = dit_grad
+
+            module_grad_debug("action_decoder", action_decoder)
+            dec_param, dec_grad = module_norms(action_decoder)
+            if dec_param is not None:
+                metrics["debug/param_norm/action_decoder"] = dec_param
+            if dec_grad is not None:
+                metrics["debug/grad_norm/action_decoder"] = dec_grad
+
+            module_grad_debug("vlm_language", vlm_language)
+            vlm_param, vlm_grad = module_norms(vlm_language)
+            if vlm_param is not None:
+                metrics["debug/param_norm/vlm_language"] = vlm_param
+            if vlm_grad is not None:
+                metrics["debug/grad_norm/vlm_language"] = vlm_grad
+
+            if vlm_model is not None:
+                geom_modules = [
+                    ("geometric_model", getattr(vlm_model, "geometric_model", None)),
+                    ("geometric_projector", getattr(vlm_model, "geometric_projector", None)),
+                    ("fusion_projector", getattr(vlm_model, "fusion_projector", None)),
+                ]
+                for name, module in geom_modules:
+                    module_grad_debug(name, module)
+                    w_l2, w_rms, g_l2, g_rms = weight_grad_stats(module)
+                    metrics[f"debug/geom_grad/{name}_l2"] = float(g_l2) if g_l2 is not None else 0.0
+                    metrics[f"debug/geom_grad/{name}_rms"] = float(g_rms) if g_rms is not None else 0.0
+                    metrics[f"debug/core_weight/{name}_w_rms"] = float(w_rms) if w_rms is not None else 0.0
+                    if w_l2 is not None:
+                        init_attr = "_param_l2_init"
+                        last_attr = "_param_l2_last"
+                        init_val = getattr(module, init_attr, None)
+                        if init_val is None:
+                            setattr(module, init_attr, w_l2)
+                            setattr(module, last_attr, w_l2)
+                            delta_from_start = 0.0
+                            delta_from_last = 0.0
+                        else:
+                            last_val = getattr(module, last_attr, init_val)
+                            delta_from_start = abs(w_l2 - init_val)
+                            delta_from_last = abs(w_l2 - last_val)
+                            setattr(module, last_attr, w_l2)
+                        metrics[f"debug/param_delta/{name}_l2_from_start"] = float(delta_from_start)
+                        metrics[f"debug/param_delta/{name}_l2_from_last"] = float(delta_from_last)
+
+                vision_modules = [
+                    ("vision_tower", getattr(vlm_model, "vision_tower", None)),
+                    ("vision_projector", getattr(vlm_model, "vision_projector", None)),
+                ]
+                for name, module in vision_modules:
+                    module_grad_debug(name, module)
+                    w_l2, w_rms, g_l2, g_rms = weight_grad_stats(module)
+                    metrics[f"debug/vlm_vision_grad/{name}_l2"] = float(g_l2) if g_l2 is not None else 0.0
+                    metrics[f"debug/vlm_vision_grad/{name}_rms"] = float(g_rms) if g_rms is not None else 0.0
+                    metrics[f"debug/core_weight/{name}_w_rms"] = float(w_rms) if w_rms is not None else 0.0
+                    if w_l2 is not None:
+                        init_attr = "_param_l2_init"
+                        last_attr = "_param_l2_last"
+                        init_val = getattr(module, init_attr, None)
+                        if init_val is None:
+                            setattr(module, init_attr, w_l2)
+                            setattr(module, last_attr, w_l2)
+                            delta_from_start = 0.0
+                            delta_from_last = 0.0
+                        else:
+                            last_val = getattr(module, last_attr, init_val)
+                            delta_from_start = abs(w_l2 - init_val)
+                            delta_from_last = abs(w_l2 - last_val)
+                            setattr(module, last_attr, w_l2)
+                        metrics[f"debug/param_delta/{name}_l2_from_start"] = float(delta_from_start)
+                        metrics[f"debug/param_delta/{name}_l2_from_last"] = float(delta_from_last)
+
+                module_grad_debug("language_model", vlm_language)
+                w_l2, w_rms, g_l2, g_rms = weight_grad_stats(vlm_language)
+                metrics["debug/vlm_vision_grad/language_model_l2"] = float(g_l2) if g_l2 is not None else 0.0
+                metrics["debug/vlm_vision_grad/language_model_rms"] = float(g_rms) if g_rms is not None else 0.0
+                metrics["debug/core_weight/language_model_w_rms"] = float(w_rms) if w_rms is not None else 0.0
+                if w_l2 is not None:
+                    init_attr = "_param_l2_init"
+                    last_attr = "_param_l2_last"
+                    init_val = getattr(vlm_language, init_attr, None)
+                    if init_val is None:
+                        setattr(vlm_language, init_attr, w_l2)
+                        setattr(vlm_language, last_attr, w_l2)
+                        delta_from_start = 0.0
+                        delta_from_last = 0.0
+                    else:
+                        last_val = getattr(vlm_language, last_attr, init_val)
+                        delta_from_start = abs(w_l2 - init_val)
+                        delta_from_last = abs(w_l2 - last_val)
+                        setattr(vlm_language, last_attr, w_l2)
+                    metrics["debug/param_delta/language_model_l2_from_start"] = float(delta_from_start)
+                    metrics["debug/param_delta/language_model_l2_from_last"] = float(delta_from_last)
+        except Exception as e:
+            logger.warning(f"Failed to collect debug norm metrics: {e}")
+            try:
+                metrics["debug/grad_collect_error"] = str(e)
+            except Exception:
+                pass
+
     def _train_step(self, batch_vla, batch_vlm=None):
         """execute single training step"""
         with self.accelerator.accumulate(self.model):
@@ -432,24 +808,61 @@ class VLATrainer(TrainerUtils):
             # VLA task forward propagation
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla)
-
                 action_loss = output_dict["action_loss"]
                 total_loss = action_loss
 
             # VLA backward propagation
             self.accelerator.backward(total_loss)
 
+            geom_vision_only_steps = getattr(self.config.trainer, "geom_vision_only_steps", 0)
+            lang_freeze_steps = getattr(self.config.trainer, "lang_freeze_steps", 0)
+            if geom_vision_only_steps and self.completed_steps < geom_vision_only_steps:
+                try:
+                    base_model = self.accelerator.unwrap_model(self.model)
+                    action_model = getattr(base_model, "action_model", None)
+                    if action_model is not None:
+                        for p in action_model.parameters():
+                            if p.grad is not None:
+                                p.grad.zero_()
+                    vlm_interface = getattr(base_model, "mapanythingllava3d_vlm_interface", None)
+                    vlm_model = getattr(vlm_interface, "model", None) if vlm_interface is not None else None
+                    language_model = getattr(vlm_model, "language_model", None) if vlm_model is not None else None
+                    if language_model is not None:
+                        for p in language_model.parameters():
+                            if p.grad is not None:
+                                p.grad.zero_()
+                except Exception as e:
+                    logger.warning(f"Failed to zero grads during geom_vision_only warmup: {e}")
+            elif lang_freeze_steps and self.completed_steps < lang_freeze_steps:
+                try:
+                    base_model = self.accelerator.unwrap_model(self.model)
+                    vlm_interface = getattr(base_model, "mapanythingllava3d_vlm_interface", None)
+                    vlm_model = getattr(vlm_interface, "model", None) if vlm_interface is not None else None
+                    language_model = getattr(vlm_model, "language_model", None) if vlm_model is not None else None
+                    if language_model is not None:
+                        for p in language_model.parameters():
+                            if p.grad is not None:
+                                p.grad.zero_()
+                except Exception as e:
+                    logger.warning(f"Failed to zero language model grads during warmup: {e}")
+
             # gradient clipping
             if self.config.trainer.gradient_clipping is not None:
                 self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
+
+            # collect grad/weight stats before optimizer step (only on synchronized steps)
+            step_metrics = {"action_dit_loss": float(action_loss.item())}
+            debug_metrics = output_dict.get("debug_metrics", None)
+            if isinstance(debug_metrics, dict):
+                step_metrics.update(debug_metrics)
+            if self.accelerator.sync_gradients:
+                self._collect_debug_norm_metrics(step_metrics)
 
             # optimizer step
             self.optimizer.step()
             self.lr_scheduler.step()
 
-        return {
-            "action_dit_loss": action_loss.item(),
-        }
+        return step_metrics
 
     def _finalize_training(self):
         """training end processing"""
@@ -464,7 +877,15 @@ class VLATrainer(TrainerUtils):
 
         # close W&B
         if self.accelerator.is_main_process:
-            wandb.finish()
+            backend = getattr(self, "logger_backend", None)
+            if backend == "swanlab":
+                try:
+                    import swanlab
+                    swanlab.finish()
+                except Exception:
+                    pass
+            elif backend == "wandb":
+                wandb.finish()
 
         self.accelerator.wait_for_everyone()
 

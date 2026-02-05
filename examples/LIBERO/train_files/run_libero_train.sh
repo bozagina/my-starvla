@@ -1,8 +1,11 @@
 
 
-export NCCL_SOCKET_IFNAME=bond0
-export NCCL_IB_HCA=mlx5_2,mlx5_3
-
+# export NCCL_SOCKET_IFNAME=bond0
+# export NCCL_IB_HCA=mlx5_2,mlx5_3
+# 修改后：
+export NCCL_SOCKET_IFNAME=eth0        # 或者干脆注释掉，让 NCCL 自动选
+export NCCL_IB_DISABLE=1              # 禁用 InfiniBand
+export NCCL_P2P_DISABLE=0             # 保持 GPU 之间 P2P（同机）
 # used for check save when communication
 export NCCL_BLOCKING_WAIT=1
 export NCCL_ASYNC_ERROR_HANDLING=1
@@ -10,46 +13,51 @@ export NCCL_TIMEOUT=10000  # timeout set to 1 hour (unit: seconds)
 export NCCL_SOCKET_TIMEOUT_MS=360000
 ###########################################################################################
 # === Please modify the following paths according to your environment ===
-Framework_name=QwenOFT
+Framework_name=MapAnythingLlava3DPI
+# freeze_module_list='mapanythingllava3d_vlm_interface.model.vision_tower,mapanythingllava3d_vlm_interface.model.geometric_model'
 freeze_module_list=''
-base_vlm=playground/Pretrained_models/Qwen3-VL-4B-Instruct
-config_yaml=./examples/LIBERO/train_files/starvla_cotrain_libero.yaml
-libero_data_root=playground/Datasets/LEROBOT_LIBERO_DATA
+base_vlm=/2025233147/zzq/SpatialVLA_llava3d/starVLA/checkpoints/mapanything_llava3d_vlm_base
+config_yaml=/2025233147/zzq/SpatialVLA_llava3d/starVLA/starVLA/config/training/starvla_train_oxe_mapanything_llava3d.yaml
+libero_data_root=/2025233147/zzq/SpatialVLA_llava3d/playground/Datasets/LEROBOT_LIBERO_DATA
 data_mix=libero_all
 run_root_dir=./results/Checkpoints
-run_id=1229_libero4in1_qwen3oft
+seed=42
+timestamp=$(date +"%Y%m%d_%H%M%S")
+run_id=1229_libero4in1_MapAnythingLlava3DPI_s${seed}_${timestamp}
 # === End of environment variable configuration ===
 ###########################################################################################
 
 
-# export WANDB_MODE=disabled
+export WANDB_MODE=disabled
 
 output_dir=${run_root_dir}/${run_id}
 mkdir -p ${output_dir}
 # mv this script to the output dir
 cp $0 ${output_dir}/
 
+exec > >(tee "${output_dir}/train.log") 2>&1
+
 
 accelerate launch \
   --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
-  --num_processes 8 \
+  --num_processes 4 \
   starVLA/training/train_starvla.py \
   --config_yaml ${config_yaml} \
   --framework.name ${Framework_name} \
-  --framework.qwenvl.base_vlm ${base_vlm} \
+  --framework.mapanything_llava3d.base_vlm ${base_vlm} \
   --datasets.vla_data.data_root_dir ${libero_data_root}\
   --datasets.vla_data.data_mix ${data_mix} \
-  --datasets.vla_data.per_device_batch_size 16 \
-  --trainer.vla_data.video_backend torchvision_av \
+  --datasets.vla_data.per_device_batch_size 4 \
+  --datasets.vla_data.video_backend torchvision_av \
   --trainer.freeze_modules ${freeze_module_list} \
   --trainer.max_train_steps 80000 \
   --trainer.save_interval 10000 \
-  --trainer.logging_frequency 100 \
+  --trainer.logging_frequency 10 \
   --trainer.eval_interval 100 \
+  --seed ${seed} \
   --run_root_dir ${run_root_dir} \
   --run_id ${run_id} \
-  --wandb_project starVLA_Libero \
-  --wandb_entity jinhuiye \
+  --wandb_project starvla_mapanything_llava3d \
   # --is_debug True
 
 
@@ -65,7 +73,7 @@ accelerate launch \
   #   starVLA/training/train_starvla.py \
   #   --config_yaml ${config_yaml} \
   #   --framework.name ${Framework_name} \
-  #   --framework.qwenvl.base_vlm ${base_vlm} \
+  #   --framework.mapanything_llava3d.base_vlm ${base_vlm} \
   #   --run_root_dir ${run_root_dir} \
   #   --run_id ${run_id} \
   #   --wandb_project your_project \

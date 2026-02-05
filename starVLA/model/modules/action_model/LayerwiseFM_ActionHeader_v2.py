@@ -20,8 +20,6 @@ from starVLA.model.modules.action_model.flow_matching_head.action_encoder import
 
 from starVLA.model.modules.action_model.flow_matching_head.cross_attention_dit import DiT, SelfAttentionTransformer
 
-# TODO try to meger DiT Modules with follow_match_head, they are just the same arch, but diff loss, use diffusers package will be simple
-
 class CategorySpecificLinear(nn.Module):
     def __init__(self, num_categories, input_dim, hidden_dim):
         super().__init__()
@@ -61,7 +59,7 @@ class MLP(nn.Module):
 
 
 class ActionEncoder(nn.Module):
-    def __init__(self, action_dim, hidden_size=1024):
+    def __init__(self, action_dim, hidden_size):
         super().__init__()
         self.hidden_size = hidden_size
         self.action_dim = action_dim
@@ -104,116 +102,11 @@ class ActionEncoder(nn.Module):
         return x
 
 
+
+
 DiTConfig = {"num_layers": 36, "input_embedding_dim": 2048, "attention_head_dim": 64, "num_attention_heads": 32}
 
-class MultiEmbodimentActionEncoder(nn.Module):
-    def __init__(self, action_dim, hidden_size=1024, num_embodiments=8):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.num_embodiments = num_embodiments
-
-        # W1: R^{w x d}, W2: R^{w x 2w}, W3: R^{w x w}
-        self.W1 = CategorySpecificLinear(num_embodiments, action_dim, hidden_size)  # (d -> w)
-        self.W2 = CategorySpecificLinear(num_embodiments, 2 * hidden_size, hidden_size)  # (2w -> w)
-        self.W3 = CategorySpecificLinear(num_embodiments, hidden_size, hidden_size)  # (w -> w)
-        self.pos_encoding = SinusoidalPositionalEncoding(hidden_size)
-
-    def forward(self, actions, timesteps, cat_ids):
-        """
-        actions:   shape (B, T, action_dim)
-        timesteps: shape (B,)  -- a single scalar per batch item
-        cat_ids:   shape (B,)
-        returns:   shape (B, T, hidden_size)
-        """
-        B, T, _ = actions.shape
-
-        # 1) Expand each batch's single scalar time 'tau' across all T steps
-        #    so that shape => (B, T)
-        #    e.g. if timesteps is (B,), replicate across T
-        if timesteps.dim() == 1 and timesteps.shape[0] == B:
-            # shape (B,) => (B,T)
-            timesteps = timesteps.unsqueeze(1).expand(-1, T)
-        else:
-            raise ValueError(
-                "Expected `timesteps` to have shape (B,) so we can replicate across T."
-            )
-
-        # 2) Standard action MLP step for shape => (B, T, w)
-        a_emb = self.W1(actions, cat_ids)
-
-        # 3) Get the sinusoidal encoding (B, T, w)
-        tau_emb = self.pos_encoding(timesteps).to(dtype=a_emb.dtype)
-
-        # 4) Concat along last dim => (B, T, 2w), then W2 => (B, T, w), swish
-        x = torch.cat([a_emb, tau_emb], dim=-1)
-        x = swish(self.W2(x, cat_ids))
-
-        # 5) Finally W3 => (B, T, w)
-        x = self.W3(x, cat_ids)
-        return x
-
-
-@dataclass
-class FlowmatchingActionHeadConfig(PretrainedConfig):
-    """NOTE: N1.5 uses XEmbFlowmatchingPolicyHeadConfig as action head"""
-
-    add_pos_embed: bool = field(
-        default=True, metadata={"help": "Whether to add positional embedding"}
-    )
-    diffusion_model_cfg: dict = field(
-        default=None, metadata={"help": "Diffusion model configuration."}
-    )
-    input_embedding_dim: int = field(
-        default=1536, metadata={"help": "Input embedding channel dimension."}
-    )
-
-    hidden_size: int = field(default=1024, metadata={"help": "Input embedding dimension."})
-    max_seq_len: int = field(default=1024, metadata={"help": "Maxium Sequence Length"})
-    action_dim: int = field(default=None, metadata={"help": "Action dimension."})
-    action_horizon: int = field(default=None, metadata={"help": "Action horizon."})
-    noise_beta_alpha: float = field(default=1.5, metadata={"help": ""})
-    noise_beta_beta: float = field(default=1.0, metadata={"help": ""})
-    noise_s: float = field(
-        default=0.999, metadata={"help": "Flow matching noise Beta distribution s."}
-    )
-    num_timestep_buckets: int = field(
-        default=1000, metadata={"help": "Number of timestep discretization buckets."}
-    )
-    num_inference_timesteps: int = field(
-        default=None,
-        metadata={"help": "Number of inference steps for noise diffusion."},
-    )
-    max_num_embodiments: int = field(default=32, metadata={"help": "Number of embodiments."})
-    tune_projector: bool = field(default=True, metadata={"help": "Whether to tune the projector."})
-    tune_diffusion_model: bool = field(
-        default=True, metadata={"help": "Whether to tune the diffusion model."}
-    )
-    load_pretrained_det_decode_layer_path: str = field(
-        default=None, metadata={"help": "Path to pretrained detection model."}
-    )
-    detection_coeff: float = field(default=1.0, metadata={"help": "Detection coefficient."})
-
-    freeze_decode_layer: bool = field(default=False)
-    expand_batch: int = field(default=None)
-    use_vlln: bool = field(default=True)
-
-    vl_self_attention_cfg: dict = field(default=None)
-    num_target_vision_tokens: int = field(
-        default=32, metadata={"help": "Number of target vision tokens."}
-    )
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        for key, value in kwargs.items():
-            setattr(self, key, value)
-
-
-
-
-DiTConfig = {"num_layers": 36, "input_embedding_dim": 2048, "attention_head_dim": 64, "num_attention_heads": 32} # default for qwen2.5-vl
-
-
-class LayerwiseFlowmatchingActionHead(nn.Module):
+class LayerwiseFlowmatchingActionHead(nn.Module): # TODO might rethinking about gr00t action header
     def __init__(
         self,
         global_config,
@@ -222,34 +115,17 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         super().__init__()
         action_config = global_config.framework.action_model
         diffusion_model_cfg = action_config.diffusion_model_cfg
+        # 更新 DiTConfig 到 diffusion_model_cfg
 
-        num_vl_layers = global_config.framework.mapanything_llava3d.num_vl_layers
-        cfg_num_layers = None
-        try:
-            if isinstance(diffusion_model_cfg, dict):
-                cfg_num_layers = diffusion_model_cfg.get("num_layers", None)
-            else:
-                cfg_num_layers = getattr(diffusion_model_cfg, "num_layers", None)
-        except Exception:
-            cfg_num_layers = None
-        if cfg_num_layers is None:
-            effective_num_layers = num_vl_layers
-        else:
-            cfg_num_layers = int(cfg_num_layers)
-            effective_num_layers = min(cfg_num_layers, num_vl_layers)
-
-        DiTConfig["num_layers"] = effective_num_layers
-        DiTConfig["input_embedding_dim"] = global_config.framework.mapanything_llava3d.vl_hidden_dim
+        DiTConfig["num_layers"] = global_config.framework.qwenvl.num_vl_layers
+        DiTConfig["input_embedding_dim"] = global_config.framework.qwenvl.vl_hidden_dim
         DiTConfig["num_attention_heads"] = DiTConfig["input_embedding_dim"] // DiTConfig["attention_head_dim"]
         diffusion_model_cfg.update(DiTConfig)
-        diffusion_model_cfg.cross_attention_dim = DiTConfig["input_embedding_dim"]
-        self.input_embedding_dim = global_config.framework.mapanything_llava3d.vl_hidden_dim
+        diffusion_model_cfg["interleave_self_attention"] = False
+        diffusion_model_cfg.cross_attention_dim = DiTConfig["input_embedding_dim"] # should match vl embedding dim, but for some case we might want to change it for cross + self attention
+        self.input_embedding_dim = diffusion_model_cfg["input_embedding_dim"]
         self.model = DiT(**diffusion_model_cfg)
-        if isinstance(diffusion_model_cfg, dict):
-            dit_output_dim = diffusion_model_cfg.get("output_dim", self.input_embedding_dim)
-        else:
-            dit_output_dim = getattr(diffusion_model_cfg, "output_dim", self.input_embedding_dim)
-        self.dit_out_hidden_size = dit_output_dim
+        self.dit_out_hidden_size = diffusion_model_cfg.output_dim
         self.action_dim = action_config.action_dim
         self.action_horizon = action_config.future_action_window_size + 1
         self.num_inference_timesteps = action_config.num_inference_timesteps
@@ -265,7 +141,6 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         )
         self.action_decoder = MLP(
             input_dim=self.dit_out_hidden_size,
-            hidden_dim=1024,
             output_dim=self.action_dim,
         )
         self.future_tokens = nn.Embedding(action_config.num_target_vision_tokens, self.input_embedding_dim)
@@ -285,8 +160,6 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
 
     def prepare_input(self, batch: dict) -> BatchFeature:
         return BatchFeature(data=batch)
-
-
     def _apply_layerwise_cross_attention(self, saction_embs, vl_embs_list, temb):
         """
         Apply layerwise cross-attention between state-action embeddings and vision-language embeddings.
@@ -300,17 +173,13 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             hidden_states: Tensor of shape (B, seq_length, embedding_dim)
         """
         hidden_states = saction_embs
-        self._last_dit_layer_means = []
-        self._last_dit_layer_vars = []
-        for layer_idx, layer in enumerate(self.model.transformer_blocks):
-            hidden_states = layer(
+        for layer_idx, block in enumerate(self.model.transformer_blocks):
+            cross_and_self_feature = torch.cat((vl_embs_list[layer_idx], hidden_states), dim=1)
+            hidden_states = block(
                 hidden_states=hidden_states,
-                encoder_hidden_states=vl_embs_list[layer_idx],
+                encoder_hidden_states=cross_and_self_feature,
                 temb=temb,
             )
-            stats = hidden_states.detach().float()
-            self._last_dit_layer_means.append(stats.mean().item())
-            self._last_dit_layer_vars.append(stats.var(unbiased=False).item())
         return hidden_states
 
     def _process_output(self, hidden_states, temb, actions_length):
@@ -328,7 +197,9 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         conditioning = temb
         shift, scale = self.model.proj_out_1(F.silu(conditioning)).chunk(2, dim=1)
         hidden_states = self.model.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
+
         action_features = self.model.proj_out_2(hidden_states)
+
         pred = self.action_decoder(action_features)
         pred_velocity = pred[:, -actions_length:]
         return pred_velocity
@@ -364,12 +235,21 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
 
         # state and action embedding along sequence dimension.
         future_tokens = self.future_tokens.weight.unsqueeze(0).expand(B, -1, -1)
-        sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1) \
+        saction_embs = torch.cat((state_features, future_tokens, action_features), dim=1) \
             if state_features is not None else torch.cat((future_tokens, action_features), dim=1)
         
+        # Encode timesteps
         temb = self.model.timestep_encoder(t_discretized)
-        hidden_states = self._apply_layerwise_cross_attention(sa_embs, vl_embs_list, temb)
+
+
+        # Layerwise cross-attention with vl_embs
+        hidden_states = self._apply_layerwise_cross_attention(saction_embs, vl_embs_list, temb)
+
+
+        # Output processing
         pred_velocity = self._process_output(hidden_states, temb, actions.shape[1])
+
+        # Slice out only the action portion of pred and target.
         loss = ((pred_velocity - velocity) ** 2).mean()
         return loss
 
@@ -378,7 +258,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         # Set initial actions as the sampled noise.
         batch_size = vl_embs_list[0].shape[0]
         device = vl_embs_list[0].device
-        actions = torch.randn(
+        actions = torch.randn( # noise action
             size=(batch_size, self.action_horizon, self.action_dim),
             dtype=vl_embs_list[0].dtype,
             device=device,
@@ -389,6 +269,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
 
         state_features = self.state_encoder(state) if state is not None else None
 
+        # Run denoising steps.
         for t in range(num_steps):
             t_cont = t / float(num_steps)
             t_discretized_int = int(t_cont * self.num_timestep_buckets)
@@ -412,9 +293,16 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 else torch.cat((future_tokens, action_features), dim=1)
             )
 
+            # Encode timestep
             temb = self.model.timestep_encoder(timesteps_tensor)
+
+            # Layerwise cross-attention with vl_embs_list
             hidden_states = self._apply_layerwise_cross_attention(sa_embs, vl_embs_list, temb)
+
+            # Output processing
             pred_velocity = self._process_output(hidden_states, temb, self.action_horizon)
+
+            # Euler integration
             actions = actions + dt * pred_velocity
         return actions
 

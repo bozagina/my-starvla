@@ -190,6 +190,48 @@ class TrainerUtils:
         # accelerator.wait_for_everyone()  # synchronize when distributed training
         if dist.get_rank == 0:
             print(f"🔒 Frozen modules with re pattern: {frozen}")
+
+        try:
+            total_params = sum(p.numel() for p in model.parameters())
+            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            frozen_param_counts = {}
+            for path in frozen:
+                module = model
+                for attr in path.split("."):
+                    module = getattr(module, attr)
+                frozen_param_counts[path] = sum(p.numel() for p in module.parameters())
+            frozen_params_total = total_params - trainable_params
+            frozen_params_from_modules = sum(frozen_param_counts.values())
+            freeze_consistency_ok = frozen_params_total == frozen_params_from_modules
+            setattr(
+                model,
+                "_freeze_summary",
+                {
+                    "frozen_modules": frozen,
+                    "frozen_param_counts": frozen_param_counts,
+                    "total_params": total_params,
+                    "trainable_params": trainable_params,
+                    "frozen_params_total": frozen_params_total,
+                    "frozen_params_from_modules": frozen_params_from_modules,
+                    "freeze_consistency_ok": freeze_consistency_ok,
+                },
+            )
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                if freeze_consistency_ok:
+                    print(
+                        f"✅ freeze consistency check passed: "
+                        f"frozen_params_total={frozen_params_total}, "
+                        f"frozen_params_from_modules={frozen_params_from_modules}"
+                    )
+                else:
+                    print(
+                        f"⚠️ freeze consistency mismatch: "
+                        f"frozen_params_total={frozen_params_total}, "
+                        f"frozen_params_from_modules={frozen_params_from_modules}"
+                    )
+        except Exception as e:
+            print(f"⚠️ failed to compute freeze summary: {e}")
+
         return model
 
     @staticmethod
@@ -283,6 +325,11 @@ class TrainerUtils:
 
     @staticmethod
     def euclidean_distance(predicted: np.ndarray, ground_truth: np.ndarray) -> float:
+        if predicted.shape != ground_truth.shape:
+            raise ValueError(
+                f"Shape mismatch in euclidean_distance: "
+                f"predicted.shape={predicted.shape}, ground_truth.shape={ground_truth.shape}"
+            )
         return np.linalg.norm(predicted - ground_truth)
 
     @staticmethod

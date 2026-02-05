@@ -1,0 +1,33 @@
+checkpoint文件夹里/2025233147/zzq/SpatialVLA_llava3d/checkpoints/llava3d_deepfusion_base的config.json是模型的配置文件
+/2025233147/zzq/SpatialVLA_llava3d/checkpoints/pi0_libero_dit_head_pp_l16_adaln_unfreeze4_ditgate0d0d5to2这个里面是参数
+
+Libero benchmark:
+server command:
+
+export PROJECT_ROOT=/2025233147/zzq/SpatialVLA_llava3d
+export PYTHONPATH=$PYTHONPATH:$PROJECT_ROOT:$PROJECT_ROOT/openpi/src:$PROJECT_ROOT/openpi/third_party/libero
+export LIBERO_LOCAL_ROOT=$PROJECT_ROOT/data/physical-intelligence/libero
+
+/2025233147/envs/llava3d_vla_train/bin/python scripts/serve_custom_model.py \
+  --checkpoint-dir /2025233147/zzq/SpatialVLA_llava3d/checkpoints/pi0_libero_dit_head_pp_l16_adaln_unfreeze4_ditgate0d0d5to2/5000 \
+  --device cuda:0
+
+
+client command:
+
+export PROJECT_ROOT=/2025233147/zzq/SpatialVLA_llava3d
+export LIBERO_LOCAL_ROOT=$PROJECT_ROOT/data/physical-intelligence/libero
+export PYTHONPATH=$PYTHONPATH:$PROJECT_ROOT/openpi/third_party/libero:$PROJECT_ROOT/openpi/packages/openpi-client
+
+# Force OSMesa to avoid graphics driver errors
+export MUJOCO_GL=osmesa
+export PYOPENGL_PLATFORM=osmesa
+
+/2025233147/envs/llava3d_vla_train/bin/python examples/libero/main.py \
+    --args.host "0.0.0.0" \
+    --args.port 8001 \
+    --args.task-suite-name "libero_10" \
+    --args.num-trials-per-task 10
+
+
+libero视频记录/2025233147/zzq/SpatialVLA_llava3d/openpi/data/libero/videos

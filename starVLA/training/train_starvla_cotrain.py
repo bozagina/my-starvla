@@ -175,16 +175,45 @@ class VLAMTrainer(TrainerUtils):
             * self.accelerator.gradient_accumulation_steps
         )
 
+    def _init_swanlab(self):
+        """initialize experiment logger (SwanLab as default, fallback to WandB)"""
+        if not self.accelerator.is_main_process:
+            return
+
+        try:
+            import swanlab
+
+            try:
+                swanlab.init(
+                    project=getattr(self.config, "wandb_project", "starvla_mapanything_llava3d"),
+                    workspace=getattr(self.config, "wandb_entity", "starvla_mapanything_llava3d"),
+                    experiment_name=self.config.run_id,
+                    description="StarVLA VLA+VLM CoTrain (starvla_mapanything_llava3d)",
+                    config=OmegaConf.to_container(self.config, resolve=True),
+                    logdir=os.path.join(self.config.output_dir, "swanlog"),
+                )
+                self.logger_backend = "swanlab"
+                return
+            except Exception as e:
+                logger.warning(f"SwanLab init failed ({e}); disabling SwanLab logging.")
+                self.logger_backend = None
+        except ImportError:
+            try:
+                wandb.init(
+                    name=self.config.run_id,
+                    dir=os.path.join(self.config.output_dir, "wandb"),
+                    project=self.config.wandb_project,
+                    entity=self.config.wandb_entity,
+                    group="vla-train",
+                )
+                self.logger_backend = "wandb"
+                return
+            except Exception as e:
+                logger.warning(f"WandB init failed ({e}); disabling experiment logging.")
+                self.logger_backend = None
+
     def _init_wandb(self):
-        """initialize Weights & Biases"""
-        if self.accelerator.is_main_process:
-            wandb.init(
-                name=self.config.run_id,
-                dir=os.path.join(self.config.output_dir, "wandb"),
-                project=self.config.wandb_project,
-                entity=self.config.wandb_entity,
-                group="vla-train",
-            )
+        self._init_swanlab()
 
     def _init_checkpointing(self):
         """initialize checkpoint directory"""
@@ -250,8 +279,13 @@ class VLAMTrainer(TrainerUtils):
                 # add epoch information
                 metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
 
-                # record to W&B
-                wandb.log(metrics, step=self.completed_steps)
+                # record to SwanLab or W&B
+                if getattr(self, "logger_backend", None) == "swanlab":
+                    import swanlab
+
+                    swanlab.log(metrics, step=self.completed_steps)
+                else:
+                    wandb.log(metrics, step=self.completed_steps)
                 # debug output
                 logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
 
@@ -404,7 +438,8 @@ class VLAMTrainer(TrainerUtils):
             pass
             # VLM task forward propagation
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                vlm_output = self.model.qwen_vl_interface(**batch_vlm)
+                # vlm_output = self.model.qwen_vl_interface(**batch_vlm)
+                vlm_output = self.model.mapanythingllava3d_vlm_interface(**batch_vlm)
                 vlm_loss = vlm_output.loss * self.config.trainer.loss_scale.vlm
 
             self.accelerator.backward(vlm_loss)
