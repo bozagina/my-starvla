@@ -237,13 +237,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
         
         print(f"[mapanything_llava3d] geom_seq.shape: {tuple(geometric_features.shape)}")
 
-        
-        final_features = fusion_module(geometric_features, vision_feats)
-        
-
-        self._record_geom_stats("geom_proj", geom_proj)
-        self._record_geom_stats("fused_pre", fused_features_pre)
-        self._record_geom_stats("fused", final_features)
+        final_features = self.fusion_module(geometric_features, vision_feats)
 
         self._last_image_features = final_features
         return final_features
@@ -251,7 +245,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
     def fusion_module(self, geometric_features, vision_features):
         geometric_features = self.geometric_projector(geometric_features).to(vision_features.dtype)
         geometric_global = geometric_features.mean(dim=1, keepdim=True)  # TODO: revisit geometric pooling strategy
-        geometric_broadcast = geom_global.expand(vision_features.shape[0], vision_features.shape[1], geometric_global.shape[-1])
+        geometric_broadcast = geometric_global.expand(vision_features.shape[0], vision_features.shape[1], geometric_global.shape[-1])
         fused_features_pre = torch.cat([vision_features, geometric_broadcast], dim=-1)
         final_features = self.fusion_projector(fused_features_pre)
         return final_features

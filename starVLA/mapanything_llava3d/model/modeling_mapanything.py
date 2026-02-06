@@ -50,8 +50,21 @@ class MapAnythingWrapper(nn.Module):
 
         if len(final_features.features) == 1:
             geometric_features = final_features.features[0]
+            if geometric_features.dim() == 4:
+                b, c, h, w = geometric_features.shape
+                geometric_features = geometric_features.permute(0, 2, 3, 1).reshape(b, h * w, c)
         else:
-            geometric_features = torch.cat(final_features.features, dim=1)
+            seq_features = []
+            for f in final_features.features:
+                if f.dim() == 4:
+                    b, c, h, w = f.shape
+                    f = f.permute(0, 2, 3, 1).reshape(b, h * w, c)
+                elif f.dim() == 3:
+                    pass
+                else:
+                    raise ValueError(f"Unsupported feature shape: {tuple(f.shape)}")
+                seq_features.append(f)
+            geometric_features = torch.cat(seq_features, dim=1)
 
         class _Out:
             def __init__(self, last_hidden_state):
