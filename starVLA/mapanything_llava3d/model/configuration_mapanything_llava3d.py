@@ -67,12 +67,29 @@ class MapAnythingLlava3DConfig(PretrainedConfig):
         elif isinstance(vision_config, PretrainedConfig):
             self.vision_config = vision_config
         elif vision_config is None and vision_model_name_or_path is not None:
-            # Try to load config from path, otherwise use default
-            try:
-                raw_cfg = AutoConfig.from_pretrained(vision_model_name_or_path, trust_remote_code=True)
-                self.vision_config = getattr(raw_cfg, "vision_config", raw_cfg)
-            except Exception:
-                logger.warning(f"Could not load vision config from {vision_model_name_or_path}, using default SigLIP config.")
+            # 仅当为本地路径时从磁盘加载，避免 hub id（如 google/siglip-so400m-patch14-224）触发联网
+            _use_local_vision_config = (
+                isinstance(vision_model_name_or_path, str)
+                and (os.path.isdir(vision_model_name_or_path) or os.path.isfile(vision_model_name_or_path))
+            )
+            if _use_local_vision_config:
+                try:
+                    raw_cfg = AutoConfig.from_pretrained(vision_model_name_or_path, trust_remote_code=True)
+                    self.vision_config = getattr(raw_cfg, "vision_config", raw_cfg)
+                except Exception:
+                    logger.warning(f"Could not load vision config from {vision_model_name_or_path}, using default SigLIP config.")
+                    self.vision_config = CONFIG_MAPPING["siglip_vision_model"](
+                        intermediate_size=4096,
+                        hidden_size=1152,
+                        patch_size=14,
+                        image_size=224,
+                        num_hidden_layers=27,
+                        num_attention_heads=16,
+                        vocab_size=32000, # Placeholder
+                        vision_use_head=False,
+                    )
+            else:
+                # hub id 或非路径：直接用默认 SigLIP config，不联网
                 self.vision_config = CONFIG_MAPPING["siglip_vision_model"](
                     intermediate_size=4096,
                     hidden_size=1152,

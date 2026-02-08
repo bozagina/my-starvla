@@ -26,6 +26,11 @@ class LLaVA3DForCausalLMV2(PreTrainedModel, GenerationMixin):
             if pretrained_path is not None:
                 llava_cfg = AutoConfig.from_pretrained(pretrained_path, trust_remote_code=True)
                 setattr(llava_cfg, "mm_video_tower", None)
+                # 彻底不构建 LLaVA 的 vision tower，避免 build_vision_tower 里 os.path.exists(None) 以及联网下 clip
+                if hasattr(llava_cfg, "mm_vision_tower"):
+                    delattr(llava_cfg, "mm_vision_tower")
+                if hasattr(llava_cfg, "vision_tower"):
+                    delattr(llava_cfg, "vision_tower")
                 self.model = LlavaLlamaForCausalLM.from_pretrained(
                     pretrained_path, low_cpu_mem_usage=True, config=llava_cfg
                 )
@@ -36,6 +41,11 @@ class LLaVA3DForCausalLMV2(PreTrainedModel, GenerationMixin):
             if pretrained_path is not None:
                 llava_cfg = AutoConfig.from_pretrained(pretrained_path, trust_remote_code=True)
                 setattr(llava_cfg, "mm_video_tower", None)
+                # 彻底不构建 LLaVA 的 vision tower，避免 build_vision_tower 里 os.path.exists(None) 以及联网下 clip
+                if hasattr(llava_cfg, "mm_vision_tower"):
+                    delattr(llava_cfg, "mm_vision_tower")
+                if hasattr(llava_cfg, "vision_tower"):
+                    delattr(llava_cfg, "vision_tower")
                 self.model = LlavaMistralForCausalLM.from_pretrained(
                     pretrained_path, low_cpu_mem_usage=True, config=llava_cfg
                 )
