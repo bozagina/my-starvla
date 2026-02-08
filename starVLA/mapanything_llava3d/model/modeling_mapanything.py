@@ -6,7 +6,17 @@ import sys
 import torch
 import torch.nn as nn
 
-sys.path.append(os.path.join(os.path.dirname(__file__), "map-anything"))
+_LOCAL_MAPANYTHING_ROOT = os.path.join(os.path.dirname(__file__), "map-anything")
+if _LOCAL_MAPANYTHING_ROOT not in sys.path:
+    sys.path.insert(0, _LOCAL_MAPANYTHING_ROOT)
+
+# If mapanything was already imported from elsewhere, force reload from local path.
+if "mapanything" in sys.modules:
+    mod = sys.modules["mapanything"]
+    mod_file = getattr(mod, "__file__", "") or ""
+    if not mod_file.startswith(_LOCAL_MAPANYTHING_ROOT):
+        del sys.modules["mapanything"]
+
 from mapanything.models.mapanything.model import MapAnything
 from uniception.models.info_sharing.base import MultiViewTransformerInput
 
@@ -33,6 +43,24 @@ class MapAnythingWrapper(nn.Module):
                 if k in feature:
                     return feature[k]
         return feature
+
+    @staticmethod
+    def _ensure_4d_feature(feature, view_idx: int | None = None):
+        if not isinstance(feature, torch.Tensor):
+            raise TypeError(f"map-anything view[{view_idx}] is not a Tensor: {type(feature)}")
+        if feature.dim() == 4:
+            return feature
+        if feature.dim() == 3:
+            b, c, l = feature.shape
+            if l == 1:
+                return feature.view(b, c, 1, 1)
+            side = int(l**0.5)
+            if side * side == l:
+                return feature.view(b, c, side, side)
+        raise ValueError(
+            f"map-anything view[{view_idx}] has unsupported shape {tuple(feature.shape)}; "
+            "expected 4D (N,C,H,W) or 3D with L=1 or perfect square."
+        )
 
     def forward(self, pixel_values, intrinsics):
         views = []
@@ -75,7 +103,12 @@ class MapAnythingWrapper(nn.Module):
             except Exception:
                 self._debug_logged_encode_views = 1
         if isinstance(all_encoder_features, (list, tuple)):
-            all_encoder_features = [self._unwrap_feature(f) for f in all_encoder_features]
+            converted = []
+            for i, f in enumerate(all_encoder_features):
+                f = self._unwrap_feature(f)
+                f = self._ensure_4d_feature(f, view_idx=i)
+                converted.append(f)
+            all_encoder_features = converted
 
         info_sharing_input = MultiViewTransformerInput(features=all_encoder_features)
 
