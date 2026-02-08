@@ -1,0 +1,3 @@
+[submodule "starVLA/mapanything_llava3d/model/map-anything"]
+	path = starVLA/mapanything_llava3d/model/map-anything
+	url = https://github.com/facebookresearch/map-anything.git
