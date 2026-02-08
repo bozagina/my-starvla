@@ -18,7 +18,7 @@ export PYOPENGL_PLATFORM=osmesa
 host="127.0.0.1"
 base_port=5694
 unnorm_key="franka"
-your_ckpt=./results/Checkpoints/1229_libero4in1_MapAnythingLlava3DPI_s42_20260201_042829/checkpoints/steps_20000_pytorch_model.pt
+your_ckpt=/2025233147/zzq/SpatialVLA_llava3d/model_zoo/qwen3vlPI/checkpoints/steps_100000_pytorch_model.pt
 
 folder_name=$(echo "$your_ckpt" | awk -F'/' '{print $(NF-2)"_"$(NF-1)"_"$NF}')
 # === End of environment variable configuration ===

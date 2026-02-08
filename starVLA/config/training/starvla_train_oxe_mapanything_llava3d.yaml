@@ -12,9 +12,9 @@ framework:
     base_vlm: ./checkpoints/mapanything_llava3d_vlm_base
     attn_implementation: flash_attention_2
     vl_hidden_dim: 4096
-    prefix_image_dropout_prob: 0.1
-    prefix_lang_dropout_prob: 0.1
-    use_geometric_branch: true
+    prefix_image_dropout_prob: 0.0
+    prefix_lang_dropout_prob: 0.0
+    use_geometric_branch: false
   dino:
     dino_backbone: dinov2_vits14
 
@@ -28,10 +28,10 @@ framework:
     future_action_window_size: 7
     action_horizon: 8
     past_action_window_size: 0
-    repeated_diffusion_steps: 2
-    noise_beta_alpha: 1.5
+    repeated_diffusion_steps: 8
+    noise_beta_alpha: 1.0
     noise_beta_beta: 1.0
-    noise_s: 0.999
+    noise_s: 1.0
     num_timestep_buckets: 1000
     num_inference_timesteps: 4
     num_target_vision_tokens: 32
@@ -42,7 +42,7 @@ framework:
       final_dropout: true
       interleave_self_attention: true
       norm_type: "ada_norm"
-      num_layers: 16
+      num_layers: 12
       output_dim: 1024
       positional_embeddings: null
 
@@ -65,7 +65,7 @@ trainer:
   epochs: 100
   max_train_steps: 100000
   num_warmup_steps: 5000
-  lang_freeze_steps: 0
+  lang_freeze_steps: 2000
   save_interval: 5000
   # save_interval: 5
   eval_interval: 100

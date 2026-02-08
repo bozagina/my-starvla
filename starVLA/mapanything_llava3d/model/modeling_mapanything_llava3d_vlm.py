@@ -11,6 +11,12 @@ from transformers.generation import GenerationMixin
 from .configuration_mapanything_llava3d import MapAnythingLlava3DConfig
 from .modeling_mapanything import MapAnythingWrapper
 from .modeling_llava3d_v2 import LLaVA3DForCausalLMV2
+from starVLA.model.modules.action_model.LayerwiseFM_ActionHeader import (
+    init_tensor_parallel,
+    TPLinear,
+    ColumnParallelLinear,
+    RowParallelLinear,
+)
 
 import torchvision.transforms.functional as TF
 
@@ -83,11 +89,27 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
 
         self.hidden_size = config.hidden_size
         self.vision_hidden_size = config.vision_config.hidden_size
-        self.vision_projector = projector_model or nn.Linear(self.vision_hidden_size, self.hidden_size)
-
+        tp_size = getattr(config, "tp_size", 1)
+        self.vlm_tp_context = init_tensor_parallel(tp_size)
+        if projector_model is not None:
+            self.vision_projector = projector_model
+        else:
+            self.vision_projector = TPLinear(
+                self.vision_hidden_size,
+                self.hidden_size,
+                tp_context=self.vlm_tp_context,
+            )
         geom_dim = self._infer_geom_dim()
-        self.geometric_projector = nn.Linear(geom_dim, self.hidden_size)
-        self.fusion_projector = nn.Linear(self.hidden_size * 2, self.hidden_size)
+        self.geometric_projector = TPLinear(
+            geom_dim,
+            self.hidden_size,
+            tp_context=self.vlm_tp_context,
+        )
+        self.fusion_projector = TPLinear(
+            self.hidden_size * 2,
+            self.hidden_size,
+            tp_context=self.vlm_tp_context,
+        )
 
         if config.use_spatial_token:
             self.spatial_embed_tokens = nn.Embedding(config.spatial_token_num, self.hidden_size)
@@ -102,6 +124,120 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
         self._llava_vision_available = True
         self.prefix_lang_dropout_prob = getattr(config, "prefix_lang_dropout_prob", 0.0)
         self.prefix_image_dropout_prob = getattr(config, "prefix_image_dropout_prob", 0.0)
+
+        self._enable_language_model_tp()
+
+    def _enable_language_model_tp(self):
+        tp_context = getattr(self, "vlm_tp_context", None)
+        if tp_context is None or tp_context.tp_size <= 1:
+            return
+        language_model = getattr(self, "language_model", None)
+        if language_model is None:
+            return
+        base_model = getattr(language_model, "model", None)
+        if base_model is None:
+            return
+        if hasattr(base_model, "get_model"):
+            core_model = base_model.get_model()
+        else:
+            core_model = getattr(base_model, "model", None) or base_model
+        decoder = getattr(core_model, "model", None)
+        if decoder is not None and hasattr(decoder, "layers"):
+            layers = decoder.layers
+        elif hasattr(core_model, "layers"):
+            layers = core_model.layers
+        else:
+            return
+        tp_size = tp_context.tp_size
+        for layer in layers:
+            attn = getattr(layer, "self_attn", None)
+            mlp = getattr(layer, "mlp", None)
+            if attn is None or mlp is None:
+                continue
+            o_proj = getattr(attn, "o_proj", None)
+            gate_proj = getattr(mlp, "gate_proj", None)
+            up_proj = getattr(mlp, "up_proj", None)
+            down_proj = getattr(mlp, "down_proj", None)
+            if o_proj is None or gate_proj is None or up_proj is None or down_proj is None:
+                continue
+            hidden_size = o_proj.in_features
+            intermediate_size = gate_proj.out_features
+            if hidden_size % tp_size != 0 or intermediate_size % tp_size != 0:
+                continue
+            if isinstance(o_proj, nn.Linear):
+                new_o_proj = RowParallelLinear(
+                    hidden_size,
+                    hidden_size,
+                    bias=o_proj.bias is not None,
+                    tp_context=tp_context,
+                    reduce_output=True,
+                )
+                with torch.no_grad():
+                    w = o_proj.weight.data
+                    out_dim, in_dim = w.shape
+                    per_in = in_dim // tp_size
+                    rank = tp_context.tp_rank
+                    start = rank * per_in
+                    end = start + per_in
+                    shard = w[:, start:end]
+                    new_o_proj.weight.data.copy_(shard.t().contiguous())
+                    if new_o_proj.bias is not None and o_proj.bias is not None:
+                        new_o_proj.bias.data.copy_(o_proj.bias.data)
+                attn.o_proj = new_o_proj
+            if isinstance(gate_proj, nn.Linear) and isinstance(up_proj, nn.Linear) and isinstance(down_proj, nn.Linear):
+                new_gate = ColumnParallelLinear(
+                    hidden_size,
+                    intermediate_size,
+                    bias=gate_proj.bias is not None,
+                    tp_context=tp_context,
+                    gather_output=False,
+                )
+                new_up = ColumnParallelLinear(
+                    hidden_size,
+                    intermediate_size,
+                    bias=up_proj.bias is not None,
+                    tp_context=tp_context,
+                    gather_output=False,
+                )
+                new_down = RowParallelLinear(
+                    intermediate_size,
+                    hidden_size,
+                    bias=down_proj.bias is not None,
+                    tp_context=tp_context,
+                    reduce_output=True,
+                )
+                with torch.no_grad():
+                    w_gate = gate_proj.weight.data
+                    w_up = up_proj.weight.data
+                    w_down = down_proj.weight.data
+                    out_gate, in_gate = w_gate.shape
+                    out_up, in_up = w_up.shape
+                    out_down, in_down = w_down.shape
+                    per_out_gate = out_gate // tp_size
+                    per_out_up = out_up // tp_size
+                    per_in_down = in_down // tp_size
+                    rank = tp_context.tp_rank
+                    start_gate = rank * per_out_gate
+                    end_gate = start_gate + per_out_gate
+                    start_up = rank * per_out_up
+                    end_up = start_up + per_out_up
+                    start_down = rank * per_in_down
+                    end_down = start_down + per_in_down
+                    shard_gate = w_gate[start_gate:end_gate, :]
+                    shard_up = w_up[start_up:end_up, :]
+                    shard_down = w_down[:, start_down:end_down]
+                    new_gate.weight.data.copy_(shard_gate.t().contiguous())
+                    new_up.weight.data.copy_(shard_up.t().contiguous())
+                    new_down.weight.data.copy_(shard_down.t().contiguous())
+                    if new_gate.bias is not None and gate_proj.bias is not None:
+                        new_gate.bias.data.copy_(gate_proj.bias.data[start_gate:end_gate])
+                    if new_up.bias is not None and up_proj.bias is not None:
+                        new_up.bias.data.copy_(up_proj.bias.data[start_up:end_up])
+                    if new_down.bias is not None and down_proj.bias is not None:
+                        new_down.bias.data.copy_(down_proj.bias.data)
+                mlp.gate_proj = new_gate
+                mlp.up_proj = new_up
+                mlp.down_proj = new_down
 
     def _infer_geom_dim(self) -> int:
         mam = getattr(self.geometric_model, "map_anything_model", None)

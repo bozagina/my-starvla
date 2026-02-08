@@ -92,8 +92,63 @@ class baseframework(PreTrainedModel):
         FrameworkModel.norm_stats = norm_stats
         # Load from Checkpoint (Custom --> should load both *projector* and *llm* weights)
         model_state_dict = torch.load(pretrained_checkpoint, map_location="cpu")
-        # logger.info(f"Loading model weights from `{pretrained_checkpoint}`")
         model_keys = set(FrameworkModel.state_dict().keys())
+
+        key_pairs = [
+            (
+                "mapanythingllava3d_vlm_interface.model.vision_projector.weight",
+                "mapanythingllava3d_vlm_interface.model.vision_projector.linear.weight",
+            ),
+            (
+                "mapanythingllava3d_vlm_interface.model.vision_projector.bias",
+                "mapanythingllava3d_vlm_interface.model.vision_projector.linear.bias",
+            ),
+            (
+                "mapanythingllava3d_vlm_interface.model.geometric_projector.weight",
+                "mapanythingllava3d_vlm_interface.model.geometric_projector.linear.weight",
+            ),
+            (
+                "mapanythingllava3d_vlm_interface.model.geometric_projector.bias",
+                "mapanythingllava3d_vlm_interface.model.geometric_projector.linear.bias",
+            ),
+            (
+                "mapanythingllava3d_vlm_interface.model.fusion_projector.weight",
+                "mapanythingllava3d_vlm_interface.model.fusion_projector.linear.weight",
+            ),
+            (
+                "mapanythingllava3d_vlm_interface.model.fusion_projector.bias",
+                "mapanythingllava3d_vlm_interface.model.fusion_projector.linear.bias",
+            ),
+            (
+                "action_model.action_encoder.layer1.weight",
+                "action_model.action_encoder.layer1.linear.weight",
+            ),
+            (
+                "action_model.action_encoder.layer1.bias",
+                "action_model.action_encoder.layer1.linear.bias",
+            ),
+            (
+                "action_model.action_encoder.layer2.weight",
+                "action_model.action_encoder.layer2.linear.weight",
+            ),
+            (
+                "action_model.action_encoder.layer2.bias",
+                "action_model.action_encoder.layer2.linear.bias",
+            ),
+            (
+                "action_model.action_encoder.layer3.weight",
+                "action_model.action_encoder.layer3.linear.weight",
+            ),
+            (
+                "action_model.action_encoder.layer3.bias",
+                "action_model.action_encoder.layer3.linear.bias",
+            ),
+        ]
+
+        for old_key, new_key in key_pairs:
+            if old_key in model_state_dict and new_key in model_keys and new_key not in model_state_dict:
+                model_state_dict[new_key] = model_state_dict.pop(old_key)
+
         checkpoint_keys = set(model_state_dict.keys())
         try:
             FrameworkModel.load_state_dict(model_state_dict, strict=True)

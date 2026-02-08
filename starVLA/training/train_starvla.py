@@ -329,6 +329,11 @@ class VLATrainer(TrainerUtils):
             if dist.get_rank() == 0:
                 # add learning rate 
                 metrics["learning_rate"] = self.lr_scheduler.get_last_lr()[0] # see lr group in yaml.trainer.learning_rate
+                if torch.cuda.is_available():
+                    current_device = torch.cuda.current_device()
+                    metrics["debug/max_memory_allocated_mb"] = float(
+                        torch.cuda.max_memory_allocated(current_device) / (1024 * 1024)
+                    )
 
                 geom_vision_only_steps = getattr(self.config.trainer, "geom_vision_only_steps", 0)
                 lang_freeze_steps = getattr(self.config.trainer, "lang_freeze_steps", 0)
@@ -500,6 +505,14 @@ class VLATrainer(TrainerUtils):
             logger.info(f"  Per device batch size = {self.config.datasets.vla_data.per_device_batch_size}")
             logger.info(f"  Gradient accumulation steps = {self.config.trainer.gradient_accumulation_steps}")
             logger.info(f"  Total batch size = {self.total_batch_size}")
+            tp_size = getattr(self.config.framework.action_model, "tp_size", 1)
+            world_size = self.accelerator.num_processes
+            if tp_size > 1 and world_size % tp_size == 0:
+                dp_size = world_size // tp_size
+            else:
+                dp_size = world_size
+            logger.info(f"  Tensor parallel size = {tp_size}")
+            logger.info(f"  Data parallel size = {dp_size}")
 
     def _register_grad_hooks(self, base_model=None):
         """register backward hooks on key modules to track output gradient norms (compatible with ZeRO)."""

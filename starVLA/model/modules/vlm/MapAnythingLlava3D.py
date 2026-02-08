@@ -52,6 +52,7 @@ class _MapAnythingLlava3D_Interface(nn.Module):
                     use_geom = bool(getattr(ma_cfg, "use_geometric_branch"))
                 elif hasattr(ma_cfg, "use_geom"):
                     use_geom = bool(getattr(ma_cfg, "use_geom"))
+                tp_size_vlm = getattr(ma_cfg, "tp_size", None)
         except Exception:
             prefix_image_dropout_prob = 0.0
             prefix_lang_dropout_prob = 0.0
@@ -70,6 +71,8 @@ class _MapAnythingLlava3D_Interface(nn.Module):
                 mapanything_cfg.prefix_image_dropout_prob = prefix_image_dropout_prob
                 mapanything_cfg.prefix_lang_dropout_prob = prefix_lang_dropout_prob
                 setattr(mapanything_cfg, "use_geometric_branch", use_geom)
+                if "tp_size_vlm" in locals() and tp_size_vlm is not None:
+                    setattr(mapanything_cfg, "tp_size", int(tp_size_vlm))
                 print(f"Loaded MapAnythingLlava3D VLM from merged checkpoint: {base_vlm_path}")
             except Exception as e:
                 raise AssertionError(f"Failed to load merged VLM checkpoint from {base_vlm_path}: {e}")
@@ -88,6 +91,8 @@ class _MapAnythingLlava3D_Interface(nn.Module):
                 prefix_image_dropout_prob=prefix_image_dropout_prob,
                 prefix_lang_dropout_prob=prefix_lang_dropout_prob,
             )
+            if "tp_size_vlm" in locals() and tp_size_vlm is not None:
+                setattr(mapanything_cfg, "tp_size", int(tp_size_vlm))
             model = MapAnythingLlava3DForConditionalGeneration(mapanything_cfg)
         image_processor = AutoImageProcessor.from_pretrained(vision_model_name_or_path, trust_remote_code=True)
         tokenizer = AutoTokenizer.from_pretrained(language_model_name_or_path, trust_remote_code=True)

@@ -5,9 +5,11 @@
 
 
 from dataclasses import dataclass, field
+import math
 
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 from torch import nn
 from torch.distributions import Beta
 from transformers import PretrainedConfig
@@ -19,6 +21,236 @@ from starVLA.model.modules.action_model.flow_matching_head.action_encoder import
 )
 
 from starVLA.model.modules.action_model.flow_matching_head.cross_attention_dit import DiT, SelfAttentionTransformer
+
+
+class TensorParallelContext:
+    def __init__(self, tp_size, tp_rank, dp_size, dp_rank, tp_group):
+        self.tp_size = tp_size
+        self.tp_rank = tp_rank
+        self.dp_size = dp_size
+        self.dp_rank = dp_rank
+        self.tp_group = tp_group
+
+
+_TP_GROUP_CACHE = {}
+
+
+def init_tensor_parallel(tp_size: int):
+    if tp_size is None or tp_size <= 1:
+        return None
+    if not dist.is_available() or not dist.is_initialized():
+        return None
+    world_size = dist.get_world_size()
+    if world_size % tp_size != 0:
+        raise ValueError(f"world_size={world_size} is not divisible by tp_size={tp_size}")
+    rank = dist.get_rank()
+    dp_size = world_size // tp_size
+    dp_rank = rank // tp_size
+    tp_rank = rank % tp_size
+    group_key = (world_size, tp_size, dp_rank)
+    if group_key in _TP_GROUP_CACHE:
+        tp_group = _TP_GROUP_CACHE[group_key]
+    else:
+        ranks = [dp_rank * tp_size + i for i in range(tp_size)]
+        tp_group = dist.new_group(ranks=ranks)
+        _TP_GROUP_CACHE[group_key] = tp_group
+    if dist.get_rank() == 0:
+        print(
+            f"[TensorParallel] world_size={world_size}, tp_size={tp_size}, "
+            f"dp_size={dp_size}"
+        )
+    return TensorParallelContext(tp_size=tp_size, tp_rank=tp_rank, dp_size=dp_size, dp_rank=dp_rank, tp_group=tp_group)
+
+
+class TPLinear(nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        tp_context: TensorParallelContext = None,
+        gather_output: bool = True,
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.gather_output = gather_output
+        self.tp_context = tp_context
+        self.is_tp = (
+            tp_context is not None
+            and tp_context.tp_size > 1
+            and dist.is_available()
+            and dist.is_initialized()
+        )
+        if not self.is_tp:
+            self.linear = nn.Linear(in_features, out_features, bias=bias)
+            self.tp_world_size = 1
+            self.tp_rank = 0
+        else:
+            tp_world_size = tp_context.tp_size
+            if out_features % tp_world_size != 0:
+                raise ValueError(
+                    f"out_features={out_features} must be divisible by tp_size={tp_world_size}"
+                )
+            self.tp_world_size = tp_world_size
+            self.tp_rank = tp_context.tp_rank
+            per_rank_out = out_features // tp_world_size
+            self.weight = nn.Parameter(torch.empty(in_features, per_rank_out))
+            if bias:
+                self.bias = nn.Parameter(torch.empty(per_rank_out))
+            else:
+                self.bias = None
+            nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+            if self.bias is not None:
+                fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+                bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+                nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.is_tp:
+            return self.linear(x)
+        x_shape = x.shape
+        x_2d = x.reshape(-1, self.in_features)
+        local_out = x_2d.matmul(self.weight)
+        if self.bias is not None:
+            local_out = local_out + self.bias
+        if self.gather_output:
+            tp_group = self.tp_context.tp_group
+            outputs = [
+                torch.empty_like(local_out) for _ in range(self.tp_world_size)
+            ]
+            dist.all_gather(outputs, local_out, group=tp_group)
+            out_2d = torch.cat(outputs, dim=-1)
+        else:
+            out_2d = local_out
+        out = out_2d.view(*x_shape[:-1], self.out_features)
+        return out
+
+
+class ColumnParallelLinear(nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        tp_context: TensorParallelContext = None,
+        gather_output: bool = True,
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.gather_output = gather_output
+        self.tp_context = tp_context
+        self.is_tp = (
+            tp_context is not None
+            and tp_context.tp_size > 1
+            and dist.is_available()
+            and dist.is_initialized()
+        )
+        if not self.is_tp:
+            self.linear = nn.Linear(in_features, out_features, bias=bias)
+            self.tp_world_size = 1
+        else:
+            tp_world_size = tp_context.tp_size
+            if out_features % tp_world_size != 0:
+                raise ValueError(
+                    f"out_features={out_features} must be divisible by tp_size={tp_world_size}"
+                )
+            self.tp_world_size = tp_world_size
+            per_rank_out = out_features // tp_world_size
+            self.weight = nn.Parameter(torch.empty(in_features, per_rank_out))
+            if bias:
+                self.bias = nn.Parameter(torch.empty(per_rank_out))
+            else:
+                self.bias = None
+            nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+            if self.bias is not None:
+                fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+                bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+                nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.is_tp:
+            return self.linear(x)
+        x_shape = x.shape
+        x_2d = x.reshape(-1, self.in_features)
+        local_out = x_2d.matmul(self.weight)
+        if self.bias is not None:
+            local_out = local_out + self.bias
+        if self.gather_output:
+            tp_group = self.tp_context.tp_group
+            outputs = [
+                torch.empty_like(local_out) for _ in range(self.tp_world_size)
+            ]
+            dist.all_gather(outputs, local_out, group=tp_group)
+            out_2d = torch.cat(outputs, dim=-1)
+        else:
+            out_2d = local_out
+        out = out_2d.view(*x_shape[:-1], self.out_features)
+        return out
+
+
+class RowParallelLinear(nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        tp_context: TensorParallelContext = None,
+        reduce_output: bool = True,
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.reduce_output = reduce_output
+        self.tp_context = tp_context
+        self.is_tp = (
+            tp_context is not None
+            and tp_context.tp_size > 1
+            and dist.is_available()
+            and dist.is_initialized()
+        )
+        if not self.is_tp:
+            self.linear = nn.Linear(in_features, out_features, bias=bias)
+            self.tp_world_size = 1
+        else:
+            tp_world_size = tp_context.tp_size
+            if in_features % tp_world_size != 0:
+                raise ValueError(
+                    f"in_features={in_features} must be divisible by tp_size={tp_world_size}"
+                )
+            self.tp_world_size = tp_world_size
+            per_rank_in = in_features // tp_world_size
+            self.weight = nn.Parameter(torch.empty(per_rank_in, out_features))
+            if bias:
+                self.bias = nn.Parameter(torch.empty(out_features))
+            else:
+                self.bias = None
+            nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+            if self.bias is not None:
+                fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+                bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+                nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.is_tp:
+            return self.linear(x)
+        x_shape = x.shape
+        x_2d = x.reshape(-1, self.in_features)
+        tp_world_size = self.tp_context.tp_size
+        per_rank_in = self.in_features // tp_world_size
+        rank = self.tp_context.tp_rank
+        start = rank * per_rank_in
+        end = start + per_rank_in
+        x_local = x_2d[:, start:end]
+        local_out = x_local.matmul(self.weight)
+        if self.bias is not None:
+            local_out = local_out + self.bias
+        if self.reduce_output:
+            tp_group = self.tp_context.tp_group
+            dist.all_reduce(local_out, group=tp_group)
+        out = local_out.view(*x_shape[:-1], self.out_features)
+        return out
 
 # TODO try to meger DiT Modules with follow_match_head, they are just the same arch, but diff loss, use diffusers package will be simple
 
@@ -51,23 +283,36 @@ class CategorySpecificMLP(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, input_dim, hidden_dim=1024, output_dim=2048):
+    def __init__(
+        self,
+        input_dim,
+        hidden_dim=1024,
+        output_dim=2048,
+        tp_context: TensorParallelContext = None,
+    ):
         super().__init__()
-        self.layer1 = nn.Linear(input_dim, hidden_dim)
-        self.layer2 = nn.Linear(hidden_dim, output_dim)
+        use_tp = tp_context is not None and dist.is_available() and dist.is_initialized()
+        if use_tp and hidden_dim % tp_context.tp_size == 0:
+            self.layer1 = TPLinear(input_dim, hidden_dim, tp_context=tp_context)
+        else:
+            self.layer1 = nn.Linear(input_dim, hidden_dim)
+        if use_tp and output_dim % tp_context.tp_size == 0:
+            self.layer2 = TPLinear(hidden_dim, output_dim, tp_context=tp_context)
+        else:
+            self.layer2 = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, x):
         return self.layer2(F.relu(self.layer1(x)))
 
 
 class ActionEncoder(nn.Module):
-    def __init__(self, action_dim, hidden_size=1024):
+    def __init__(self, action_dim, hidden_size=1024, tp_context: TensorParallelContext = None):
         super().__init__()
         self.hidden_size = hidden_size
         self.action_dim = action_dim
-        self.layer1 = nn.Linear(action_dim, hidden_size)
-        self.layer2 = nn.Linear(2 * hidden_size, hidden_size)
-        self.layer3 = nn.Linear(hidden_size, hidden_size)
+        self.layer1 = TPLinear(action_dim, hidden_size, tp_context=tp_context)
+        self.layer2 = TPLinear(2 * hidden_size, hidden_size, tp_context=tp_context)
+        self.layer3 = TPLinear(hidden_size, hidden_size, tp_context=tp_context)
         self.pos_encoding = SinusoidalPositionalEncoding(hidden_size)
 
     def forward(self, actions, timesteps):
@@ -221,6 +466,8 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
     ):
         super().__init__()
         action_config = global_config.framework.action_model
+        tp_size = getattr(action_config, "tp_size", 1)
+        self.tp_context = init_tensor_parallel(tp_size)
         diffusion_model_cfg = action_config.diffusion_model_cfg
 
         num_vl_layers = global_config.framework.mapanything_llava3d.num_vl_layers
@@ -242,9 +489,33 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         DiTConfig["input_embedding_dim"] = global_config.framework.mapanything_llava3d.vl_hidden_dim
         DiTConfig["num_attention_heads"] = DiTConfig["input_embedding_dim"] // DiTConfig["attention_head_dim"]
         diffusion_model_cfg.update(DiTConfig)
-        diffusion_model_cfg.cross_attention_dim = DiTConfig["input_embedding_dim"]
+        if isinstance(diffusion_model_cfg, dict):
+            diffusion_model_cfg["cross_attention_dim"] = DiTConfig["input_embedding_dim"]
+            diffusion_model_cfg["tp_size"] = tp_size
+            diffusion_model_cfg["tp_enable_ffn"] = tp_size > 1
+        else:
+            diffusion_model_cfg.cross_attention_dim = DiTConfig["input_embedding_dim"]
+            diffusion_model_cfg.tp_size = tp_size
+            diffusion_model_cfg.tp_enable_ffn = tp_size > 1
         self.input_embedding_dim = global_config.framework.mapanything_llava3d.vl_hidden_dim
         self.model = DiT(**diffusion_model_cfg)
+        if self.tp_context is not None and self.tp_context.tp_size > 1 and dist.is_initialized():
+            out1_dim = self.model.proj_out_1.out_features
+            out2_dim = self.model.proj_out_2.out_features
+            proj1 = TPLinear(
+                self.model.inner_dim,
+                out1_dim,
+                bias=self.model.proj_out_1.bias is not None,
+                tp_context=self.tp_context,
+            )
+            proj2 = TPLinear(
+                self.model.inner_dim,
+                out2_dim,
+                bias=self.model.proj_out_2.bias is not None,
+                tp_context=self.tp_context,
+            )
+            self.model.proj_out_1 = proj1
+            self.model.proj_out_2 = proj2
         if isinstance(diffusion_model_cfg, dict):
             dit_output_dim = diffusion_model_cfg.get("output_dim", self.input_embedding_dim)
         else:
@@ -257,19 +528,31 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         self.state_encoder = MLP(
             input_dim=action_config.state_dim,
             output_dim=self.input_embedding_dim,
+            tp_context=self.tp_context,
         ) if action_config.state_dim else None
 
         self.action_encoder = ActionEncoder(
             action_dim=action_config.action_dim,
             hidden_size=self.input_embedding_dim,
+            tp_context=self.tp_context,
         )
         self.action_decoder = MLP(
             input_dim=self.dit_out_hidden_size,
             hidden_dim=1024,
             output_dim=self.action_dim,
+            tp_context=self.tp_context,
         )
         self.future_tokens = nn.Embedding(action_config.num_target_vision_tokens, self.input_embedding_dim)
         nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
+
+        if self.tp_context is not None and self.tp_context.tp_rank == 0:
+            try:
+                print("TensorParallel shard proj_out_1", tuple(self.model.proj_out_1.weight.shape))
+                print("TensorParallel shard proj_out_2", tuple(self.model.proj_out_2.weight.shape))
+                print("TensorParallel shard action_decoder.layer1", tuple(self.action_decoder.layer1.weight.shape))
+                print("TensorParallel shard action_decoder.layer2", tuple(self.action_decoder.layer2.weight.shape))
+            except Exception:
+                pass
 
         if action_config.add_pos_embed:
             self.position_embedding = nn.Embedding(action_config.max_seq_len, self.input_embedding_dim)

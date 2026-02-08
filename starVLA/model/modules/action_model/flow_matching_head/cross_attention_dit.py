@@ -17,6 +17,7 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 from diffusers import ConfigMixin, ModelMixin
 from diffusers.configuration_utils import register_to_config
 from diffusers.models.attention import Attention, FeedForward
@@ -39,6 +40,164 @@ class TimestepEncoder(nn.Module):
         timesteps_proj = self.time_proj(timesteps).to(dtype)
         timesteps_emb = self.timestep_embedder(timesteps_proj)  # (N, D)
         return timesteps_emb
+
+
+class DiTTPContext:
+    def __init__(self, tp_size, tp_rank, tp_group):
+        self.tp_size = tp_size
+        self.tp_rank = tp_rank
+        self.tp_group = tp_group
+
+
+_DIT_TP_GROUP_CACHE = {}
+
+
+def init_dit_tensor_parallel(tp_size: int):
+    if tp_size is None or tp_size <= 1:
+        return None
+    if not dist.is_available() or not dist.is_initialized():
+        return None
+    world_size = dist.get_world_size()
+    if world_size % tp_size != 0:
+        raise ValueError(f"world_size={world_size} is not divisible by tp_size={tp_size}")
+    rank = dist.get_rank()
+    dp_size = world_size // tp_size
+    dp_rank = rank // tp_size
+    tp_rank = rank % tp_size
+    key = (world_size, tp_size, dp_rank)
+    if key in _DIT_TP_GROUP_CACHE:
+        tp_group = _DIT_TP_GROUP_CACHE[key]
+    else:
+        ranks = [dp_rank * tp_size + i for i in range(tp_size)]
+        tp_group = dist.new_group(ranks=ranks)
+        _DIT_TP_GROUP_CACHE[key] = tp_group
+    return DiTTPContext(tp_size=tp_size, tp_rank=tp_rank, tp_group=tp_group)
+
+
+class ColumnParallelLinear(nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        tp_context: DiTTPContext = None,
+        gather_output: bool = True,
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.gather_output = gather_output
+        self.tp_context = tp_context
+        self.is_tp = (
+            tp_context is not None
+            and tp_context.tp_size > 1
+            and dist.is_available()
+            and dist.is_initialized()
+        )
+        if not self.is_tp:
+            self.linear = nn.Linear(in_features, out_features, bias=bias)
+            self.tp_world_size = 1
+        else:
+            tp_world_size = tp_context.tp_size
+            if out_features % tp_world_size != 0:
+                raise ValueError(
+                    f"out_features={out_features} must be divisible by tp_size={tp_world_size}"
+                )
+            self.tp_world_size = tp_world_size
+            per_rank_out = out_features // tp_world_size
+            self.weight = nn.Parameter(torch.empty(in_features, per_rank_out))
+            if bias:
+                self.bias = nn.Parameter(torch.empty(per_rank_out))
+            else:
+                self.bias = None
+            nn.init.kaiming_uniform_(self.weight, a=5**0.5)
+            if self.bias is not None:
+                fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+                bound = 1 / fan_in**0.5 if fan_in > 0 else 0
+                nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.is_tp:
+            return self.linear(x)
+        x_shape = x.shape
+        x_2d = x.reshape(-1, self.in_features)
+        local_out = x_2d.matmul(self.weight)
+        if self.bias is not None:
+            local_out = local_out + self.bias
+        if self.gather_output:
+            tp_group = self.tp_context.tp_group
+            outputs = [
+                torch.empty_like(local_out) for _ in range(self.tp_world_size)
+            ]
+            dist.all_gather(outputs, local_out, group=tp_group)
+            out_2d = torch.cat(outputs, dim=-1)
+        else:
+            out_2d = local_out
+        out = out_2d.view(*x_shape[:-1], self.out_features)
+        return out
+
+
+class RowParallelLinear(nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        tp_context: DiTTPContext = None,
+        reduce_output: bool = True,
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.reduce_output = reduce_output
+        self.tp_context = tp_context
+        self.is_tp = (
+            tp_context is not None
+            and tp_context.tp_size > 1
+            and dist.is_available()
+            and dist.is_initialized()
+        )
+        if not self.is_tp:
+            self.linear = nn.Linear(in_features, out_features, bias=bias)
+            self.tp_world_size = 1
+        else:
+            tp_world_size = tp_context.tp_size
+            if in_features % tp_world_size != 0:
+                raise ValueError(
+                    f"in_features={in_features} must be divisible by tp_size={tp_world_size}"
+                )
+            self.tp_world_size = tp_world_size
+            per_rank_in = in_features // tp_world_size
+            self.weight = nn.Parameter(torch.empty(per_rank_in, out_features))
+            if bias:
+                self.bias = nn.Parameter(torch.empty(out_features))
+            else:
+                self.bias = None
+            nn.init.kaiming_uniform_(self.weight, a=5**0.5)
+            if self.bias is not None:
+                fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+                bound = 1 / fan_in**0.5 if fan_in > 0 else 0
+                nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.is_tp:
+            return self.linear(x)
+        x_shape = x.shape
+        x_2d = x.reshape(-1, self.in_features)
+        tp_world_size = self.tp_context.tp_size
+        per_rank_in = self.in_features // tp_world_size
+        rank = self.tp_context.tp_rank
+        start = rank * per_rank_in
+        end = start + per_rank_in
+        x_local = x_2d[:, start:end]
+        local_out = x_local.matmul(self.weight)
+        if self.bias is not None:
+            local_out = local_out + self.bias
+        if self.reduce_output:
+            tp_group = self.tp_context.tp_group
+            dist.all_reduce(local_out, group=tp_group)
+        out = local_out.view(*x_shape[:-1], self.out_features)
+        return out
 
 
 class AdaLayerNorm(nn.Module):
@@ -67,6 +226,50 @@ class AdaLayerNorm(nn.Module):
         return x
 
 
+class TPFeedForward(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        inner_dim: int,
+        dropout: float,
+        activation_fn: str,
+        final_dropout: bool,
+        bias: bool,
+        tp_context: DiTTPContext,
+    ):
+        super().__init__()
+        use_tp = (
+            tp_context is not None
+            and dist.is_available()
+            and dist.is_initialized()
+            and dim % tp_context.tp_size == 0
+            and inner_dim % tp_context.tp_size == 0
+        )
+        if use_tp:
+            self.w1 = ColumnParallelLinear(dim, inner_dim, bias=bias, tp_context=tp_context, gather_output=False)
+            self.w2 = RowParallelLinear(inner_dim, dim, bias=bias, tp_context=tp_context, reduce_output=True)
+        else:
+            self.w1 = nn.Linear(dim, inner_dim, bias=bias)
+            self.w2 = nn.Linear(inner_dim, dim, bias=bias)
+        self.act = FeedForward(
+            dim,
+            dropout=dropout,
+            activation_fn=activation_fn,
+            final_dropout=final_dropout,
+            inner_dim=inner_dim,
+            bias=bias,
+        ).act
+        self.dropout = nn.Dropout(dropout) if final_dropout else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        hidden = self.w1(x)
+        hidden = self.act(hidden)
+        if self.dropout is not None:
+            hidden = self.dropout(hidden)
+        out = self.w2(hidden)
+        return out
+
+
 class BasicTransformerBlock(nn.Module):
     def __init__(
         self,
@@ -88,6 +291,8 @@ class BasicTransformerBlock(nn.Module):
         ff_inner_dim: Optional[int] = None,
         ff_bias: bool = True,
         attention_out_bias: bool = True,
+        tp_context: DiTTPContext = None,
+        use_tp_ffn: bool = False,
     ):
         super().__init__()
         self.dim = dim
@@ -101,6 +306,8 @@ class BasicTransformerBlock(nn.Module):
         self.positional_embeddings = positional_embeddings
         self.num_positional_embeddings = num_positional_embeddings
         self.norm_type = norm_type
+        self.tp_context = tp_context
+        self.use_tp_ffn = use_tp_ffn
 
         if positional_embeddings and (num_positional_embeddings is None):
             raise ValueError(
@@ -134,14 +341,26 @@ class BasicTransformerBlock(nn.Module):
 
         # 3. Feed-forward
         self.norm3 = nn.LayerNorm(dim, norm_eps, norm_elementwise_affine)
-        self.ff = FeedForward(
-            dim,
-            dropout=dropout,
-            activation_fn=activation_fn,
-            final_dropout=final_dropout,
-            inner_dim=ff_inner_dim,
-            bias=ff_bias,
-        )
+        inner_dim = ff_inner_dim if ff_inner_dim is not None else dim * 4
+        if use_tp_ffn and tp_context is not None:
+            self.ff = TPFeedForward(
+                dim=dim,
+                inner_dim=inner_dim,
+                dropout=dropout,
+                activation_fn=activation_fn,
+                final_dropout=final_dropout,
+                bias=ff_bias,
+                tp_context=tp_context,
+            )
+        else:
+            self.ff = FeedForward(
+                dim,
+                dropout=dropout,
+                activation_fn=activation_fn,
+                final_dropout=final_dropout,
+                inner_dim=inner_dim,
+                bias=ff_bias,
+            )
         if final_dropout:
             self.final_dropout = nn.Dropout(dropout)
         else:
@@ -218,6 +437,9 @@ class DiT(ModelMixin, ConfigMixin):
         self.attention_head_dim = attention_head_dim
         self.inner_dim = self.config.num_attention_heads * self.config.attention_head_dim
         self.gradient_checkpointing = False
+        tp_size = getattr(self.config, "tp_size", 1)
+        self.tp_context = init_dit_tensor_parallel(tp_size)
+        use_tp_ffn = getattr(self.config, "tp_enable_ffn", False)
 
         # Timestep encoder
         #  self.config.compute_dtype 可能不存在，要提前处理
@@ -248,6 +470,8 @@ class DiT(ModelMixin, ConfigMixin):
                     num_positional_embeddings=self.config.max_num_positional_embeddings,
                     final_dropout=final_dropout,
                     cross_attention_dim=curr_cross_attention_dim,
+                    tp_context=self.tp_context,
+                    use_tp_ffn=use_tp_ffn,
                 )
             ]
         self.transformer_blocks = nn.ModuleList(all_blocks)
