@@ -21,6 +21,19 @@ class MapAnythingWrapper(nn.Module):
         self.config = _Cfg()
         self.config.hidden_size = int(enc_dim) if enc_dim is not None else 1024
 
+    @staticmethod
+    def _unwrap_feature(feature):
+        # Some map-anything versions return (feat, meta) tuples per view.
+        if isinstance(feature, tuple):
+            if len(feature) == 0:
+                return feature
+            return feature[0]
+        if isinstance(feature, dict):
+            for k in ("features", "feature", "x"):
+                if k in feature:
+                    return feature[k]
+        return feature
+
     def forward(self, pixel_values, intrinsics):
         views = []
         if isinstance(pixel_values, torch.Tensor) and pixel_values.dim() == 5:
@@ -43,6 +56,26 @@ class MapAnythingWrapper(nn.Module):
             views = [view]
 
         all_encoder_features = self.map_anything_model._encode_n_views(views)
+        if not hasattr(self, "_debug_logged_encode_views"):
+            try:
+                print(f"[mapanything] _encode_n_views type: {type(all_encoder_features)}")
+                if isinstance(all_encoder_features, (list, tuple)):
+                    for i, f in enumerate(all_encoder_features[:3]):
+                        print(f"[mapanything] view[{i}] type: {type(f)}")
+                        if isinstance(f, torch.Tensor):
+                            print(f"[mapanything] view[{i}] shape: {tuple(f.shape)} dtype: {f.dtype}")
+                        elif isinstance(f, tuple) and len(f) > 0 and isinstance(f[0], torch.Tensor):
+                            print(f"[mapanything] view[{i}] tuple[0] shape: {tuple(f[0].shape)} dtype: {f[0].dtype}")
+                        elif isinstance(f, dict):
+                            for k in ("features", "feature", "x"):
+                                if k in f and isinstance(f[k], torch.Tensor):
+                                    print(f"[mapanything] view[{i}] dict[{k}] shape: {tuple(f[k].shape)} dtype: {f[k].dtype}")
+                                    break
+                self._debug_logged_encode_views = 1
+            except Exception:
+                self._debug_logged_encode_views = 1
+        if isinstance(all_encoder_features, (list, tuple)):
+            all_encoder_features = [self._unwrap_feature(f) for f in all_encoder_features]
 
         info_sharing_input = MultiViewTransformerInput(features=all_encoder_features)
 
