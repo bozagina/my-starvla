@@ -84,6 +84,12 @@ class MapAnythingWrapper(nn.Module):
             views = [view]
 
         all_encoder_features = self.map_anything_model._encode_n_views(views)
+        encoder_registers = None
+        if isinstance(all_encoder_features, tuple) and len(all_encoder_features) == 2:
+            # Newer map-anything returns (features, registers)
+            # TODO: registers are currently ignored because MultiViewTransformerInput does not accept them.
+            # Consider wiring them into additional_input_tokens(_per_view) if info_sharing starts using them.
+            all_encoder_features, encoder_registers = all_encoder_features
         if not hasattr(self, "_debug_logged_encode_views"):
             try:
                 print(f"[mapanything] _encode_n_views type: {type(all_encoder_features)}")
@@ -99,6 +105,10 @@ class MapAnythingWrapper(nn.Module):
                                 if k in f and isinstance(f[k], torch.Tensor):
                                     print(f"[mapanything] view[{i}] dict[{k}] shape: {tuple(f[k].shape)} dtype: {f[k].dtype}")
                                     break
+                if encoder_registers is not None and isinstance(encoder_registers, (list, tuple)):
+                    for i, f in enumerate(encoder_registers[:3]):
+                        if isinstance(f, torch.Tensor):
+                            print(f"[mapanything] register[{i}] shape: {tuple(f.shape)} dtype: {f.dtype}")
                 self._debug_logged_encode_views = 1
             except Exception:
                 self._debug_logged_encode_views = 1
