@@ -69,10 +69,8 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
         if language_model is not None:
             self.language_model = language_model
         elif config.language_model_name_or_path is not None:
-            self.language_model = LLaVA3DForCausalLMV2.from_pretrained(
-                config.language_model_name_or_path,
-                config=config.text_config,
-            )
+            # Avoid wrapper-level from_pretrained to prevent double-loading and key-mismatch warnings.
+            self.language_model = LLaVA3DForCausalLMV2(config.text_config)
         else:
             self.language_model = LLaVA3DForCausalLMV2(config.text_config)
 

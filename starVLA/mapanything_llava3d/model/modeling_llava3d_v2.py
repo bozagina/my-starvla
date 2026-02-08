@@ -1,9 +1,12 @@
+import json
 import os
 import sys
+from pathlib import Path
 import torch
 import torch.nn as nn
 from typing import Optional, Tuple, Union, List
 from transformers import PreTrainedModel, AutoConfig
+from transformers.modeling_utils import load_state_dict
 from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -13,6 +16,58 @@ if _ROOT_DIR not in sys.path:
 
 from LLaVA_3D.llava.model.language_model.llava_llama import LlavaLlamaForCausalLM
 from LLaVA_3D.llava.model.language_model.llava_mistral import LlavaMistralForCausalLM
+
+
+def _resolve_index_file(pretrained_path: str) -> Optional[Path]:
+    candidates = [
+        "model.safetensors.index.json",
+        "pytorch_model.bin.index.json",
+    ]
+    base = Path(pretrained_path)
+    for name in candidates:
+        p = base / name
+        if p.is_file():
+            return p
+    return None
+
+
+def _resolve_weight_files(pretrained_path: str) -> List[Path]:
+    base = Path(pretrained_path)
+    index_file = _resolve_index_file(pretrained_path)
+    if index_file is not None:
+        data = json.loads(index_file.read_text())
+        shard_files = sorted(set(data.get("weight_map", {}).values()))
+        return [base / f for f in shard_files]
+    candidates = [
+        "model.safetensors",
+        "pytorch_model.bin",
+    ]
+    for name in candidates:
+        p = base / name
+        if p.is_file():
+            return [p]
+    raise FileNotFoundError(
+        f"No model weights found under {pretrained_path} (missing index or weight files)."
+    )
+
+
+def _filter_llava_state_dict(state_dict: dict) -> dict:
+    drop_substrings = (".mm_projector.", ".vision_tower.", ".video_tower.")
+    filtered = {}
+    for k, v in state_dict.items():
+        if any(s in k for s in drop_substrings):
+            continue
+        filtered[k] = v
+    return filtered
+
+
+def _load_llava_base_weights(model: nn.Module, pretrained_path: str) -> None:
+    weight_files = _resolve_weight_files(pretrained_path)
+    for wf in weight_files:
+        shard = load_state_dict(str(wf))
+        shard = _filter_llava_state_dict(shard)
+        model.load_state_dict(shard, strict=False)
+        del shard
 
 
 class LLaVA3DForCausalLMV2(PreTrainedModel, GenerationMixin):
@@ -28,12 +83,11 @@ class LLaVA3DForCausalLMV2(PreTrainedModel, GenerationMixin):
                 setattr(llava_cfg, "mm_video_tower", None)
                 # 彻底不构建 LLaVA 的 vision tower，避免 build_vision_tower 里 os.path.exists(None) 以及联网下 clip
                 if hasattr(llava_cfg, "mm_vision_tower"):
-                    delattr(llava_cfg, "mm_vision_tower")
+                    setattr(llava_cfg, "mm_vision_tower", None)
                 if hasattr(llava_cfg, "vision_tower"):
-                    delattr(llava_cfg, "vision_tower")
-                self.model = LlavaLlamaForCausalLM.from_pretrained(
-                    pretrained_path, low_cpu_mem_usage=True, config=llava_cfg
-                )
+                    setattr(llava_cfg, "vision_tower", None)
+                self.model = LlavaLlamaForCausalLM(llava_cfg)
+                _load_llava_base_weights(self.model, pretrained_path)
             else:
                 setattr(config, "mm_video_tower", None)
                 self.model = LlavaLlamaForCausalLM(config)
@@ -43,12 +97,11 @@ class LLaVA3DForCausalLMV2(PreTrainedModel, GenerationMixin):
                 setattr(llava_cfg, "mm_video_tower", None)
                 # 彻底不构建 LLaVA 的 vision tower，避免 build_vision_tower 里 os.path.exists(None) 以及联网下 clip
                 if hasattr(llava_cfg, "mm_vision_tower"):
-                    delattr(llava_cfg, "mm_vision_tower")
+                    setattr(llava_cfg, "mm_vision_tower", None)
                 if hasattr(llava_cfg, "vision_tower"):
-                    delattr(llava_cfg, "vision_tower")
-                self.model = LlavaMistralForCausalLM.from_pretrained(
-                    pretrained_path, low_cpu_mem_usage=True, config=llava_cfg
-                )
+                    setattr(llava_cfg, "vision_tower", None)
+                self.model = LlavaMistralForCausalLM(llava_cfg)
+                _load_llava_base_weights(self.model, pretrained_path)
             else:
                 setattr(config, "mm_video_tower", None)
                 self.model = LlavaMistralForCausalLM(config)
