@@ -15,10 +15,9 @@ def get_vlm_model(config):
     elif "florence" in vlm_name.lower():
         from .Florence2 import _Florence_Interface 
         return _Florence_Interface(config)
-    elif "mapanything_llava3d" in vlm_name.lower():
+    elif "mapanything_llava3d" in vlm_name.lower() or "mapanythingllava3d" in vlm_name.lower():
         from .MapAnythingLlava3D import _MapAnythingLlava3D_Interface
         return _MapAnythingLlava3D_Interface(config)
     else:
         raise NotImplementedError(f"VLM model {vlm_name} not implemented")
-
 
