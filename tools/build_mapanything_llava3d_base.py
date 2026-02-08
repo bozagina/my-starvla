@@ -22,7 +22,12 @@ def parse_args():
     parser.add_argument("--siglip-path", required=True)
     parser.add_argument("--mapanything-path", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--use-geometric-branch", action="store_true")
+    parser.add_argument("--use-geometric-branch", action="store_true", default=True)
+    parser.add_argument(
+        "--disable-geometric-branch", dest="use_geometric_branch", action="store_false"
+    )
+    parser.add_argument("--use-spatial-token", action="store_true", default=True)
+    parser.add_argument("--disable-spatial-token", dest="use_spatial_token", action="store_false")
     parser.add_argument("--safe-serialization", action="store_true")
     return parser.parse_args()
 
@@ -32,6 +37,20 @@ def _has_prefix(state_dict: dict, prefix: str) -> bool:
         if k.startswith(prefix):
             return True
     return False
+
+
+def _resolve_path(value: str) -> str:
+    return str(Path(value).expanduser().resolve())
+
+
+def _validate_model_dir(path: str, name: str) -> None:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"{name} path does not exist: {path}")
+    if p.is_dir():
+        cfg = p / "config.json"
+        if not cfg.exists():
+            raise FileNotFoundError(f"{name} config.json not found under: {path}")
 
 
 def build_base_checkpoint(args) -> None:
@@ -54,29 +73,37 @@ def build_base_checkpoint(args) -> None:
     if hasattr(torch, "set_default_device"):
         torch.set_default_device("cpu")
 
+    llava3d_path = _resolve_path(args.llava3d_path)
+    siglip_path = _resolve_path(args.siglip_path)
+    mapanything_path = _resolve_path(args.mapanything_path)
+    _validate_model_dir(llava3d_path, "LLaVA3D")
+    _validate_model_dir(siglip_path, "SigLIP")
+    _validate_model_dir(mapanything_path, "MapAnything")
+
     vision_tower = AutoModel.from_pretrained(
-        args.siglip_path, trust_remote_code=True, low_cpu_mem_usage=False, device_map=None
+        siglip_path, trust_remote_code=True, low_cpu_mem_usage=False, device_map=None
     )
 
-    text_cfg = AutoConfig.from_pretrained(args.llava3d_path, trust_remote_code=True)
+    text_cfg = AutoConfig.from_pretrained(llava3d_path, trust_remote_code=True)
     setattr(text_cfg, "llava3d_model_type", args.llava3d_model_type)
-    setattr(text_cfg, "llava3d_pretrained_path", args.llava3d_path)
+    setattr(text_cfg, "llava3d_pretrained_path", llava3d_path)
+    setattr(text_cfg, "_name_or_path", llava3d_path)
     language_model = LLaVA3DForCausalLMV2(text_cfg)
 
     class _Cfg:
         pass
 
     map_cfg = _Cfg()
-    setattr(map_cfg, "mapanything_model_name_or_path", args.mapanything_path)
+    setattr(map_cfg, "mapanything_model_name_or_path", mapanything_path)
     geometric_model = MapAnythingWrapper(map_cfg)
 
     config = MapAnythingLlava3DConfig(
         text_config=text_cfg,
-        mapanything_config={"model_name_or_path": args.mapanything_path},
-        vision_model_name_or_path=args.siglip_path,
-        language_model_name_or_path=args.llava3d_path,
-        mapanything_model_name_or_path=args.mapanything_path,
-        use_spatial_token=False,
+        mapanything_config={"model_name_or_path": mapanything_path},
+        vision_model_name_or_path=siglip_path,
+        language_model_name_or_path=llava3d_path,
+        mapanything_model_name_or_path=mapanything_path,
+        use_spatial_token=bool(args.use_spatial_token),
         use_geometric_branch=bool(args.use_geometric_branch),
         image_token_index=-200,
     )
@@ -99,9 +126,8 @@ def build_base_checkpoint(args) -> None:
     ]
     missing = [p for p in required_prefixes if not _has_prefix(state_dict, p)]
     if missing:
-        print(f"WARNING: missing parameter groups in assembled model: {missing}")
-    else:
-        print("OK: assembled model contains all required parameter groups.")
+        raise RuntimeError(f"Missing parameter groups in assembled model: {missing}")
+    print("OK: assembled model contains all required parameter groups.")
 
     model.save_pretrained(output_dir, safe_serialization=bool(args.safe_serialization))
     config.save_pretrained(output_dir)
