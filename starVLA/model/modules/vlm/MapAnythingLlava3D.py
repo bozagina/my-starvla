@@ -1,4 +1,5 @@
 import os
+from contextlib import contextmanager
 import torch
 import torch.nn as nn
 from typing import Optional, List, Dict
@@ -11,6 +12,40 @@ from accelerate.logging import get_logger
 
 
 logger = get_logger(__name__)
+
+
+def _get_default_device():
+    if hasattr(torch, "get_default_device"):
+        return torch.get_default_device()
+    if hasattr(torch, "_C") and hasattr(torch._C, "_get_default_device"):
+        return torch._C._get_default_device()
+    return None
+
+
+@contextmanager
+def _suspend_meta_device():
+    """Ensure from_pretrained is not called under a meta-device context."""
+    prev_device = _get_default_device()
+    reset_device = prev_device is not None and str(prev_device) == "meta"
+    try:
+        if reset_device and hasattr(torch, "set_default_device"):
+            torch.set_default_device("cpu")
+        try:
+            from accelerate.utils import init_empty_weights
+        except Exception:
+            init_empty_weights = None
+        prev_flag = None
+        if init_empty_weights is not None and hasattr(init_empty_weights, "_is_enabled"):
+            prev_flag = init_empty_weights._is_enabled
+            init_empty_weights._is_enabled = False
+        try:
+            yield
+        finally:
+            if prev_flag is not None:
+                init_empty_weights._is_enabled = prev_flag
+    finally:
+        if reset_device and hasattr(torch, "set_default_device"):
+            torch.set_default_device(str(prev_device))
 
 
 _DEFAULT_VISION_MODEL = "/2025233147/zzq/mapAnythingLlava3dPi0.5/model_zoo/siglip-so400m-patch14-224"
@@ -65,7 +100,10 @@ class _MapAnythingLlava3D_Interface(nn.Module):
             assert isinstance(base_vlm_path, str), f"framework.mapanything_llava3d.base_vlm must be str, got {type(base_vlm_path)}"
             assert os.path.isdir(base_vlm_path), f"base_vlm path does not exist or is not a directory: {base_vlm_path}"
             try:
-                model = MapAnythingLlava3DForConditionalGeneration.from_pretrained(base_vlm_path)
+                with _suspend_meta_device():
+                    model = MapAnythingLlava3DForConditionalGeneration.from_pretrained(
+                        base_vlm_path, low_cpu_mem_usage=False, device_map=None
+                    )
                 mapanything_cfg = model.config
                 mapanything_cfg.prefix_image_dropout_prob = prefix_image_dropout_prob
                 mapanything_cfg.prefix_lang_dropout_prob = prefix_lang_dropout_prob

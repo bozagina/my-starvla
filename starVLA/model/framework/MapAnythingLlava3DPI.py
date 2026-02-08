@@ -1,5 +1,6 @@
 from typing import Optional, List, Tuple
 import torch
+import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 
@@ -39,6 +40,9 @@ class MapAnythingLlava3D_PI(baseframework):
         self.config.framework.mapanything_llava3d.vl_hidden_dim = llm_hidden_size
         self.config.framework.mapanything_llava3d.num_vl_layers = num_vl_layers
         self.vl_layer_selection = getattr(self.config.framework.action_model, "vl_layer_selection", "last")
+        self.normalize_vl_hidden = bool(
+            getattr(self.config.framework.mapanything_llava3d, "normalize_vl_hidden", False)
+        )
 
         self.action_model: LayerwiseFlowmatchingActionHead = get_action_model(config=self.config)
 
@@ -87,6 +91,8 @@ class MapAnythingLlava3D_PI(baseframework):
             else:
                 indices = range(len(all_hidden) - expected_layers, len(all_hidden))
             vl_embs_list = [all_hidden[i] for i in indices]
+            if self.normalize_vl_hidden:
+                vl_embs_list = [F.layer_norm(h, h.shape[-1:]) for h in vl_embs_list]
             base_hidden = vl_embs_list[-1]
             debug_metrics = {}
             try:
@@ -138,9 +144,11 @@ class MapAnythingLlava3D_PI(baseframework):
             actions_target = actions[:, -(self.future_action_window_size + 1) :, :]
 
             repeated_diffusion_steps = (
-                self.config.trainer.get("repeated_diffusion_steps", 4) if self.config and self.config.trainer else 4
+                int(self.config.trainer.get("repeated_diffusion_steps", 4))
+                if self.config and self.config.trainer
+                else 4
             )
-            repeated_diffusion_steps = 2
+            repeated_diffusion_steps = max(1, repeated_diffusion_steps)
             actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
             vl_embs_list_repeated = [h.repeat(repeated_diffusion_steps, 1, 1) for h in vl_embs_list]
 
@@ -201,6 +209,8 @@ class MapAnythingLlava3D_PI(baseframework):
             else:
                 indices = range(len(all_hidden) - expected_layers, len(all_hidden))
             vl_embs_list = [all_hidden[i] for i in indices]
+            if self.normalize_vl_hidden:
+                vl_embs_list = [F.layer_norm(h, h.shape[-1:]) for h in vl_embs_list]
             base_hidden = vl_embs_list[-1]
 
         state_tensor = torch.from_numpy(np.array(state)).to(base_hidden.device, dtype=base_hidden.dtype) if state is not None else None
