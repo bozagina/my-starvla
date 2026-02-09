@@ -118,6 +118,18 @@ def _run_checks(llava_path: str, base_vlm_path: str) -> Tuple[float, bool]:
         print(f"base_index_file: {base_index}")
         print(f"base_has_ls_weight: {has_ls_weight}")
         print(f"base_has_mm_projector: {has_mm_projector}")
+        # Verify shard contents to detect stale/extra keys in weight files.
+        shard_name = next(iter(set(base_data.get("weight_map", {}).values())), None)
+        if shard_name is not None:
+            shard_path = Path(base_vlm_path) / shard_name
+            shard_sd = load_state_dict(str(shard_path))
+            shard_has_ls_weight = any(
+                "ls1.weight" in k or "ls2.weight" in k for k in shard_sd.keys()
+            )
+            shard_has_mm_projector = any("mm_projector" in k for k in shard_sd.keys())
+            print(f"base_shard_file: {shard_path}")
+            print(f"base_shard_has_ls_weight: {shard_has_ls_weight}")
+            print(f"base_shard_has_mm_projector: {shard_has_mm_projector}")
     else:
         print("base_index_file: NOT FOUND")
 
