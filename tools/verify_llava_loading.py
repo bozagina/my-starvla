@@ -108,7 +108,20 @@ def _run_checks(llava_path: str, base_vlm_path: str) -> Tuple[float, bool]:
     w_model = m.model.state_dict()[probe_key]
     max_abs_diff = (w_loaded - w_model).abs().max().item()
 
-    # 2) verify VLM assembly loads without LLaVA3D warning
+    # 2) inspect base checkpoint index for known legacy keys
+    base_index = _resolve_index_file(base_vlm_path)
+    if base_index is not None:
+        base_data = json.loads(base_index.read_text())
+        base_keys = list(base_data.get("weight_map", {}).keys())
+        has_ls_weight = any("ls1.weight" in k or "ls2.weight" in k for k in base_keys)
+        has_mm_projector = any("mm_projector" in k for k in base_keys)
+        print(f"base_index_file: {base_index}")
+        print(f"base_has_ls_weight: {has_ls_weight}")
+        print(f"base_has_mm_projector: {has_mm_projector}")
+    else:
+        print("base_index_file: NOT FOUND")
+
+    # 3) verify VLM assembly loads without LLaVA3D warning
     _ = MapAnythingLlava3DForConditionalGeneration.from_pretrained(
         base_vlm_path, trust_remote_code=True
     )

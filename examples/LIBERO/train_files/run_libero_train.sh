@@ -16,7 +16,8 @@ export NCCL_SOCKET_TIMEOUT_MS=360000
 Framework_name=MapAnythingLlava3DPI
 # freeze_module_list='mapanythingllava3d_vlm_interface.model.vision_tower,mapanythingllava3d_vlm_interface.model.geometric_model'
 freeze_module_list=''
-base_vlm=/2025233147/zzq/SpatialVLA_llava3d/model_zoo/mapanythingllava3d_base
+base_vlm=/2025233147/zzq/SpatialVLA_llava3d/model_zoo/mapanythingllava3d_base_v2
+
 config_yaml=/2025233147/zzq/SpatialVLA_llava3d/starVLA/starVLA/config/training/starvla_train_oxe_mapanything_llava3d.yaml
 libero_data_root=/2025233147/zzq/SpatialVLA_llava3d/playground/Datasets/LEROBOT_LIBERO_DATA
 data_mix=libero_all
