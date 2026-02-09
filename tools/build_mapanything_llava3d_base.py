@@ -29,6 +29,8 @@ def parse_args():
     parser.add_argument("--use-spatial-token", action="store_true", default=True)
     parser.add_argument("--disable-spatial-token", dest="use_spatial_token", action="store_false")
     parser.add_argument("--safe-serialization", action="store_true")
+    parser.add_argument("--clean-output", dest="clean_output", action="store_true", default=True)
+    parser.add_argument("--no-clean-output", dest="clean_output", action="store_false")
     return parser.parse_args()
 
 
@@ -70,6 +72,26 @@ def _prune_state_dict(state_dict: dict) -> int:
     return len(to_del)
 
 
+def _clean_output_dir(output_dir: Path) -> int:
+    patterns = [
+        "model.safetensors",
+        "model.safetensors.index.json",
+        "pytorch_model.bin",
+        "pytorch_model.bin.index.json",
+        "pytorch_model-*.bin",
+        "model-*.safetensors",
+    ]
+    removed = 0
+    for pat in patterns:
+        for p in output_dir.glob(pat):
+            try:
+                p.unlink()
+                removed += 1
+            except Exception:
+                pass
+    return removed
+
+
 def _resolve_path(value: str) -> str:
     return str(Path(value).expanduser().resolve())
 
@@ -100,6 +122,10 @@ def build_base_checkpoint(args) -> None:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.clean_output:
+        removed = _clean_output_dir(output_dir)
+        if removed:
+            print(f"Cleaned {removed} old weight shard files in {output_dir}")
 
     if hasattr(torch, "set_default_device"):
         torch.set_default_device("cpu")
