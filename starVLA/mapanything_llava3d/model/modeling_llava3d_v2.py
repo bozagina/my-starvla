@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 import torch
 import torch.nn as nn
+from contextlib import contextmanager
 from typing import Optional, Tuple, Union, List
 from transformers import PreTrainedModel, AutoConfig
 from transformers.modeling_utils import load_state_dict
@@ -16,6 +17,35 @@ if _ROOT_DIR not in sys.path:
 
 from LLaVA_3D.llava.model.language_model.llava_llama import LlavaLlamaForCausalLM
 from LLaVA_3D.llava.model.language_model.llava_mistral import LlavaMistralForCausalLM
+
+
+@contextmanager
+def _suspend_llava_vision_tower():
+    builder = None
+    llava_arch = None
+    origs = {}
+    try:
+        import LLaVA_3D.llava.model.multimodal_encoder.builder as builder  # type: ignore
+    except Exception:
+        builder = None
+    try:
+        import LLaVA_3D.llava.model.llava_arch as llava_arch  # type: ignore
+    except Exception:
+        llava_arch = None
+
+    def _noop_build(*args, **kwargs):
+        return None
+
+    for mod in (builder, llava_arch):
+        if mod is not None and hasattr(mod, "build_vision_tower"):
+            origs[mod] = mod.build_vision_tower
+            mod.build_vision_tower = _noop_build
+
+    try:
+        yield
+    finally:
+        for mod, orig in origs.items():
+            mod.build_vision_tower = orig
 
 
 def _resolve_index_file(pretrained_path: str) -> Optional[Path]:
@@ -83,28 +113,32 @@ class LLaVA3DForCausalLMV2(PreTrainedModel, GenerationMixin):
                 setattr(llava_cfg, "mm_video_tower", None)
                 # 彻底不构建 LLaVA 的 vision tower，避免 build_vision_tower 里 os.path.exists(None) 以及联网下 clip
                 if hasattr(llava_cfg, "mm_vision_tower"):
-                    setattr(llava_cfg, "mm_vision_tower", None)
+                    setattr(llava_cfg, "mm_vision_tower", "")
                 if hasattr(llava_cfg, "vision_tower"):
-                    setattr(llava_cfg, "vision_tower", None)
-                self.model = LlavaLlamaForCausalLM(llava_cfg)
+                    setattr(llava_cfg, "vision_tower", "")
+                with _suspend_llava_vision_tower():
+                    self.model = LlavaLlamaForCausalLM(llava_cfg)
                 _load_llava_base_weights(self.model, pretrained_path)
             else:
                 setattr(config, "mm_video_tower", None)
-                self.model = LlavaLlamaForCausalLM(config)
+                with _suspend_llava_vision_tower():
+                    self.model = LlavaLlamaForCausalLM(config)
         elif model_type == "mistral":
             if pretrained_path is not None:
                 llava_cfg = AutoConfig.from_pretrained(pretrained_path, trust_remote_code=True)
                 setattr(llava_cfg, "mm_video_tower", None)
                 # 彻底不构建 LLaVA 的 vision tower，避免 build_vision_tower 里 os.path.exists(None) 以及联网下 clip
                 if hasattr(llava_cfg, "mm_vision_tower"):
-                    setattr(llava_cfg, "mm_vision_tower", None)
+                    setattr(llava_cfg, "mm_vision_tower", "")
                 if hasattr(llava_cfg, "vision_tower"):
-                    setattr(llava_cfg, "vision_tower", None)
-                self.model = LlavaMistralForCausalLM(llava_cfg)
+                    setattr(llava_cfg, "vision_tower", "")
+                with _suspend_llava_vision_tower():
+                    self.model = LlavaMistralForCausalLM(llava_cfg)
                 _load_llava_base_weights(self.model, pretrained_path)
             else:
                 setattr(config, "mm_video_tower", None)
-                self.model = LlavaMistralForCausalLM(config)
+                with _suspend_llava_vision_tower():
+                    self.model = LlavaMistralForCausalLM(config)
         else:
             raise ValueError(f"Unsupported LLaVA-3D model type: {model_type}")
         self.vocab_size = getattr(self.model.config, "vocab_size", getattr(config, "vocab_size", None))
