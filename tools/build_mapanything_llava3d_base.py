@@ -38,6 +38,37 @@ def _has_prefix(state_dict: dict, prefix: str) -> bool:
             return True
     return False
 
+def _remap_layerscale_weights(state_dict: dict) -> int:
+    to_add = {}
+    to_del = []
+    remapped = 0
+    for k in list(state_dict.keys()):
+        if k.endswith(".ls1.weight") or k.endswith(".ls2.weight"):
+            gamma_key = k.rsplit(".", 1)[0] + ".gamma"
+            if gamma_key not in state_dict:
+                to_add[gamma_key] = state_dict[k]
+                remapped += 1
+            to_del.append(k)
+    for k in to_del:
+        state_dict.pop(k, None)
+    state_dict.update(to_add)
+    return remapped
+
+
+def _prune_state_dict(state_dict: dict) -> int:
+    prefixes = (
+        "vision_tower.text_model.",
+        "language_model.model.model.mm_projector.",
+    )
+    exact_keys = {"vision_tower.logit_bias", "vision_tower.logit_scale"}
+    to_del = []
+    for k in state_dict.keys():
+        if k in exact_keys or k.startswith(prefixes):
+            to_del.append(k)
+    for k in to_del:
+        state_dict.pop(k, None)
+    return len(to_del)
+
 
 def _resolve_path(value: str) -> str:
     return str(Path(value).expanduser().resolve())
@@ -116,6 +147,12 @@ def build_base_checkpoint(args) -> None:
     )
 
     state_dict = model.state_dict()
+    remapped = _remap_layerscale_weights(state_dict)
+    pruned = _prune_state_dict(state_dict)
+    if remapped:
+        print(f"Remapped {remapped} LayerScale weights (ls*.weight -> ls*.gamma).")
+    if pruned:
+        print(f"Pruned {pruned} unused vision/text/mm_projector weights from checkpoint.")
     required_prefixes = [
         "language_model",
         "vision_tower",
@@ -129,7 +166,11 @@ def build_base_checkpoint(args) -> None:
         raise RuntimeError(f"Missing parameter groups in assembled model: {missing}")
     print("OK: assembled model contains all required parameter groups.")
 
-    model.save_pretrained(output_dir, safe_serialization=bool(args.safe_serialization))
+    model.save_pretrained(
+        output_dir,
+        safe_serialization=bool(args.safe_serialization),
+        state_dict=state_dict,
+    )
     config.save_pretrained(output_dir)
     print(f"Saved base VLM checkpoint to: {output_dir}")
 
