@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import sys
+import time
 import warnings
 from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
@@ -90,6 +91,10 @@ def _run_checks(llava_path: str, base_vlm_path: str) -> Tuple[float, bool]:
         MapAnythingLlava3DForConditionalGeneration,
     )
 
+    base_realpath = os.path.realpath(base_vlm_path)
+    base_dir_mtime = time.ctime(os.path.getmtime(base_realpath))
+    base_shard_mtimes = {}
+
     # 1) verify wrapper loads LLM weights and no warning output
     cfg = AutoConfig.from_pretrained(llava_path, trust_remote_code=True)
     setattr(cfg, "llava3d_model_type", "llama")
@@ -115,6 +120,16 @@ def _run_checks(llava_path: str, base_vlm_path: str) -> Tuple[float, bool]:
         base_keys = list(base_data.get("weight_map", {}).keys())
         has_ls_weight = any("ls1.weight" in k or "ls2.weight" in k for k in base_keys)
         has_mm_projector = any("mm_projector" in k for k in base_keys)
+        shard_files = sorted(set(base_data.get("weight_map", {}).values()))
+        for shard_name in shard_files:
+            shard_path = os.path.join(base_realpath, shard_name)
+            try:
+                base_shard_mtimes[shard_name] = time.ctime(os.path.getmtime(shard_path))
+            except OSError:
+                base_shard_mtimes[shard_name] = "missing"
+        print(f"base_realpath: {base_realpath}")
+        print(f"base_dir_mtime: {base_dir_mtime}")
+        print(f"base_shard_mtimes: {base_shard_mtimes}")
         print(f"base_index_file: {base_index}")
         print(f"base_has_ls_weight: {has_ls_weight}")
         print(f"base_has_mm_projector: {has_mm_projector}")
