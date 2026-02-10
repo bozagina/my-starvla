@@ -7,8 +7,8 @@ import os
 import sys
 import time
 import warnings
-from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
+from contextlib import redirect_stdout, redirect_stderr
 from typing import Optional, Tuple
 
 
@@ -50,6 +50,19 @@ def _resolve_weight_files(pretrained_path: str) -> Tuple[Path, ...]:
     raise FileNotFoundError(
         f"No model weights found under {pretrained_path} (missing index or weight files)."
     )
+
+def _list_all_weight_files(pretrained_path: str) -> Tuple[Path, ...]:
+    base = Path(pretrained_path)
+    patterns = [
+        "pytorch_model.bin",
+        "pytorch_model-*.bin",
+        "model.safetensors",
+        "model-*.safetensors",
+    ]
+    files = []
+    for pattern in patterns:
+        files.extend(base.glob(pattern))
+    return tuple(sorted(set(files)))
 
 
 def _pick_probe_key(index_file: Path) -> str:
@@ -94,6 +107,7 @@ def _run_checks(llava_path: str, base_vlm_path: str) -> Tuple[float, bool]:
     base_realpath = os.path.realpath(base_vlm_path)
     base_dir_mtime = time.ctime(os.path.getmtime(base_realpath))
     base_shard_mtimes = {}
+    extra_weight_file_info = {}
 
     # 1) verify wrapper loads LLM weights and no warning output
     cfg = AutoConfig.from_pretrained(llava_path, trust_remote_code=True)
@@ -121,15 +135,32 @@ def _run_checks(llava_path: str, base_vlm_path: str) -> Tuple[float, bool]:
         has_ls_weight = any("ls1.weight" in k or "ls2.weight" in k for k in base_keys)
         has_mm_projector = any("mm_projector" in k for k in base_keys)
         shard_files = sorted(set(base_data.get("weight_map", {}).values()))
+        all_weight_files = _list_all_weight_files(base_realpath)
+        shard_set = {str(Path(base_realpath) / name) for name in shard_files}
+        extra_weight_files = [p for p in all_weight_files if str(p) not in shard_set]
         for shard_name in shard_files:
             shard_path = os.path.join(base_realpath, shard_name)
             try:
                 base_shard_mtimes[shard_name] = time.ctime(os.path.getmtime(shard_path))
             except OSError:
                 base_shard_mtimes[shard_name] = "missing"
+        for extra_path in extra_weight_files:
+            try:
+                sd = load_state_dict(str(extra_path))
+                extra_weight_file_info[str(extra_path)] = {
+                    "mtime": time.ctime(os.path.getmtime(extra_path)),
+                    "size": extra_path.stat().st_size,
+                    "has_ls_weight": any(
+                        "ls1.weight" in k or "ls2.weight" in k for k in sd.keys()
+                    ),
+                    "has_mm_projector": any("mm_projector" in k for k in sd.keys()),
+                }
+            except Exception as e:
+                extra_weight_file_info[str(extra_path)] = {"error": repr(e)}
         print(f"base_realpath: {base_realpath}")
         print(f"base_dir_mtime: {base_dir_mtime}")
         print(f"base_shard_mtimes: {base_shard_mtimes}")
+        print(f"base_extra_weight_files: {extra_weight_file_info}")
         print(f"base_index_file: {base_index}")
         print(f"base_has_ls_weight: {has_ls_weight}")
         print(f"base_has_mm_projector: {has_mm_projector}")
