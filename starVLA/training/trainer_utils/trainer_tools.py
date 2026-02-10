@@ -166,6 +166,9 @@ class TrainerUtils:
         """
         frozen = []
         print("#"*30)
+        if isinstance(freeze_modules, bool):
+            print("⚠️ freeze_modules is boolean; treating as empty string. This usually happens when the CLI flag is passed without a value.")
+            freeze_modules = ""
         print(freeze_modules)
         if freeze_modules and type(freeze_modules) == str:
             # split and remove whitespace

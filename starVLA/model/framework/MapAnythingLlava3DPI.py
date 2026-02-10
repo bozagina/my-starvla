@@ -96,6 +96,13 @@ class MapAnythingLlava3D_PI(baseframework):
             base_hidden = vl_embs_list[-1]
             debug_metrics = {}
             try:
+                try:
+                    h = base_hidden.detach().float()
+                    debug_metrics["debug/vl_norm/base_hidden_mean"] = float(h.mean().item())
+                    debug_metrics["debug/vl_norm/base_hidden_std"] = float(h.std().item())
+                    debug_metrics["debug/vl_norm/base_hidden_rms"] = float((h * h).mean().sqrt().item())
+                except Exception:
+                    debug_metrics = debug_metrics
                 vlm_core = getattr(self.mapanythingllava3d_vlm_interface, "model", None)
                 geom_stats = getattr(vlm_core, "geom_feature_stats", None)
                 if isinstance(geom_stats, list) and geom_stats:

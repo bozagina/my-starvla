@@ -39,6 +39,11 @@ cp $0 ${output_dir}/
 exec > >(tee "${output_dir}/train.log") 2>&1
 
 
+freeze_args=()
+if [ -n "${freeze_module_list}" ]; then
+  freeze_args=(--trainer.freeze_modules "${freeze_module_list}")
+fi
+
 accelerate launch \
   --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
   --num_processes 4 \
@@ -51,7 +56,7 @@ accelerate launch \
   --datasets.vla_data.data_mix ${data_mix} \
   --datasets.vla_data.per_device_batch_size 4 \
   --datasets.vla_data.video_backend torchvision_av \
-  --trainer.freeze_modules ${freeze_module_list} \
+  "${freeze_args[@]}" \
   --trainer.max_train_steps 80000 \
   --trainer.save_interval 10000 \
   --trainer.logging_frequency 10 \
