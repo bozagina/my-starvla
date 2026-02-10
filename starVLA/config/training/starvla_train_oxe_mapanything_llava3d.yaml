@@ -9,7 +9,7 @@ is_debug: false
 framework:
   name: MapAnythingLlava3DPI
   mapanything_llava3d:
-    base_vlm: /2025233147/zzq/SpatialVLA_llava3d/model_zoo/mapanythingllava3d_base
+    base_vlm: /2025233147/zzq/SpatialVLA_llava3d/model_zoo/mapanythingllava3d_base_v3
     attn_implementation: flash_attention_2
     vl_hidden_dim: 4096
     prefix_image_dropout_prob: 0.1
