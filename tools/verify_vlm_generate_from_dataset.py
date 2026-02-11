@@ -27,14 +27,24 @@ def _setup_logging(log_file: str) -> logging.Logger:
     return logger
 
 
-def _load_dataset(cfg, dataset_py: str, logger: logging.Logger):
+def _load_dataset(cfg, dataset_py: str, logger: logging.Logger, data_mix_override: str | None = None):
     if dataset_py != "lerobot_datasets":
         raise ValueError(
             f"Only dataset_py=lerobot_datasets is supported for now, got {dataset_py}."
         )
     from starVLA.dataloader.lerobot_datasets import get_vla_dataset
+    from starVLA.dataloader.gr00t_lerobot.mixtures import DATASET_NAMED_MIXTURES
 
     vla_cfg = cfg.datasets.vla_data
+    if data_mix_override:
+        vla_cfg.data_mix = data_mix_override
+        logger.info(f"Override data_mix -> {data_mix_override}")
+    data_mix = getattr(vla_cfg, "data_mix", None)
+    if data_mix not in DATASET_NAMED_MIXTURES:
+        available = ", ".join(sorted(DATASET_NAMED_MIXTURES.keys()))
+        raise KeyError(
+            f"data_mix '{data_mix}' not in DATASET_NAMED_MIXTURES. Available: {available}"
+        )
     dataset = get_vla_dataset(data_cfg=vla_cfg)
     logger.info(f"Loaded dataset {type(dataset).__name__} with length {len(dataset)}")
     return dataset
@@ -70,6 +80,7 @@ def main():
     parser.add_argument("--config-yaml", required=True)
     parser.add_argument("--base-vlm", default=None)
     parser.add_argument("--dataset-py", default=None)
+    parser.add_argument("--data-mix", default=None)
     parser.add_argument("--index", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-new-tokens", type=int, default=64)
@@ -89,7 +100,7 @@ def main():
     dataset_py = args.dataset_py or cfg.datasets.vla_data.get("dataset_py", "lerobot_datasets")
     logger.info(f"Using dataset_py={dataset_py}")
 
-    dataset = _load_dataset(cfg, dataset_py, logger)
+    dataset = _load_dataset(cfg, dataset_py, logger, data_mix_override=args.data_mix)
     index, sample = _select_sample(dataset, args.index, args.seed, logger)
 
     instruction = _extract_instruction(sample)
