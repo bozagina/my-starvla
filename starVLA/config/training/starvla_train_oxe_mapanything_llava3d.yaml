@@ -28,7 +28,7 @@ framework:
     future_action_window_size: 7
     action_horizon: 8
     past_action_window_size: 0
-    repeated_diffusion_steps: 2
+    repeated_diffusion_steps: 8
     noise_beta_alpha: 1.5
     noise_beta_beta: 1.0
     noise_s: 0.999
