@@ -100,6 +100,10 @@ def main():
     parser.add_argument("--data-mix", default=None)
     parser.add_argument("--index", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--include-state", action="store_true")
+    parser.add_argument("--override-state-dim", type=int, default=None)
+    parser.add_argument("--drop-state-pad", action="store_true")
+    parser.add_argument("--skip-state-encoder-load", action="store_true")
     parser.add_argument("--log-file", default="tools/verify_action_forward_from_dataset.log")
     parser.add_argument("--output-json", default="tools/verify_action_forward_from_dataset.json")
     args = parser.parse_args()
@@ -111,12 +115,17 @@ def main():
     cfg = OmegaConf.load(args.config_yaml)
     if args.base_vlm is not None:
         cfg.framework.mapanything_llava3d.base_vlm = args.base_vlm
+    if args.include_state:
+        cfg.datasets.vla_data.include_state = True
+    if args.override_state_dim is not None:
+        cfg.framework.action_model.state_dim = args.override_state_dim
 
     dataset_py = args.dataset_py or cfg.datasets.vla_data.get("dataset_py", "lerobot_datasets")
     logger.info(f"Using dataset_py={dataset_py}")
 
     dataset = _load_dataset(cfg, dataset_py, logger, data_mix_override=args.data_mix)
     index, sample = _select_sample(dataset, args.index, args.seed, logger)
+    logger.info(f"Sample keys: {list(sample.keys())}")
 
     instruction = _extract_instruction(sample)
     images = sample.get("image")
@@ -127,6 +136,14 @@ def main():
 
     action = sample.get("action")
     state = sample.get("state", None)
+    if state is not None and args.drop_state_pad:
+        target_dim = int(getattr(cfg.framework.action_model, "state_dim", 0) or 0)
+        if target_dim > 0:
+            state = np.array(state)[..., :target_dim]
+    if state is None:
+        logger.info("State is None in sample (include_state may be false or dataset does not return state).")
+    else:
+        logger.info(f"State present with shape {np.array(state).shape}")
 
     logger.info(f"Instruction: {instruction}")
     logger.info(f"Num images: {len(images)}")
@@ -141,6 +158,10 @@ def main():
     if args.checkpoint:
         logger.info(f"Loading checkpoint: {args.checkpoint}")
         state_dict = torch.load(args.checkpoint, map_location="cpu")
+        if args.skip_state_encoder_load:
+            before = len(state_dict)
+            state_dict = {k: v for k, v in state_dict.items() if not k.startswith("action_model.state_encoder")}
+            logger.info(f"Pruned state_encoder params: {before - len(state_dict)} keys removed")
         load_res = model.load_state_dict(state_dict, strict=False)
         missing = list(load_res.missing_keys)
         unexpected = list(load_res.unexpected_keys)
