@@ -1,4 +1,5 @@
 # coding=utf-8
+import copy
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
@@ -55,6 +56,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
         language_model=None,
         mapanything_model=None,
         projector_model=None,
+        skip_language_model_preload: bool = False,
     ):
         super().__init__(config)
 
@@ -65,11 +67,14 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
 
         if language_model is not None:
             self.language_model = language_model
-        elif config.language_model_name_or_path is not None:
-            # Avoid wrapper-level from_pretrained to prevent double-loading and key-mismatch warnings.
-            self.language_model = LLaVA3DForCausalLMV2(config.text_config)
         else:
-            self.language_model = LLaVA3DForCausalLMV2(config.text_config)
+            text_cfg = config.text_config
+            if skip_language_model_preload and text_cfg is not None:
+                text_cfg = copy.deepcopy(text_cfg)
+                if hasattr(text_cfg, "llava3d_pretrained_path"):
+                    setattr(text_cfg, "llava3d_pretrained_path", None)
+                logger.info("Skip inner LLaVA preload in model __init__; rely on outer from_pretrained state_dict loading.")
+            self.language_model = LLaVA3DForCausalLMV2(text_cfg)
 
         if mapanything_model is not None:
             self.geometric_model = mapanything_model

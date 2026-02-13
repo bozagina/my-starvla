@@ -13,6 +13,7 @@ Conventions:
 
 # Standard Library
 import argparse
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -194,11 +195,49 @@ class VLATrainer(TrainerUtils):
             self.optimizer,
             self.vla_train_dataloader,
         )
+        self._patch_deepspeed_no_sync_if_needed()
 
         base_model = self.accelerator.unwrap_model(self.model)
         self._register_grad_hooks(base_model)
 
         self._init_wandb()
+
+    def _patch_deepspeed_no_sync_if_needed(self):
+        """
+        Accelerate's `accumulate()` uses `no_sync` on non-sync micro steps.
+        DeepSpeed ZeRO stage-2/3 with gradient partitioning disallows `no_sync`
+        and raises:
+          "no_sync context manager is incompatible with gradient partitioning ..."
+        Replace instance-level `no_sync` with a no-op context manager to keep
+        accumulation flow working.
+        """
+        dist_type = str(getattr(self.accelerator.state, "distributed_type", ""))
+        if "DEEPSPEED" not in dist_type.upper():
+            return
+        engine = self.model
+        if getattr(engine, "_starvla_no_sync_patched", False):
+            return
+        zero_partition_fn = getattr(engine, "zero_optimization_partition_gradients", None)
+        if not callable(zero_partition_fn):
+            return
+        try:
+            zero_partition = bool(zero_partition_fn())
+        except Exception:
+            zero_partition = False
+        if not zero_partition:
+            return
+
+        @contextlib.contextmanager
+        def _no_sync_passthrough():
+            yield
+
+        if hasattr(engine, "no_sync"):
+            engine.no_sync = _no_sync_passthrough
+            engine._starvla_no_sync_patched = True
+            logger.warning(
+                "Patched DeepSpeedEngine.no_sync -> nullcontext for ZeRO gradient partitioning "
+                "compatibility (accumulate still works; gradients may sync each micro-step)."
+            )
 
 
     def _adjust_lr_scheduler_for_resume(self):

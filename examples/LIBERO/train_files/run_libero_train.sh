@@ -32,6 +32,8 @@ run_id=1229_libero4in1_MapAnythingLlava3DPI_s${seed}_${timestamp}
 
 
 export WANDB_MODE=disabled
+export HF_ENABLE_PARALLEL_LOADING=true
+export HF_PARALLEL_LOADING_WORKERS=8
 
 output_dir=${run_root_dir}/${run_id}
 mkdir -p ${output_dir}

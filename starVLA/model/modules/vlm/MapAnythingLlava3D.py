@@ -24,22 +24,12 @@ def _get_default_device():
 
 @contextmanager
 def _suspend_meta_device():
-    """Ensure from_pretrained is not called under meta/ZeRO-3 init contexts."""
+    """Ensure from_pretrained is not called under a meta-device context."""
     prev_device = _get_default_device()
     reset_device = prev_device is not None and str(prev_device) == "meta"
-    ds_mod = None
-    prev_ds_ref = None
     try:
         if reset_device and hasattr(torch, "set_default_device"):
             torch.set_default_device("cpu")
-        try:
-            import transformers.integrations.deepspeed as ds_mod  # type: ignore
-            if hasattr(ds_mod, "_hf_deepspeed_config_weak_ref"):
-                prev_ds_ref = ds_mod._hf_deepspeed_config_weak_ref
-                ds_mod._hf_deepspeed_config_weak_ref = None
-        except Exception:
-            ds_mod = None
-            prev_ds_ref = None
         try:
             from accelerate.utils import init_empty_weights
         except Exception:
@@ -53,8 +43,6 @@ def _suspend_meta_device():
         finally:
             if prev_flag is not None:
                 init_empty_weights._is_enabled = prev_flag
-            if ds_mod is not None and prev_ds_ref is not None:
-                ds_mod._hf_deepspeed_config_weak_ref = prev_ds_ref
     finally:
         if reset_device and hasattr(torch, "set_default_device"):
             torch.set_default_device(str(prev_device))
@@ -114,7 +102,10 @@ class _MapAnythingLlava3D_Interface(nn.Module):
             try:
                 with _suspend_meta_device():
                     model = MapAnythingLlava3DForConditionalGeneration.from_pretrained(
-                        base_vlm_path, low_cpu_mem_usage=False, device_map=None
+                        base_vlm_path,
+                        low_cpu_mem_usage=False,
+                        device_map=None,
+                        skip_language_model_preload=True,
                     )
                 mapanything_cfg = model.config
                 mapanything_cfg.prefix_image_dropout_prob = prefix_image_dropout_prob
