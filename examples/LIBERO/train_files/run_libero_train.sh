@@ -1,4 +1,4 @@
-
+set -o pipefail
 
 # export NCCL_SOCKET_IFNAME=bond0
 # export NCCL_IB_HCA=mlx5_2,mlx5_3
@@ -35,10 +35,13 @@ export WANDB_MODE=disabled
 
 output_dir=${run_root_dir}/${run_id}
 mkdir -p ${output_dir}
+raw_log_file="${output_dir}/train.raw.log"
+log_file="${output_dir}/train.log"
 # mv this script to the output dir
 cp $0 ${output_dir}/
 
-exec > >(tee "${output_dir}/train.log") 2>&1
+export PYTHONUNBUFFERED=1
+export PYTHONFAULTHANDLER=1
 
 
 freeze_args=()
@@ -46,7 +49,7 @@ if [ -n "${freeze_module_list}" ]; then
   freeze_args=(--trainer.freeze_modules "${freeze_module_list}")
 fi
 
-accelerate launch \
+stdbuf -oL -eL accelerate launch \
   --config_file starVLA/config/deepseeds/deepspeed_zero3.yaml \
   --gradient_accumulation_steps ${grad_accum_steps} \
   --num_processes 4 \
@@ -69,7 +72,13 @@ accelerate launch \
   --run_root_dir ${run_root_dir} \
   --run_id ${run_id} \
   --wandb_project starvla_mapanything_llava3d \
-  # --is_debug True
+  2>&1 | tee -a "${raw_log_file}"
+
+train_exit=${PIPESTATUS[0]}
+tr '\r' '\n' < "${raw_log_file}" > "${log_file}"
+echo "Saved raw log to: ${raw_log_file}"
+echo "Saved normalized log to: ${log_file}"
+exit ${train_exit}
 
 
 
