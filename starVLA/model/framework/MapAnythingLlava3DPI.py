@@ -150,11 +150,19 @@ class MapAnythingLlava3D_PI(baseframework):
             )
             actions_target = actions[:, -(self.future_action_window_size + 1) :, :]
 
-            repeated_diffusion_steps = (
-                int(self.config.trainer.get("repeated_diffusion_steps", 4))
-                if self.config and self.config.trainer
-                else 4
-            )
+            repeated_diffusion_steps = 4
+            if self.config is not None:
+                try:
+                    repeated_diffusion_steps = int(
+                        getattr(self.config.framework.action_model, "repeated_diffusion_steps", repeated_diffusion_steps)
+                    )
+                except Exception:
+                    repeated_diffusion_steps = repeated_diffusion_steps
+                try:
+                    if hasattr(self.config, "trainer") and hasattr(self.config.trainer, "repeated_diffusion_steps"):
+                        repeated_diffusion_steps = int(self.config.trainer.repeated_diffusion_steps)
+                except Exception:
+                    repeated_diffusion_steps = repeated_diffusion_steps
             repeated_diffusion_steps = max(1, repeated_diffusion_steps)
             actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
             vl_embs_list_repeated = [h.repeat(repeated_diffusion_steps, 1, 1) for h in vl_embs_list]

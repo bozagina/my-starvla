@@ -108,6 +108,12 @@ class _MapAnythingLlava3D_Interface(nn.Module):
                 mapanything_cfg.prefix_image_dropout_prob = prefix_image_dropout_prob
                 mapanything_cfg.prefix_lang_dropout_prob = prefix_lang_dropout_prob
                 setattr(mapanything_cfg, "use_geometric_branch", use_geom)
+                cfg_vision = getattr(mapanything_cfg, "vision_model_name_or_path", None)
+                cfg_language = getattr(mapanything_cfg, "language_model_name_or_path", None)
+                if isinstance(cfg_vision, str) and cfg_vision:
+                    vision_model_name_or_path = cfg_vision
+                if isinstance(cfg_language, str) and cfg_language:
+                    language_model_name_or_path = cfg_language
                 print(f"Loaded MapAnythingLlava3D VLM from merged checkpoint: {base_vlm_path}")
             except Exception as e:
                 raise AssertionError(f"Failed to load merged VLM checkpoint from {base_vlm_path}: {e}")

@@ -12,9 +12,6 @@ from .configuration_mapanything_llava3d import MapAnythingLlava3DConfig
 from .modeling_mapanything import MapAnythingWrapper
 from .modeling_llava3d_v2 import LLaVA3DForCausalLMV2
 
-import torchvision.transforms.functional as TF
-
-
 logger = logging.get_logger(__name__)
 
 
@@ -190,8 +187,9 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
                 vision_feats = None
                 self._llava_vision_available = False
         if vision_feats is None:
-            siglip_pixel_values = TF.normalize(pixel_values, mean=SIGLIP_MEAN, std=SIGLIP_STD)
-            siglip_pixel_values = siglip_pixel_values.float().contiguous()
+            # `MapAnythingLlava3DProcessor` already applies SigLIP preprocessing.
+            # Normalizing again here shifts the input distribution and harms visual encoding.
+            siglip_pixel_values = pixel_values.float().contiguous()
             vision_outputs = self.vision_tower(siglip_pixel_values)
             vision_feats = vision_outputs.last_hidden_state
             if getattr(self, "geom_feature_hook_enabled", False):
@@ -227,6 +225,13 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
             geom_pixel_values = pixel_values.view(b, v, *pixel_values.shape[1:])
         else:
             geom_pixel_values = pixel_values
+        # Geometry branch expects image-like ranges before its own normalization logic.
+        # Convert SigLIP-normalized [-1, 1] tensors back to [0, 1] when needed.
+        if isinstance(geom_pixel_values, torch.Tensor):
+            with torch.no_grad():
+                min_v = float(geom_pixel_values.detach().amin().item())
+            if min_v < -0.05:
+                geom_pixel_values = (geom_pixel_values * 0.5 + 0.5).clamp(0.0, 1.0)
         geometric_out = self.geometric_model(pixel_values=geom_pixel_values, intrinsics=intrinsic)
         geometric_features = geometric_out.last_hidden_state
         if geometric_features.dim() == 4:
