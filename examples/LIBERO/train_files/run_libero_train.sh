@@ -23,6 +23,8 @@ libero_data_root=/2025233147/zzq/SpatialVLA_llava3d/playground/Datasets/LEROBOT_
 data_mix=libero_all
 run_root_dir=./results/Checkpoints
 seed=42
+per_device_bs=2
+grad_accum_steps=4
 timestamp=$(date +"%Y%m%d_%H%M%S")
 run_id=1229_libero4in1_MapAnythingLlava3DPI_s${seed}_${timestamp}
 # === End of environment variable configuration ===
@@ -45,7 +47,8 @@ if [ -n "${freeze_module_list}" ]; then
 fi
 
 accelerate launch \
-  --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
+  --config_file starVLA/config/deepseeds/deepspeed_zero3.yaml \
+  --gradient_accumulation_steps ${grad_accum_steps} \
   --num_processes 4 \
   starVLA/training/train_starvla.py \
   --config_yaml ${config_yaml} \
@@ -54,13 +57,14 @@ accelerate launch \
   --framework.mapanything_llava3d.normalize_vl_hidden true \
   --datasets.vla_data.data_root_dir ${libero_data_root}\
   --datasets.vla_data.data_mix ${data_mix} \
-  --datasets.vla_data.per_device_batch_size 4 \
+  --datasets.vla_data.per_device_batch_size ${per_device_bs} \
   --datasets.vla_data.video_backend torchvision_av \
   "${freeze_args[@]}" \
   --trainer.max_train_steps 80000 \
   --trainer.save_interval 10000 \
   --trainer.logging_frequency 10 \
   --trainer.eval_interval 100 \
+  --trainer.gradient_accumulation_steps ${grad_accum_steps} \
   --seed ${seed} \
   --run_root_dir ${run_root_dir} \
   --run_id ${run_id} \

@@ -49,6 +49,73 @@ class MapAnythingLlava3D_PI(baseframework):
         self.future_action_window_size = config.framework.action_model.future_action_window_size
         self.past_action_window_size = config.framework.action_model.past_action_window_size
         self.chunk_len = self.past_action_window_size + 1 + self.future_action_window_size
+        self.vlm_use_cache = False
+        self._configure_memory_optimizations()
+
+    @staticmethod
+    def _set_module_use_cache(module, use_cache: bool, module_name: str):
+        if module is None:
+            return
+        cfg = getattr(module, "config", None)
+        if cfg is not None and hasattr(cfg, "use_cache"):
+            setattr(cfg, "use_cache", bool(use_cache))
+            logger.info(f"[memory_opt] set {module_name}.config.use_cache={bool(use_cache)}")
+        generation_cfg = getattr(module, "generation_config", None)
+        if generation_cfg is not None and hasattr(generation_cfg, "use_cache"):
+            setattr(generation_cfg, "use_cache", bool(use_cache))
+
+    @staticmethod
+    def _enable_gradient_checkpointing(module, module_name: str):
+        if module is None:
+            return False
+        for fn_name in ("gradient_checkpointing_enable", "enable_gradient_checkpointing"):
+            fn = getattr(module, fn_name, None)
+            if callable(fn):
+                try:
+                    fn()
+                    logger.info(f"[memory_opt] enabled gradient checkpointing on {module_name} via `{fn_name}`")
+                    return True
+                except TypeError:
+                    try:
+                        fn(gradient_checkpointing_kwargs={"use_reentrant": False})
+                        logger.info(f"[memory_opt] enabled gradient checkpointing on {module_name} via `{fn_name}` with kwargs")
+                        return True
+                    except Exception as e:
+                        logger.warning(f"[memory_opt] failed enabling gradient checkpointing on {module_name}: {e}")
+                except Exception as e:
+                    logger.warning(f"[memory_opt] failed enabling gradient checkpointing on {module_name}: {e}")
+        return False
+
+    def _configure_memory_optimizations(self):
+        fw_cfg = getattr(self.config, "framework", None)
+        ma_cfg = getattr(fw_cfg, "mapanything_llava3d", None) if fw_cfg is not None else None
+        if ma_cfg is not None and hasattr(ma_cfg, "use_cache"):
+            self.vlm_use_cache = bool(getattr(ma_cfg, "use_cache"))
+        else:
+            self.vlm_use_cache = False
+
+        vlm_interface = self.mapanythingllava3d_vlm_interface
+        vlm_core = getattr(vlm_interface, "model", None)
+        language_wrapper = getattr(vlm_core, "language_model", None) if vlm_core is not None else None
+        llm_core = getattr(language_wrapper, "model", None) if language_wrapper is not None else None
+        action_dit = getattr(self.action_model, "model", None)
+
+        self._set_module_use_cache(vlm_core, self.vlm_use_cache, "vlm_core")
+        self._set_module_use_cache(language_wrapper, self.vlm_use_cache, "language_wrapper")
+        self._set_module_use_cache(llm_core, self.vlm_use_cache, "llm_core")
+
+        enable_gc = bool(getattr(getattr(self.config, "trainer", None), "enable_gradient_checkpointing", False))
+        if not enable_gc:
+            logger.info("[memory_opt] gradient checkpointing disabled by config")
+            return
+
+        gc_enabled = False
+        gc_enabled = self._enable_gradient_checkpointing(vlm_core, "vlm_core") or gc_enabled
+        gc_enabled = self._enable_gradient_checkpointing(language_wrapper, "language_wrapper") or gc_enabled
+        gc_enabled = self._enable_gradient_checkpointing(llm_core, "llm_core") or gc_enabled
+        gc_enabled = self._enable_gradient_checkpointing(action_dit, "action_dit") or gc_enabled
+        if not gc_enabled:
+            logger.warning("[memory_opt] no module accepted gradient checkpointing enable call")
 
     def forward(
         self,
@@ -77,6 +144,7 @@ class MapAnythingLlava3D_PI(baseframework):
         with torch.autocast("cuda", dtype=torch.bfloat16):
             vlm_outputs = self.mapanythingllava3d_vlm_interface(
                 **vlm_inputs,
+                use_cache=self.vlm_use_cache,
                 output_attentions=False,
                 output_hidden_states=True,
                 return_dict=True,
@@ -210,6 +278,7 @@ class MapAnythingLlava3D_PI(baseframework):
         with torch.autocast("cuda", dtype=torch.bfloat16):
             vlm_outputs = self.mapanythingllava3d_vlm_interface(
                 **vlm_inputs,
+                use_cache=self.vlm_use_cache,
                 output_attentions=False,
                 output_hidden_states=True,
                 return_dict=True,
