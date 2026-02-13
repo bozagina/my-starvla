@@ -10,6 +10,7 @@ from transformers import PreTrainedModel, AutoConfig
 from transformers.modeling_utils import load_state_dict
 from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
+import inspect
 
 _ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
 if _ROOT_DIR not in sys.path:
@@ -46,6 +47,54 @@ def _suspend_llava_vision_tower():
     finally:
         for mod, orig in origs.items():
             mod.build_vision_tower = orig
+
+
+@contextmanager
+def _suspend_hf_zero3_init():
+    """
+    Temporarily disable Transformers' global ZeRO-3 init flag while constructing/loading
+    this local LLaVA module. Otherwise, parameters can be materialized as zero-sized
+    partitions (shape [0]) and fail on manual `load_state_dict`.
+    """
+    ds_mod = None
+    old_ref = None
+    try:
+        import transformers.integrations.deepspeed as ds_mod  # type: ignore
+        if hasattr(ds_mod, "_hf_deepspeed_config_weak_ref"):
+            old_ref = ds_mod._hf_deepspeed_config_weak_ref
+            ds_mod._hf_deepspeed_config_weak_ref = None
+    except Exception:
+        ds_mod = None
+        old_ref = None
+    try:
+        yield
+    finally:
+        if ds_mod is not None and old_ref is not None:
+            ds_mod._hf_deepspeed_config_weak_ref = old_ref
+
+
+def _load_state_dict_compat(model: nn.Module, shard: dict) -> None:
+    """
+    Compatibility loader:
+    - normal path: strict=False copy
+    - fallback path: strict=False + assign=True (for meta/partitioned params)
+    """
+    try:
+        model.load_state_dict(shard, strict=False)
+        return
+    except RuntimeError as e:
+        err = str(e)
+        zero_shape_mismatch = "shape in current model is torch.Size([0])" in err
+        if not zero_shape_mismatch:
+            raise
+
+    has_assign = "assign" in inspect.signature(model.load_state_dict).parameters
+    if not has_assign:
+        raise RuntimeError(
+            "Detected ZeRO-3 style zero-shaped parameters during load_state_dict, "
+            "but this torch version does not support `assign=True` fallback."
+        )
+    model.load_state_dict(shard, strict=False, assign=True)
 
 
 def _resolve_index_file(pretrained_path: str) -> Optional[Path]:
@@ -96,7 +145,7 @@ def _load_llava_base_weights(model: nn.Module, pretrained_path: str) -> None:
     for wf in weight_files:
         shard = load_state_dict(str(wf))
         shard = _filter_llava_state_dict(shard)
-        model.load_state_dict(shard, strict=False)
+        _load_state_dict_compat(model, shard)
         del shard
 
 
@@ -116,9 +165,9 @@ class LLaVA3DForCausalLMV2(PreTrainedModel, GenerationMixin):
                     setattr(llava_cfg, "mm_vision_tower", "")
                 if hasattr(llava_cfg, "vision_tower"):
                     setattr(llava_cfg, "vision_tower", "")
-                with _suspend_llava_vision_tower():
+                with _suspend_hf_zero3_init(), _suspend_llava_vision_tower():
                     self.model = LlavaLlamaForCausalLM(llava_cfg)
-                _load_llava_base_weights(self.model, pretrained_path)
+                    _load_llava_base_weights(self.model, pretrained_path)
             else:
                 setattr(config, "mm_video_tower", None)
                 with _suspend_llava_vision_tower():
@@ -132,9 +181,9 @@ class LLaVA3DForCausalLMV2(PreTrainedModel, GenerationMixin):
                     setattr(llava_cfg, "mm_vision_tower", "")
                 if hasattr(llava_cfg, "vision_tower"):
                     setattr(llava_cfg, "vision_tower", "")
-                with _suspend_llava_vision_tower():
+                with _suspend_hf_zero3_init(), _suspend_llava_vision_tower():
                     self.model = LlavaMistralForCausalLM(llava_cfg)
-                _load_llava_base_weights(self.model, pretrained_path)
+                    _load_llava_base_weights(self.model, pretrained_path)
             else:
                 setattr(config, "mm_video_tower", None)
                 with _suspend_llava_vision_tower():
