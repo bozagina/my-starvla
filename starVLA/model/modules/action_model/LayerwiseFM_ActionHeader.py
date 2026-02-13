@@ -5,6 +5,7 @@
 
 
 from dataclasses import dataclass, field
+import logging
 
 import torch
 import torch.nn.functional as F
@@ -21,6 +22,14 @@ from starVLA.model.modules.action_model.flow_matching_head.action_encoder import
 from starVLA.model.modules.action_model.flow_matching_head.cross_attention_dit import DiT, SelfAttentionTransformer
 
 # TODO try to meger DiT Modules with follow_match_head, they are just the same arch, but diff loss, use diffusers package will be simple
+
+logger = logging.getLogger(__name__)
+
+
+def _cfg_get(cfg, key, default=None):
+    if isinstance(cfg, dict):
+        return cfg.get(key, default)
+    return getattr(cfg, key, default)
 
 class CategorySpecificLinear(nn.Module):
     def __init__(self, num_categories, input_dim, hidden_dim):
@@ -201,6 +210,18 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     num_target_vision_tokens: int = field(
         default=32, metadata={"help": "Number of target vision tokens."}
     )
+    use_concat_cross_context: bool = field(
+        default=False,
+        metadata={"help": "If true, use concat(vl_emb, hidden_states) as cross-attention context."},
+    )
+    cross_attention_assert_inputs: bool = field(
+        default=True,
+        metadata={"help": "If true, validate layerwise cross-attention input layer count and shape."},
+    )
+    cross_attention_debug_log_interval: int = field(
+        default=0,
+        metadata={"help": "If >0, log layerwise hidden-state stats every N calls."},
+    )
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -278,6 +299,19 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         self.beta_dist = Beta(action_config.noise_beta_alpha, action_config.noise_beta_beta)
         self.num_timestep_buckets = action_config.num_timestep_buckets
         self.config = action_config
+        self.use_concat_cross_context = bool(_cfg_get(action_config, "use_concat_cross_context", False))
+        self.cross_attention_assert_inputs = bool(_cfg_get(action_config, "cross_attention_assert_inputs", True))
+        log_interval = _cfg_get(action_config, "cross_attention_debug_log_interval", 0)
+        self.cross_attention_debug_log_interval = int(log_interval) if log_interval is not None else 0
+        self._layerwise_forward_calls = 0
+        self._last_dit_layer_means = []
+        self._last_dit_layer_vars = []
+        logger.info(
+            "LayerwiseFMActionHead initialized: use_concat_cross_context=%s, cross_attention_assert_inputs=%s, cross_attention_debug_log_interval=%d",
+            self.use_concat_cross_context,
+            self.cross_attention_assert_inputs,
+            self.cross_attention_debug_log_interval,
+        )
 
     def sample_time(self, batch_size, device, dtype):
         sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
@@ -287,7 +321,65 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         return BatchFeature(data=batch)
 
 
-    def _apply_layerwise_cross_attention(self, saction_embs, vl_embs_list, temb):
+    @staticmethod
+    def _is_main_process():
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return True
+        return torch.distributed.get_rank() == 0
+
+    def _validate_cross_attention_inputs(self, saction_embs, vl_embs_list):
+        if not self.cross_attention_assert_inputs:
+            return
+        if not isinstance(vl_embs_list, (list, tuple)) or len(vl_embs_list) == 0:
+            raise ValueError("`vl_embs_list` must be a non-empty list/tuple of layerwise embeddings.")
+        expected_layers = len(self.model.transformer_blocks)
+        if len(vl_embs_list) != expected_layers:
+            raise ValueError(
+                f"Layerwise cross-attention mismatch: got {len(vl_embs_list)} vl layers, expected {expected_layers} DiT blocks."
+            )
+
+        expected_batch = saction_embs.shape[0]
+        expected_hidden = saction_embs.shape[-1]
+        for layer_idx, vl_emb in enumerate(vl_embs_list):
+            if vl_emb.ndim != 3:
+                raise ValueError(
+                    f"vl_embs_list[{layer_idx}] must be 3D [B,S,D], got shape={tuple(vl_emb.shape)}."
+                )
+            if vl_emb.shape[0] != expected_batch:
+                raise ValueError(
+                    f"Batch mismatch at vl_embs_list[{layer_idx}]: got B={vl_emb.shape[0]}, expected B={expected_batch}."
+                )
+            if vl_emb.shape[-1] != expected_hidden:
+                raise ValueError(
+                    f"Hidden dim mismatch at vl_embs_list[{layer_idx}]: got D={vl_emb.shape[-1]}, expected D={expected_hidden}."
+                )
+            if vl_emb.device != saction_embs.device:
+                raise ValueError(
+                    f"Device mismatch at vl_embs_list[{layer_idx}]: got {vl_emb.device}, expected {saction_embs.device}."
+                )
+
+    def _maybe_log_layerwise_stats(self, log_context):
+        if self.cross_attention_debug_log_interval <= 0:
+            return
+        if self._layerwise_forward_calls % self.cross_attention_debug_log_interval != 0:
+            return
+        if not self._is_main_process():
+            return
+        if not self._last_dit_layer_means or not self._last_dit_layer_vars:
+            return
+        logger.info(
+            "LayerwiseCrossAttn[%s] call=%d concat_cross=%s layers=%d mean(first,last)=(%.6f,%.6f) var(first,last)=(%.6f,%.6f)",
+            log_context,
+            self._layerwise_forward_calls,
+            self.use_concat_cross_context,
+            len(self._last_dit_layer_means),
+            self._last_dit_layer_means[0],
+            self._last_dit_layer_means[-1],
+            self._last_dit_layer_vars[0],
+            self._last_dit_layer_vars[-1],
+        )
+
+    def _apply_layerwise_cross_attention(self, saction_embs, vl_embs_list, temb, log_context="train"):
         """
         Apply layerwise cross-attention between state-action embeddings and vision-language embeddings.
 
@@ -299,18 +391,25 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         Returns:
             hidden_states: Tensor of shape (B, seq_length, embedding_dim)
         """
+        self._validate_cross_attention_inputs(saction_embs, vl_embs_list)
         hidden_states = saction_embs
+        self._layerwise_forward_calls += 1
         self._last_dit_layer_means = []
         self._last_dit_layer_vars = []
         for layer_idx, layer in enumerate(self.model.transformer_blocks):
+            if self.use_concat_cross_context:
+                cross_context = torch.cat((vl_embs_list[layer_idx], hidden_states), dim=1)
+            else:
+                cross_context = vl_embs_list[layer_idx]
             hidden_states = layer(
                 hidden_states=hidden_states,
-                encoder_hidden_states=vl_embs_list[layer_idx],
+                encoder_hidden_states=cross_context,
                 temb=temb,
             )
             stats = hidden_states.detach().float()
             self._last_dit_layer_means.append(stats.mean().item())
             self._last_dit_layer_vars.append(stats.var(unbiased=False).item())
+        self._maybe_log_layerwise_stats(log_context=log_context)
         return hidden_states
 
     def _process_output(self, hidden_states, temb, actions_length):
@@ -368,7 +467,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             if state_features is not None else torch.cat((future_tokens, action_features), dim=1)
         
         temb = self.model.timestep_encoder(t_discretized)
-        hidden_states = self._apply_layerwise_cross_attention(sa_embs, vl_embs_list, temb)
+        hidden_states = self._apply_layerwise_cross_attention(sa_embs, vl_embs_list, temb, log_context="train")
         pred_velocity = self._process_output(hidden_states, temb, actions.shape[1])
         loss = ((pred_velocity - velocity) ** 2).mean()
         return loss
@@ -413,7 +512,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             )
 
             temb = self.model.timestep_encoder(timesteps_tensor)
-            hidden_states = self._apply_layerwise_cross_attention(sa_embs, vl_embs_list, temb)
+            hidden_states = self._apply_layerwise_cross_attention(sa_embs, vl_embs_list, temb, log_context="infer")
             pred_velocity = self._process_output(hidden_states, temb, self.action_horizon)
             actions = actions + dt * pred_velocity
         return actions
