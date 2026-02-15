@@ -103,3 +103,8 @@ fi
 
 echo "[fetch] Local path: $LOCAL_OUT/$LATEST_REL"
 ls -lh "$LOCAL_OUT/$LATEST_REL" || true
+
+if [ ! -f "$LOCAL_OUT/$LATEST_REL/train.log" ] && [ -f "$LOCAL_OUT/$LATEST_REL/train.raw.log" ]; then
+  tr '\r' '\n' < "$LOCAL_OUT/$LATEST_REL/train.raw.log" > "$LOCAL_OUT/$LATEST_REL/train.log"
+  echo "[fetch] NOTE: train.log missing on source; generated locally from train.raw.log"
+fi
