@@ -117,6 +117,16 @@ class MapAnythingLlava3D_PI(baseframework):
         if not gc_enabled:
             logger.warning("[memory_opt] no module accepted gradient checkpointing enable call")
 
+    @staticmethod
+    def _parse_bool_flag(value, default=False):
+        if value is None:
+            return bool(default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "y", "on")
+        return bool(value)
+
     def forward(
         self,
         examples: List[dict] = None,
@@ -270,6 +280,7 @@ class MapAnythingLlava3D_PI(baseframework):
         instructions = [example["lang"] for example in examples]
         state = [example["state"] for example in examples] if "state" in examples[0] else None
         deterministic_seed = kwargs.get("deterministic_seed", None)
+        return_debug_info = self._parse_bool_flag(kwargs.get("return_debug_info", False), default=False)
         if deterministic_seed is not None:
             try:
                 deterministic_seed = int(deterministic_seed)
@@ -281,6 +292,7 @@ class MapAnythingLlava3D_PI(baseframework):
             batch_images = resize_images(batch_images, target_size=train_obs_image_size)
 
         vlm_inputs = self.mapanythingllava3d_vlm_interface.build_mapanythingllava3d_inputs(images=batch_images, instructions=instructions)
+        debug_info = None
         with torch.autocast("cuda", dtype=torch.bfloat16):
             vlm_outputs = self.mapanythingllava3d_vlm_interface(
                 **vlm_inputs,
@@ -302,6 +314,93 @@ class MapAnythingLlava3D_PI(baseframework):
             if self.normalize_vl_hidden:
                 vl_embs_list = [F.layer_norm(h, h.shape[-1:]) for h in vl_embs_list]
             base_hidden = vl_embs_list[-1]
+            if return_debug_info:
+                debug_info = {
+                    "deterministic_seed": deterministic_seed,
+                    "instruction_preview": [str(x)[:256] for x in instructions[:2]],
+                    "vl_layer_selection": str(self.vl_layer_selection),
+                    "selected_vl_layer_indices": [int(i) for i in indices],
+                    "vl_num_selected_layers": int(len(vl_embs_list)),
+                }
+                input_ids = vlm_inputs.get("input_ids", None)
+                attention_mask = vlm_inputs.get("attention_mask", None)
+                image_token_index = vlm_inputs.get("image_token_index", None)
+                if isinstance(image_token_index, torch.Tensor):
+                    image_token_index = int(image_token_index.detach().item())
+                elif image_token_index is not None:
+                    image_token_index = int(image_token_index)
+
+                if isinstance(input_ids, torch.Tensor):
+                    ids_cpu = input_ids.detach().to("cpu")
+                    debug_info["input_ids_shape"] = [int(x) for x in ids_cpu.shape]
+                    debug_info["input_ids_head"] = ids_cpu[:, :16].tolist()
+
+                    if isinstance(attention_mask, torch.Tensor):
+                        active_cpu = attention_mask.detach().to("cpu").bool()
+                    else:
+                        active_cpu = torch.ones_like(ids_cpu, dtype=torch.bool)
+
+                    if image_token_index is not None:
+                        image_mask_cpu = (ids_cpu == image_token_index) & active_cpu
+                    else:
+                        image_mask_cpu = torch.zeros_like(ids_cpu, dtype=torch.bool)
+                    lang_mask_cpu = (~image_mask_cpu) & active_cpu
+                    debug_info["image_token_index"] = image_token_index
+                    debug_info["active_tokens_per_sample"] = [int(x) for x in active_cpu.sum(dim=1).tolist()]
+                    debug_info["image_tokens_per_sample"] = [int(x) for x in image_mask_cpu.sum(dim=1).tolist()]
+                    debug_info["lang_tokens_per_sample"] = [int(x) for x in lang_mask_cpu.sum(dim=1).tolist()]
+
+                    token_signatures = []
+                    for row_ids, row_lang_mask in zip(ids_cpu, lang_mask_cpu):
+                        lang_ids = row_ids[row_lang_mask].to(torch.int64)
+                        if lang_ids.numel() == 0:
+                            token_signatures.append(0)
+                            continue
+                        weights = torch.arange(1, lang_ids.numel() + 1, dtype=torch.int64)
+                        signature = int((lang_ids * weights).sum().item() % 1000000007)
+                        token_signatures.append(signature)
+                    debug_info["lang_token_signatures"] = token_signatures
+
+                    image_mask_dev = image_mask_cpu.to(device=base_hidden.device)
+                    lang_mask_dev = lang_mask_cpu.to(device=base_hidden.device)
+                else:
+                    image_mask_dev = None
+                    lang_mask_dev = None
+                    debug_info["input_ids_shape"] = None
+                    debug_info["input_ids_head"] = None
+
+                vl_layer_mean = []
+                vl_layer_std = []
+                vl_layer_rms = []
+                lang_layer_rms = []
+                image_layer_rms = []
+                for h in vl_embs_list:
+                    hs = h.detach().float()
+                    vl_layer_mean.append(float(hs.mean().item()))
+                    vl_layer_std.append(float(hs.std(unbiased=False).item()))
+                    vl_layer_rms.append(float((hs * hs).mean().sqrt().item()))
+
+                    if lang_mask_dev is not None and bool(lang_mask_dev.any().item()):
+                        lang_weight = lang_mask_dev.unsqueeze(-1).to(dtype=hs.dtype, device=hs.device)
+                        lang_count = max(1.0, float(lang_mask_dev.sum().item()))
+                        lang_rms = ((hs * hs * lang_weight).sum() / (lang_count * hs.shape[-1])).sqrt()
+                        lang_layer_rms.append(float(lang_rms.item()))
+                    else:
+                        lang_layer_rms.append(None)
+
+                    if image_mask_dev is not None and bool(image_mask_dev.any().item()):
+                        image_weight = image_mask_dev.unsqueeze(-1).to(dtype=hs.dtype, device=hs.device)
+                        image_count = max(1.0, float(image_mask_dev.sum().item()))
+                        image_rms = ((hs * hs * image_weight).sum() / (image_count * hs.shape[-1])).sqrt()
+                        image_layer_rms.append(float(image_rms.item()))
+                    else:
+                        image_layer_rms.append(None)
+
+                debug_info["vl_layer_mean"] = vl_layer_mean
+                debug_info["vl_layer_std"] = vl_layer_std
+                debug_info["vl_layer_rms"] = vl_layer_rms
+                debug_info["lang_layer_rms"] = lang_layer_rms
+                debug_info["image_layer_rms"] = image_layer_rms
 
         state_tensor = torch.from_numpy(np.array(state)).to(base_hidden.device, dtype=base_hidden.dtype) if state is not None else None
 
@@ -313,7 +412,23 @@ class MapAnythingLlava3D_PI(baseframework):
             )
 
         normalized_actions = pred_actions.detach().cpu().numpy()
-        return {"normalized_actions": normalized_actions}
+        output = {"normalized_actions": normalized_actions}
+        if return_debug_info:
+            if debug_info is None:
+                debug_info = {}
+            debug_info["state_present"] = bool(state_tensor is not None)
+            debug_info["state_shape"] = list(state_tensor.shape) if state_tensor is not None else None
+            debug_info["normalized_action_mean"] = float(normalized_actions.mean())
+            debug_info["normalized_action_std"] = float(normalized_actions.std())
+            debug_info["normalized_action_absmax"] = float(np.abs(normalized_actions).max())
+            layer_means = getattr(self.action_model, "_last_dit_layer_means", None)
+            layer_vars = getattr(self.action_model, "_last_dit_layer_vars", None)
+            if layer_means is not None:
+                debug_info["dit_layer_means"] = [float(x) for x in layer_means]
+            if layer_vars is not None:
+                debug_info["dit_layer_vars"] = [float(x) for x in layer_vars]
+            output["debug_info"] = debug_info
+        return output
 
 
 
