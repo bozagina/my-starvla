@@ -2,13 +2,15 @@
 set -euo pipefail
 
 HOST="${HOST:-myserver}"
-REMOTE_CKPT="/2025233147/zzq/SpatialVLA_llava3d/starVLA/results/Checkpoints"
+REMOTE_CKPT="${REMOTE_CKPT:-/2025233147/zzq/SpatialVLA_llava3d/starVLA/results/Checkpoints}"
 LOCAL_OUT="${1:-$PWD/_remote_runs}"
 RUN_ID="${RUN_ID:-}"
 RUN_FILTER="${RUN_FILTER:-}"
+ALLOW_LOCAL_FALLBACK="${ALLOW_LOCAL_FALLBACK:-0}"
 
 mkdir -p "$LOCAL_OUT"
 
+echo "[fetch] Source host: $HOST"
 echo "[fetch] Remote checkpoints: $REMOTE_CKPT"
 
 USE_SSH=1
@@ -17,9 +19,15 @@ if [ -z "${HOST}" ] || [ "${HOST}" = "local" ] || [ "${HOST}" = "localhost" ] ||
 fi
 if [ "$USE_SSH" -eq 1 ]; then
   if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "$HOST" "echo ok" >/dev/null 2>&1; then
-    if [ -d "$REMOTE_CKPT" ]; then
-      echo "[fetch] WARN: ssh to ${HOST} failed; using local path ${REMOTE_CKPT}"
+    if [ -d "$REMOTE_CKPT" ] && [ "$ALLOW_LOCAL_FALLBACK" = "1" ]; then
+      echo "[fetch] WARN: ssh to ${HOST} failed; using local path ${REMOTE_CKPT} (ALLOW_LOCAL_FALLBACK=1)"
       USE_SSH=0
+    else
+      echo "[fetch] ERROR: ssh to ${HOST} failed."
+      echo "[fetch] Check first: ssh ${HOST}"
+      echo "[fetch] Hint: run this script on your local machine to pull from server '${HOST}'."
+      echo "[fetch] If you intentionally want local-path copy on this machine, set ALLOW_LOCAL_FALLBACK=1."
+      exit 3
     fi
   fi
 fi
@@ -80,31 +88,35 @@ else
 fi
 
 echo "[fetch] Latest run: $LATEST_REL"
-mkdir -p "$LOCAL_OUT/$LATEST_REL"
+ABS_LOCAL_OUT="$(cd "$LOCAL_OUT" && pwd)"
+LOCAL_RUN_PATH="$ABS_LOCAL_OUT/$LATEST_REL"
+mkdir -p "$LOCAL_RUN_PATH"
 
 echo "[fetch] Pulling: config.yaml metrics.jsonl summary.jsonl train.log train.raw.log"
-if [ "$USE_SSH" -eq 1 ]; then
-  rsync -av --ignore-missing-args \
-    "$HOST:$REMOTE_CKPT/$LATEST_REL/config.yaml" \
-    "$HOST:$REMOTE_CKPT/$LATEST_REL/metrics.jsonl" \
-    "$HOST:$REMOTE_CKPT/$LATEST_REL/summary.jsonl" \
-    "$HOST:$REMOTE_CKPT/$LATEST_REL/train.log" \
-    "$HOST:$REMOTE_CKPT/$LATEST_REL/train.raw.log" \
-    "$LOCAL_OUT/$LATEST_REL/"
-else
-  rsync -av --ignore-missing-args \
-    "$REMOTE_CKPT/$LATEST_REL/config.yaml" \
-    "$REMOTE_CKPT/$LATEST_REL/metrics.jsonl" \
-    "$REMOTE_CKPT/$LATEST_REL/summary.jsonl" \
-    "$REMOTE_CKPT/$LATEST_REL/train.log" \
-    "$REMOTE_CKPT/$LATEST_REL/train.raw.log" \
-    "$LOCAL_OUT/$LATEST_REL/"
-fi
+FILES=("config.yaml" "metrics.jsonl" "summary.jsonl" "train.log" "train.raw.log")
+for f in "${FILES[@]}"; do
+  REMOTE_FILE="$REMOTE_CKPT/$LATEST_REL/$f"
+  if [ "$USE_SSH" -eq 1 ]; then
+    if ssh "$HOST" "test -f '$REMOTE_FILE'" >/dev/null 2>&1; then
+      rsync -av "$HOST:$REMOTE_FILE" "$LOCAL_RUN_PATH/"
+    else
+      echo "[fetch] SKIP missing: $f"
+    fi
+  else
+    if [ -f "$REMOTE_FILE" ]; then
+      rsync -av "$REMOTE_FILE" "$LOCAL_RUN_PATH/"
+    else
+      echo "[fetch] SKIP missing: $f"
+    fi
+  fi
+done
 
-echo "[fetch] Local path: $LOCAL_OUT/$LATEST_REL"
-ls -lh "$LOCAL_OUT/$LATEST_REL" || true
+echo "[fetch] Saved to: $LOCAL_RUN_PATH"
+ln -sfn "$LOCAL_RUN_PATH" "$ABS_LOCAL_OUT/latest"
+echo "[fetch] Latest symlink: $ABS_LOCAL_OUT/latest"
+ls -lh "$LOCAL_RUN_PATH" || true
 
-if [ ! -f "$LOCAL_OUT/$LATEST_REL/train.log" ] && [ -f "$LOCAL_OUT/$LATEST_REL/train.raw.log" ]; then
-  tr '\r' '\n' < "$LOCAL_OUT/$LATEST_REL/train.raw.log" > "$LOCAL_OUT/$LATEST_REL/train.log"
+if [ ! -f "$LOCAL_RUN_PATH/train.log" ] && [ -f "$LOCAL_RUN_PATH/train.raw.log" ]; then
+  tr '\r' '\n' < "$LOCAL_RUN_PATH/train.raw.log" > "$LOCAL_RUN_PATH/train.log"
   echo "[fetch] NOTE: train.log missing on source; generated locally from train.raw.log"
 fi

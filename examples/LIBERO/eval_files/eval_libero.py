@@ -62,6 +62,13 @@ class Args:
 
     job_name: str = "test"
 
+    # Debug / input validation
+    use_state: bool = True
+    expected_state_dim: int = 8
+    auto_pad_state_to_expected_dim: bool = False
+    log_payload_every_n_steps: int = 20
+    repeat_infer_debug_times: int = 1
+
 
 def eval_libero(args: Args) -> None:
     logging.info(f"Arguments: {json.dumps(dataclasses.asdict(args), indent=4)}")
@@ -160,6 +167,19 @@ def eval_libero(args: Args) -> None:
                         obs["robot0_gripper_qpos"],
                     )
                 )
+                state = np.asarray(state, dtype=np.float32).reshape(-1)
+                if args.use_state and args.expected_state_dim > 0 and state.shape[0] != args.expected_state_dim:
+                    if args.auto_pad_state_to_expected_dim and state.shape[0] < args.expected_state_dim:
+                        pad_n = args.expected_state_dim - state.shape[0]
+                        state = np.concatenate([state, np.zeros((pad_n,), dtype=np.float32)], axis=0)
+                        logging.warning(
+                            f"[state] auto pad state dim from {state.shape[0] - pad_n} to {state.shape[0]}"
+                        )
+                    else:
+                        raise ValueError(
+                            f"State dim mismatch at task_id={task_id}, episode={episode_idx}, step={step}: "
+                            f"got {state.shape[0]}, expected {args.expected_state_dim}"
+                        )
 
                 observation = { # 
                     "observation.primary": np.expand_dims(
@@ -177,6 +197,21 @@ def eval_libero(args: Args) -> None:
                     "image": [observation["observation.primary"][0], observation["observation.wrist_image"][0]],
                     "lang": observation["instruction"][0],
                 }
+                if args.use_state:
+                    example_dict["state"] = observation["observation.state"].astype(np.float32)
+
+                log_every = max(1, int(args.log_payload_every_n_steps))
+                if step % log_every == 0:
+                    logging.info(
+                        "[payload] task_id=%s episode=%s step=%s lang='%s' img0=%s img1=%s state_shape=%s",
+                        task_id,
+                        episode_idx,
+                        step,
+                        example_dict["lang"],
+                        tuple(example_dict["image"][0].shape),
+                        tuple(example_dict["image"][1].shape),
+                        None if "state" not in example_dict else tuple(example_dict["state"].shape),
+                    )
 
                 logging.info(
                     f"Sending to policy server | task_id={task_id}, episode={episode_idx}, lang='{example_dict['lang']}'"
@@ -185,7 +220,36 @@ def eval_libero(args: Args) -> None:
                 
                 start_time = time.time()
                 
-                response = client_model.step(example=example_dict, step=step) 
+                repeat_times = max(1, int(args.repeat_infer_debug_times))
+                response = client_model.step(example=example_dict, step=step)
+                if repeat_times > 1:
+                    cached_raw_actions = getattr(client_model, "raw_actions", None)
+                    response_list = [response]
+                    for _ in range(repeat_times - 1):
+                        response_list.append(client_model.step(example=example_dict, step=step))
+                    repeated_actions = []
+                    for rep in response_list:
+                        rep_raw = rep["raw_action"]
+                        rep_action = np.concatenate(
+                            [
+                                np.asarray(rep_raw.get("world_vector"), dtype=np.float32).reshape(-1),
+                                np.asarray(rep_raw.get("rotation_delta"), dtype=np.float32).reshape(-1),
+                                np.asarray(rep_raw.get("open_gripper"), dtype=np.float32).reshape(-1),
+                            ],
+                            axis=0,
+                        )
+                        repeated_actions.append(rep_action)
+                    repeated_actions = np.stack(repeated_actions, axis=0)
+                    logging.info(
+                        "[repeat_debug] task_id=%s episode=%s step=%s repeats=%s action_std=%s",
+                        task_id,
+                        episode_idx,
+                        step,
+                        repeat_times,
+                        np.array2string(repeated_actions.std(axis=0), precision=6),
+                    )
+                    if cached_raw_actions is not None:
+                        client_model.raw_actions = cached_raw_actions
                 
                 end_time = time.time()
                 # print(f"time: {end_time - start_time}")
@@ -269,6 +333,15 @@ def _get_libero_env(task, resolution, seed):
             raise RuntimeError("LIBERO_CONFIG_PATH or LIBERO_HOME must be set when get_libero_path is unavailable")
         base_bddl_path = pathlib.Path(base) / "libero" / "bddl_files"
     task_bddl_file = base_bddl_path / task.problem_folder / task.bddl_file
+    debug_lines = [
+        f"[DEBUG] task_description = {task_description}",
+        f"[DEBUG] task.problem_folder = {task.problem_folder}",
+        f"[DEBUG] task.bddl_file = {task.bddl_file}",
+        f"[DEBUG] task_bddl_file = {task_bddl_file}",
+    ]
+    for line in debug_lines:
+        logging.info(line)
+        print(line, flush=True)
     env_args = {
         "bddl_file_name": task_bddl_file,
         "camera_heights": resolution,
