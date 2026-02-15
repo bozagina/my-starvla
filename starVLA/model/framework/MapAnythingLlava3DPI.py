@@ -269,6 +269,12 @@ class MapAnythingLlava3D_PI(baseframework):
         batch_images = [to_pil_preserve(example["image"]) for example in examples]
         instructions = [example["lang"] for example in examples]
         state = [example["state"] for example in examples] if "state" in examples[0] else None
+        deterministic_seed = kwargs.get("deterministic_seed", None)
+        if deterministic_seed is not None:
+            try:
+                deterministic_seed = int(deterministic_seed)
+            except Exception as exc:
+                raise ValueError(f"`deterministic_seed` must be int-compatible, got {deterministic_seed!r}") from exc
 
         train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
         if train_obs_image_size:
@@ -300,7 +306,11 @@ class MapAnythingLlava3D_PI(baseframework):
         state_tensor = torch.from_numpy(np.array(state)).to(base_hidden.device, dtype=base_hidden.dtype) if state is not None else None
 
         with torch.autocast("cuda", dtype=torch.float32):
-            pred_actions = self.action_model.predict_action(vl_embs_list, state_tensor)
+            pred_actions = self.action_model.predict_action(
+                vl_embs_list,
+                state_tensor,
+                noise_seed=deterministic_seed,
+            )
 
         normalized_actions = pred_actions.detach().cpu().numpy()
         return {"normalized_actions": normalized_actions}

@@ -473,15 +473,37 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         return loss
 
     @torch.no_grad()
-    def predict_action(self, vl_embs_list: list, state: torch.Tensor = None) -> torch.Tensor:
+    def predict_action(
+        self,
+        vl_embs_list: list,
+        state: torch.Tensor = None,
+        noise_seed: int = None,
+    ) -> torch.Tensor:
         # Set initial actions as the sampled noise.
         batch_size = vl_embs_list[0].shape[0]
         device = vl_embs_list[0].device
-        actions = torch.randn(
-            size=(batch_size, self.action_horizon, self.action_dim),
-            dtype=vl_embs_list[0].dtype,
-            device=device,
-        )
+        generator = None
+        if noise_seed is not None:
+            try:
+                gen_device = device.type if isinstance(device, torch.device) else str(device).split(":")[0]
+                generator = torch.Generator(device=gen_device)
+            except Exception:
+                generator = torch.Generator()
+            generator.manual_seed(int(noise_seed))
+
+        if generator is None:
+            actions = torch.randn(
+                size=(batch_size, self.action_horizon, self.action_dim),
+                dtype=vl_embs_list[0].dtype,
+                device=device,
+            )
+        else:
+            actions = torch.randn(
+                size=(batch_size, self.action_horizon, self.action_dim),
+                dtype=vl_embs_list[0].dtype,
+                device=device,
+                generator=generator,
+            )
 
         num_steps = self.num_inference_timesteps
         dt = 1.0 / num_steps

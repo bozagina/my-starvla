@@ -68,6 +68,7 @@ class Args:
     auto_pad_state_to_expected_dim: bool = False
     log_payload_every_n_steps: int = 20
     repeat_infer_debug_times: int = 1
+    deterministic_seed: int = -1
 
 
 def eval_libero(args: Args) -> None:
@@ -104,6 +105,7 @@ def eval_libero(args: Args) -> None:
         host=args.host,
         port=args.port,
         image_size=args.resize_size,
+        deterministic_seed=(None if int(args.deterministic_seed) < 0 else int(args.deterministic_seed)),
     )
 
 

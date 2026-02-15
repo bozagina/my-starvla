@@ -29,6 +29,7 @@ class ModelClient:
         use_ddim: bool = True,
         num_ddim_steps: int = 10,
         adaptive_ensemble_alpha = 0.1,
+        deterministic_seed: Optional[int] = None,
         host="0.0.0.0",
         port=10095,
     ) -> None:
@@ -45,6 +46,7 @@ class ModelClient:
         self.horizon = horizon #0
         self.action_ensemble = action_ensemble
         self.adaptive_ensemble_alpha = adaptive_ensemble_alpha
+        self.deterministic_seed = deterministic_seed
         self.action_ensemble_horizon = action_ensemble_horizon
         self.sticky_action_is_on = False
         self.gripper_action_repeat = 0
@@ -108,6 +110,9 @@ class ModelClient:
             "use_ddim": self.use_ddim,
             "num_ddim_steps": self.num_ddim_steps,
         }
+        if self.deterministic_seed is not None:
+            # Keep deterministic across runs while allowing step-wise variation.
+            vla_input["deterministic_seed"] = int(self.deterministic_seed + step)
         
 
         action_chunk_size = self.action_chunk_size
