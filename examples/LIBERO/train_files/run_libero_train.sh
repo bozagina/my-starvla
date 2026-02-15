@@ -52,7 +52,7 @@ if [ -n "${freeze_module_list}" ]; then
 fi
 
 stdbuf -oL -eL accelerate launch \
-  --config_file starVLA/config/deepseeds/deepspeed_zero3.yaml \
+  --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
   --gradient_accumulation_steps ${grad_accum_steps} \
   --num_processes 4 \
   starVLA/training/train_starvla.py \
