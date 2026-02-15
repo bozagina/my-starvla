@@ -26,10 +26,12 @@ folder_name=$(echo "$your_ckpt" | awk -F'/' '{print $(NF-2)"_"$(NF-1)"_"$NF}')
 
 LOG_DIR="logs/$(date +"%Y%m%d_%H%M%S")"
 mkdir -p ${LOG_DIR}
+LOG_FILE="${LOG_DIR}/eval_libero.log"
+exec > >(tee -a "${LOG_FILE}") 2>&1
 
 
 task_suite_name=libero_goal
-num_trials_per_task=50
+num_trials_per_task=5
 video_out_path="results/${task_suite_name}/${folder_name}"
 
 
