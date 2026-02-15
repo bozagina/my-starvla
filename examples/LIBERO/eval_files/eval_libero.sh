@@ -4,8 +4,8 @@ cd /2025233147/zzq/SpatialVLA_llava3d/starVLA
 
 ###########################################################################################
 # === Please modify the following paths according to your environment ===
-export LIBERO_HOME=/2025233147/zzq/SpatialVLA_llava3d/starVLA/examples/Projects/LIBERO
-export LIBERO_CONFIG_PATH=${LIBERO_HOME}/libero
+export LIBERO_HOME=/2025233147/zzq/LIBERO
+export LIBERO_CONFIG_PATH=/2025233147/zzq/LIBERO
 export LIBERO_Python=$(which python)
 
 # 让 Python 能找到 LIBERO 和 starVLA 这两个包
@@ -18,7 +18,7 @@ export PYOPENGL_PLATFORM=osmesa
 host="127.0.0.1"
 base_port=5694
 unnorm_key="franka"
-your_ckpt=./results/Checkpoints/1229_libero4in1_MapAnythingLlava3DPI_s42_20260201_042829/checkpoints/steps_20000_pytorch_model.pt
+your_ckpt=./results/Checkpoints/1229_libero4in1_MapAnythingLlava3DPI_s42_20260213_155123/checkpoints/steps_10000_pytorch_model.pt
 
 folder_name=$(echo "$your_ckpt" | awk -F'/' '{print $(NF-2)"_"$(NF-1)"_"$NF}')
 # === End of environment variable configuration ===

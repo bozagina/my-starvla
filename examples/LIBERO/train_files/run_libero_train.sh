@@ -18,12 +18,12 @@ Framework_name=MapAnythingLlava3DPI
 freeze_module_list=''
 base_vlm=/2025233147/zzq/SpatialVLA_llava3d/model_zoo/mapanythingllava3d_base_v3
 
-config_yaml=/2025233147/zzq/SpatialVLA_llava3d/starVLA/starVLA/config/training/starvla_train_libero_mapanything_llava3d.yaml
+config_yaml=/2025233147/zzq/SpatialVLA_llava3d/starVLA/starVLA/config/training/starvla_train_libero_mapanything_llava3d_ab_a_pure_cross.yaml
 libero_data_root=/2025233147/zzq/SpatialVLA_llava3d/playground/Datasets/LEROBOT_LIBERO_DATA
 data_mix=libero_all
 run_root_dir=./results/Checkpoints
 seed=42
-per_device_bs=2
+per_device_bs=4
 grad_accum_steps=4
 timestamp=$(date +"%Y%m%d_%H%M%S")
 run_id=1229_libero4in1_MapAnythingLlava3DPI_s${seed}_${timestamp}

@@ -13,8 +13,16 @@ import imageio
 import numpy as np
 import tqdm
 import tyro
-from libero.libero import benchmark, get_libero_path
-from libero.libero.envs import OffScreenRenderEnv
+try:
+    from libero.libero import benchmark, get_libero_path
+except ImportError:
+    from libero.libero import benchmark
+    get_libero_path = None
+
+try:
+    from libero.libero.envs import OffScreenRenderEnv
+except ImportError:
+    from libero.libero.envs.offscreen_env import OffScreenRenderEnv
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from examples.LIBERO.eval_files.model2libero_interface import ModelClient
 
@@ -252,13 +260,15 @@ def eval_libero(args: Args) -> None:
 
 
 def _get_libero_env(task, resolution, seed):
-    """Initializes and returns the LIBERO environment, along with the task description."""
     task_description = task.language
-    task_bddl_file = (
-        pathlib.Path(get_libero_path("bddl_files"))
-        / task.problem_folder
-        / task.bddl_file
-    )
+    if get_libero_path is not None:
+        base_bddl_path = pathlib.Path(get_libero_path("bddl_files"))
+    else:
+        base = os.environ.get("LIBERO_CONFIG_PATH") or os.environ.get("LIBERO_HOME")
+        if base is None:
+            raise RuntimeError("LIBERO_CONFIG_PATH or LIBERO_HOME must be set when get_libero_path is unavailable")
+        base_bddl_path = pathlib.Path(base) / "libero" / "bddl_files"
+    task_bddl_file = base_bddl_path / task.problem_folder / task.bddl_file
     env_args = {
         "bddl_file_name": task_bddl_file,
         "camera_heights": resolution,
