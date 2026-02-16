@@ -42,10 +42,6 @@ from starVLA.training.trainer_utils.trainer_tools import TrainerUtils
 from starVLA.training.trainer_utils.trainer_tools import build_param_lr_groups
 from starVLA.training.trainer_utils.config_tracker import wrap_config, AccessTrackedConfig
 
-deepspeed_plugin = DeepSpeedPlugin()
-accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
-accelerator.print(accelerator.state)
-
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -54,6 +50,35 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from accelerate.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def build_accelerator(cfg) -> Accelerator:
+    """Build accelerator with explicit gradient accumulation from config."""
+    grad_accum_steps = int(getattr(cfg.trainer, "gradient_accumulation_steps", 1))
+    if grad_accum_steps < 1:
+        raise ValueError(f"Invalid gradient_accumulation_steps={grad_accum_steps}, must be >= 1")
+
+    deepspeed_plugin = None
+    try:
+        deepspeed_plugin = DeepSpeedPlugin(gradient_accumulation_steps=grad_accum_steps)
+    except TypeError:
+        # Backward compatibility for older accelerate versions.
+        deepspeed_plugin = DeepSpeedPlugin()
+        logger.warning(
+            "DeepSpeedPlugin does not support `gradient_accumulation_steps` ctor arg in this environment; "
+            "falling back to plugin defaults."
+        )
+
+    accelerator = Accelerator(
+        deepspeed_plugin=deepspeed_plugin,
+        gradient_accumulation_steps=grad_accum_steps,
+    )
+    accelerator.print(accelerator.state)
+    accelerator.print(
+        f"[accum] cfg.gradient_accumulation_steps={grad_accum_steps}, "
+        f"accelerator.gradient_accumulation_steps={accelerator.gradient_accumulation_steps}"
+    )
+    return accelerator
 
 
 def load_fast_tokenizer():
@@ -170,6 +195,15 @@ class VLATrainer(TrainerUtils):
         rank = dist.get_rank() if dist.is_initialized() else 0
         seed = self.config.seed + rank if hasattr(self.config, "seed") else rank + 3047
         set_seed(seed)
+
+        cfg_grad_accum = int(getattr(self.config.trainer, "gradient_accumulation_steps", 1))
+        actual_grad_accum = int(getattr(self.accelerator, "gradient_accumulation_steps", 1))
+        if cfg_grad_accum != actual_grad_accum:
+            raise RuntimeError(
+                "Gradient accumulation mismatch detected: "
+                f"cfg={cfg_grad_accum}, accelerator={actual_grad_accum}. "
+                "Refuse to start training to avoid silent behavior drift."
+            )
 
         # load pretrained weights
         self._init_checkpointing() # TODO merge with load pretrained weights
@@ -537,7 +571,10 @@ class VLATrainer(TrainerUtils):
             logger.info("***** Training Configuration *****")
             logger.info(f"  Total optimization steps = {self.config.trainer.max_train_steps}")
             logger.info(f"  Per device batch size = {self.config.datasets.vla_data.per_device_batch_size}")
-            logger.info(f"  Gradient accumulation steps = {self.config.trainer.gradient_accumulation_steps}")
+            logger.info(f"  Gradient accumulation steps (cfg) = {self.config.trainer.gradient_accumulation_steps}")
+            logger.info(
+                f"  Gradient accumulation steps (accelerator) = {self.accelerator.gradient_accumulation_steps}"
+            )
             logger.info(f"  Total batch size = {self.total_batch_size}")
 
     def _register_grad_hooks(self, base_model=None):
@@ -935,6 +972,7 @@ def main(cfg) -> None:
     #  Wrap config to enable access tracking
     cfg = wrap_config(cfg)
     logger.info("✅ Configuration wrapped for access tracking")
+    accelerator = build_accelerator(cfg)
 
     # create output directory and save config
     output_dir = setup_directories(cfg=cfg)
