@@ -322,6 +322,153 @@ class MapAnythingLlava3D_PI(baseframework):
                     "selected_vl_layer_indices": [int(i) for i in indices],
                     "vl_num_selected_layers": int(len(vl_embs_list)),
                 }
+                tokenizer = None
+                processor = None
+                try:
+                    processor = getattr(self.mapanythingllava3d_vlm_interface, "processor", None)
+                    tokenizer = getattr(processor, "tokenizer", None)
+                except Exception:
+                    processor = None
+                    tokenizer = None
+
+                def _safe_decode(token_ids):
+                    if tokenizer is None:
+                        return None
+                    if not token_ids:
+                        return ""
+                    try:
+                        return tokenizer.decode(
+                            token_ids,
+                            skip_special_tokens=False,
+                            clean_up_tokenization_spaces=False,
+                        )
+                    except TypeError:
+                        try:
+                            return tokenizer.decode(token_ids, skip_special_tokens=False)
+                        except Exception:
+                            return None
+                    except Exception:
+                        return None
+
+                def _safe_tokenize(text):
+                    if tokenizer is None:
+                        return None
+                    if text is None:
+                        return None
+                    try:
+                        out = tokenizer(
+                            text,
+                            add_special_tokens=False,
+                            return_attention_mask=False,
+                            return_token_type_ids=False,
+                        )
+                        ids = out.get("input_ids", None) if isinstance(out, dict) else None
+                        if ids is None:
+                            return None
+                        if isinstance(ids, list) and len(ids) > 0 and isinstance(ids[0], list):
+                            ids = ids[0]
+                        if not isinstance(ids, list):
+                            return None
+                        return [int(x) for x in ids]
+                    except Exception:
+                        try:
+                            ids = tokenizer.encode(text, add_special_tokens=False)
+                            return [int(x) for x in ids]
+                        except Exception:
+                            return None
+
+                def _infer_padding_layout(mask_row):
+                    if not isinstance(mask_row, torch.Tensor) or mask_row.ndim != 1:
+                        return "unknown", 0, 0
+                    row = mask_row.detach().to("cpu").bool()
+                    seq_len = int(row.numel())
+                    if seq_len == 0:
+                        return "unknown", 0, 0
+                    active_idx = row.nonzero(as_tuple=False).flatten()
+                    if active_idx.numel() == 0:
+                        return "all_pad", seq_len, seq_len
+                    first = int(active_idx[0].item())
+                    last = int(active_idx[-1].item())
+                    left_pad = first
+                    right_pad = seq_len - 1 - last
+                    contiguous = bool(row[first : last + 1].all().item())
+                    if not contiguous:
+                        return "mixed", left_pad, right_pad
+                    if left_pad > 0 and right_pad == 0:
+                        return "left", left_pad, right_pad
+                    if left_pad == 0 and right_pad > 0:
+                        return "right", left_pad, right_pad
+                    if left_pad > 0 and right_pad > 0:
+                        return "both", left_pad, right_pad
+                    return "none", left_pad, right_pad
+
+                cot_prompt = None
+                try:
+                    datasets_cfg = getattr(self.config, "datasets", None)
+                    vla_cfg = getattr(datasets_cfg, "vla_data", None) if datasets_cfg is not None else None
+                    if vla_cfg is not None and hasattr(vla_cfg, "CoT_prompt"):
+                        cot_prompt = getattr(vla_cfg, "CoT_prompt")
+                except Exception:
+                    cot_prompt = None
+
+                tokenizer_padding_side = getattr(tokenizer, "padding_side", None) if tokenizer is not None else None
+                tokenizer_truncation_side = getattr(tokenizer, "truncation_side", None) if tokenizer is not None else None
+                tokenizer_chat_template = getattr(tokenizer, "chat_template", None) if tokenizer is not None else None
+                processor_chat_template = getattr(processor, "chat_template", None) if processor is not None else None
+
+                image_token_text = None
+                if tokenizer is not None:
+                    image_token_text = getattr(tokenizer, "image_token", None)
+                if image_token_text is None and processor is not None:
+                    image_token_text = getattr(processor, "image_token", None)
+                if image_token_text is None:
+                    image_token_text = "<image>"
+
+                tokenizer_image_token_id = getattr(tokenizer, "image_token_id", None) if tokenizer is not None else None
+                processor_image_token_id = getattr(processor, "image_token_id", None) if processor is not None else None
+                processor_image_token_index = getattr(processor, "image_token_index", None) if processor is not None else None
+                image_token_probe_ids = _safe_tokenize(image_token_text)
+                expected_special_id = (
+                    processor_image_token_id
+                    if processor_image_token_id is not None
+                    else tokenizer_image_token_id
+                )
+                image_probe_is_single = bool(image_token_probe_ids is not None and len(image_token_probe_ids) == 1)
+                image_probe_matches_expected = None
+                if image_probe_is_single and expected_special_id is not None:
+                    try:
+                        image_probe_matches_expected = bool(int(image_token_probe_ids[0]) == int(expected_special_id))
+                    except Exception:
+                        image_probe_matches_expected = None
+
+                debug_info["tokenizer_padding_side"] = tokenizer_padding_side
+                debug_info["tokenizer_truncation_side"] = tokenizer_truncation_side
+                debug_info["tokenizer_chat_template_present"] = bool(tokenizer_chat_template)
+                debug_info["tokenizer_chat_template_preview"] = (
+                    str(tokenizer_chat_template)[:256] if tokenizer_chat_template else None
+                )
+                debug_info["processor_chat_template_present"] = bool(processor_chat_template)
+                debug_info["processor_chat_template_preview"] = (
+                    str(processor_chat_template)[:256] if processor_chat_template else None
+                )
+                debug_info["cot_prompt_present"] = bool(cot_prompt)
+                debug_info["cot_prompt_preview"] = str(cot_prompt)[:256] if cot_prompt else None
+
+                debug_info["image_token_text"] = str(image_token_text) if image_token_text is not None else None
+                debug_info["tokenizer_image_token_id"] = (
+                    int(tokenizer_image_token_id) if tokenizer_image_token_id is not None else None
+                )
+                debug_info["processor_image_token_id"] = (
+                    int(processor_image_token_id) if processor_image_token_id is not None else None
+                )
+                debug_info["processor_image_token_index"] = (
+                    int(processor_image_token_index) if processor_image_token_index is not None else None
+                )
+                debug_info["image_token_probe_ids"] = image_token_probe_ids
+                debug_info["image_token_probe_is_single_token"] = image_probe_is_single
+                debug_info["image_token_probe_matches_expected_id"] = image_probe_matches_expected
+                debug_info["action_head_uses_encoder_attention_mask"] = False
+
                 input_ids = vlm_inputs.get("input_ids", None)
                 attention_mask = vlm_inputs.get("attention_mask", None)
                 image_token_index = vlm_inputs.get("image_token_index", None)
@@ -349,17 +496,66 @@ class MapAnythingLlava3D_PI(baseframework):
                     debug_info["active_tokens_per_sample"] = [int(x) for x in active_cpu.sum(dim=1).tolist()]
                     debug_info["image_tokens_per_sample"] = [int(x) for x in image_mask_cpu.sum(dim=1).tolist()]
                     debug_info["lang_tokens_per_sample"] = [int(x) for x in lang_mask_cpu.sum(dim=1).tolist()]
+                    image_present_each = [int(x) > 0 for x in image_mask_cpu.sum(dim=1).tolist()]
+                    debug_info["image_token_present_in_each_sample"] = image_present_each
+                    debug_info["image_token_present_all_samples"] = bool(all(image_present_each))
+
+                    padding_modes = []
+                    left_pad_counts = []
+                    right_pad_counts = []
+                    for row_mask in active_cpu:
+                        mode, n_left, n_right = _infer_padding_layout(row_mask)
+                        padding_modes.append(mode)
+                        left_pad_counts.append(int(n_left))
+                        right_pad_counts.append(int(n_right))
+                    debug_info["padding_mode_per_sample"] = padding_modes
+                    debug_info["padding_left_count_per_sample"] = left_pad_counts
+                    debug_info["padding_right_count_per_sample"] = right_pad_counts
+                    debug_info["padding_right_present"] = bool(any(m == "right" for m in padding_modes))
+                    debug_info["padding_mixed_present"] = bool(any(m in ("mixed", "both") for m in padding_modes))
+                    debug_info["padding_modes_unique"] = sorted(list(set(padding_modes)))
 
                     token_signatures = []
+                    lang_token_ids_head_128 = []
+                    lang_token_ids_tail_128 = []
+                    lang_decoded_text_full = []
+                    lang_decoded_text_head_128 = []
+                    lang_decoded_text_tail_128 = []
                     for row_ids, row_lang_mask in zip(ids_cpu, lang_mask_cpu):
                         lang_ids = row_ids[row_lang_mask].to(torch.int64)
                         if lang_ids.numel() == 0:
                             token_signatures.append(0)
+                            lang_token_ids_head_128.append([])
+                            lang_token_ids_tail_128.append([])
+                            lang_decoded_text_full.append(_safe_decode([]))
+                            lang_decoded_text_head_128.append(_safe_decode([]))
+                            lang_decoded_text_tail_128.append(_safe_decode([]))
                             continue
                         weights = torch.arange(1, lang_ids.numel() + 1, dtype=torch.int64)
                         signature = int((lang_ids * weights).sum().item() % 1000000007)
                         token_signatures.append(signature)
+                        lang_list = lang_ids.tolist()
+                        head_ids = lang_list[:128]
+                        tail_ids = lang_list[-128:]
+                        lang_token_ids_head_128.append(head_ids)
+                        lang_token_ids_tail_128.append(tail_ids)
+                        lang_decoded_text_full.append(_safe_decode(lang_list))
+                        lang_decoded_text_head_128.append(_safe_decode(head_ids))
+                        lang_decoded_text_tail_128.append(_safe_decode(tail_ids))
                     debug_info["lang_token_signatures"] = token_signatures
+                    debug_info["lang_token_ids_head_128"] = lang_token_ids_head_128
+                    debug_info["lang_token_ids_tail_128"] = lang_token_ids_tail_128
+                    debug_info["lang_decoded_text_full"] = lang_decoded_text_full
+                    debug_info["lang_decoded_text_head_128"] = lang_decoded_text_head_128
+                    debug_info["lang_decoded_text_tail_128"] = lang_decoded_text_tail_128
+                    debug_info["lang_decode_available"] = tokenizer is not None
+                    debug_info["image_token_special_token_integrity_ok"] = bool(
+                        debug_info.get("image_token_present_all_samples", False)
+                        and debug_info.get("image_token_probe_is_single_token", False)
+                        and (
+                            debug_info.get("image_token_probe_matches_expected_id") in (True, None)
+                        )
+                    )
 
                     image_mask_dev = image_mask_cpu.to(device=base_hidden.device)
                     lang_mask_dev = lang_mask_cpu.to(device=base_hidden.device)
@@ -368,6 +564,16 @@ class MapAnythingLlava3D_PI(baseframework):
                     lang_mask_dev = None
                     debug_info["input_ids_shape"] = None
                     debug_info["input_ids_head"] = None
+                    debug_info["lang_decode_available"] = tokenizer is not None
+                    debug_info["image_token_present_in_each_sample"] = None
+                    debug_info["image_token_present_all_samples"] = None
+                    debug_info["padding_mode_per_sample"] = None
+                    debug_info["padding_left_count_per_sample"] = None
+                    debug_info["padding_right_count_per_sample"] = None
+                    debug_info["padding_right_present"] = None
+                    debug_info["padding_mixed_present"] = None
+                    debug_info["padding_modes_unique"] = None
+                    debug_info["image_token_special_token_integrity_ok"] = None
 
                 vl_layer_mean = []
                 vl_layer_std = []
