@@ -15,6 +15,7 @@ Conventions:
 import argparse
 import contextlib
 import json
+import math
 import os
 from pathlib import Path
 from typing import Tuple
@@ -466,6 +467,7 @@ class VLATrainer(TrainerUtils):
 
         # prepare data iterators
         self._create_data_iterators()
+        self.optimizer.zero_grad()
 
         # create progress bar
         progress_bar = tqdm(
@@ -485,7 +487,8 @@ class VLATrainer(TrainerUtils):
             t_end_model = time.perf_counter()
 
             # update progress
-            if self.accelerator.sync_gradients:
+            sync_step = bool(self.accelerator.sync_gradients)
+            if sync_step:
                 progress_bar.update(1)
                 self.completed_steps += 1
             
@@ -496,6 +499,10 @@ class VLATrainer(TrainerUtils):
                             "model_times": f"{t_end_model - t_start_model:.3f}",
                         }
                     )
+
+            # Only run step-level side effects once per synchronized optimizer update.
+            if not sync_step:
+                continue
 
             # evaluate model
             if self.completed_steps % self.config.trainer.eval_interval == 0:
@@ -879,13 +886,26 @@ class VLATrainer(TrainerUtils):
     def _train_step(self, batch_vla, batch_vlm=None):
         """execute single training step"""
         with self.accelerator.accumulate(self.model):
-            self.optimizer.zero_grad()
-
             # VLA task forward propagation
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla)
                 action_loss = output_dict["action_loss"]
                 total_loss = action_loss
+
+            debug_metrics = output_dict.get("debug_metrics", None)
+            step_metrics = {"action_dit_loss": float(action_loss.item())}
+            if isinstance(debug_metrics, dict):
+                step_metrics.update(debug_metrics)
+
+            # Guard against loss explosion before backward.
+            if not torch.isfinite(total_loss).all():
+                logger.warning(
+                    "Detected non-finite loss at completed_steps=%d, skip optimizer update.",
+                    self.completed_steps,
+                )
+                step_metrics["debug/nonfinite_loss"] = 1.0
+                self.optimizer.zero_grad()
+                return step_metrics
 
             # VLA backward propagation
             self.accelerator.backward(total_loss)
@@ -923,20 +943,38 @@ class VLATrainer(TrainerUtils):
                     logger.warning(f"Failed to zero language model grads during warmup: {e}")
 
             # gradient clipping
+            clipped_grad_norm = None
             if self.config.trainer.gradient_clipping is not None:
-                self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
+                if self.accelerator.sync_gradients:
+                    grad_norm = self.accelerator.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.config.trainer.gradient_clipping,
+                    )
+                    if isinstance(grad_norm, torch.Tensor):
+                        clipped_grad_norm = float(grad_norm.detach().float().cpu().item())
+                    elif grad_norm is not None:
+                        clipped_grad_norm = float(grad_norm)
+                    if clipped_grad_norm is not None:
+                        step_metrics["debug/clip_grad_norm"] = clipped_grad_norm
 
             # collect grad/weight stats before optimizer step (only on synchronized steps)
-            step_metrics = {"action_dit_loss": float(action_loss.item())}
-            debug_metrics = output_dict.get("debug_metrics", None)
-            if isinstance(debug_metrics, dict):
-                step_metrics.update(debug_metrics)
             if self.accelerator.sync_gradients:
                 self._collect_debug_norm_metrics(step_metrics)
 
             # optimizer step
-            self.optimizer.step()
-            self.lr_scheduler.step()
+            if self.accelerator.sync_gradients:
+                if clipped_grad_norm is not None and not math.isfinite(clipped_grad_norm):
+                    logger.warning(
+                        "Detected non-finite clipped grad norm at completed_steps=%d, skip optimizer update.",
+                        self.completed_steps,
+                    )
+                    step_metrics["debug/nonfinite_grad_norm"] = 1.0
+                    self.optimizer.zero_grad()
+                    return step_metrics
+
+                self.optimizer.step()
+                self.lr_scheduler.step()
+                self.optimizer.zero_grad()
 
         return step_metrics
 
