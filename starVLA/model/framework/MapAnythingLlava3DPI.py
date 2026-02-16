@@ -350,6 +350,30 @@ class MapAnythingLlava3D_PI(baseframework):
                     except Exception:
                         return None
 
+                def _decode_single_token(token_id):
+                    if tokenizer is None:
+                        return None
+                    try:
+                        return tokenizer.decode(
+                            [int(token_id)],
+                            skip_special_tokens=False,
+                            clean_up_tokenization_spaces=False,
+                        )
+                    except TypeError:
+                        try:
+                            return tokenizer.decode([int(token_id)], skip_special_tokens=False)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                    try:
+                        piece = tokenizer.convert_ids_to_tokens(int(token_id))
+                        if isinstance(piece, str):
+                            return piece
+                    except Exception:
+                        pass
+                    return None
+
                 def _safe_tokenize(text):
                     if tokenizer is None:
                         return None
@@ -428,6 +452,7 @@ class MapAnythingLlava3D_PI(baseframework):
                 processor_image_token_id = getattr(processor, "image_token_id", None) if processor is not None else None
                 processor_image_token_index = getattr(processor, "image_token_index", None) if processor is not None else None
                 image_token_probe_ids = _safe_tokenize(image_token_text)
+                space_token_probe_ids = _safe_tokenize(" ")
                 expected_special_id = (
                     processor_image_token_id
                     if processor_image_token_id is not None
@@ -465,6 +490,7 @@ class MapAnythingLlava3D_PI(baseframework):
                     int(processor_image_token_index) if processor_image_token_index is not None else None
                 )
                 debug_info["image_token_probe_ids"] = image_token_probe_ids
+                debug_info["space_token_probe_ids"] = space_token_probe_ids
                 debug_info["image_token_probe_is_single_token"] = image_probe_is_single
                 debug_info["image_token_probe_matches_expected_id"] = image_probe_matches_expected
                 debug_info["action_head_uses_encoder_attention_mask"] = False
@@ -516,25 +542,48 @@ class MapAnythingLlava3D_PI(baseframework):
                     debug_info["padding_modes_unique"] = sorted(list(set(padding_modes)))
 
                     token_signatures = []
+                    lang_token_ids_full = []
                     lang_token_ids_head_128 = []
                     lang_token_ids_tail_128 = []
                     lang_decoded_text_full = []
                     lang_decoded_text_head_128 = []
                     lang_decoded_text_tail_128 = []
+                    lang_whitespace_tokens_per_sample = []
+                    lang_non_whitespace_tokens_per_sample = []
+                    lang_non_whitespace_ratio_per_sample = []
+                    whitespace_token_cache = {}
+
+                    def _is_whitespace_token_id(token_id):
+                        token_id_int = int(token_id)
+                        if token_id_int in whitespace_token_cache:
+                            return whitespace_token_cache[token_id_int]
+                        piece = _decode_single_token(token_id_int)
+                        if piece is None:
+                            whitespace_token_cache[token_id_int] = False
+                            return False
+                        is_whitespace = bool(len(piece) > 0 and piece.strip() == "")
+                        whitespace_token_cache[token_id_int] = is_whitespace
+                        return is_whitespace
+
                     for row_ids, row_lang_mask in zip(ids_cpu, lang_mask_cpu):
                         lang_ids = row_ids[row_lang_mask].to(torch.int64)
                         if lang_ids.numel() == 0:
                             token_signatures.append(0)
+                            lang_token_ids_full.append([])
                             lang_token_ids_head_128.append([])
                             lang_token_ids_tail_128.append([])
                             lang_decoded_text_full.append(_safe_decode([]))
                             lang_decoded_text_head_128.append(_safe_decode([]))
                             lang_decoded_text_tail_128.append(_safe_decode([]))
+                            lang_whitespace_tokens_per_sample.append(0)
+                            lang_non_whitespace_tokens_per_sample.append(0)
+                            lang_non_whitespace_ratio_per_sample.append(0.0)
                             continue
                         weights = torch.arange(1, lang_ids.numel() + 1, dtype=torch.int64)
                         signature = int((lang_ids * weights).sum().item() % 1000000007)
                         token_signatures.append(signature)
                         lang_list = lang_ids.tolist()
+                        lang_token_ids_full.append(lang_list)
                         head_ids = lang_list[:128]
                         tail_ids = lang_list[-128:]
                         lang_token_ids_head_128.append(head_ids)
@@ -542,12 +591,28 @@ class MapAnythingLlava3D_PI(baseframework):
                         lang_decoded_text_full.append(_safe_decode(lang_list))
                         lang_decoded_text_head_128.append(_safe_decode(head_ids))
                         lang_decoded_text_tail_128.append(_safe_decode(tail_ids))
+                        whitespace_count = int(sum(1 for tok in lang_list if _is_whitespace_token_id(tok)))
+                        non_whitespace_count = int(len(lang_list) - whitespace_count)
+                        lang_whitespace_tokens_per_sample.append(whitespace_count)
+                        lang_non_whitespace_tokens_per_sample.append(non_whitespace_count)
+                        lang_non_whitespace_ratio_per_sample.append(
+                            float(non_whitespace_count / max(1, len(lang_list)))
+                        )
                     debug_info["lang_token_signatures"] = token_signatures
+                    debug_info["lang_token_ids_full"] = lang_token_ids_full
                     debug_info["lang_token_ids_head_128"] = lang_token_ids_head_128
                     debug_info["lang_token_ids_tail_128"] = lang_token_ids_tail_128
                     debug_info["lang_decoded_text_full"] = lang_decoded_text_full
                     debug_info["lang_decoded_text_head_128"] = lang_decoded_text_head_128
                     debug_info["lang_decoded_text_tail_128"] = lang_decoded_text_tail_128
+                    debug_info["lang_whitespace_tokens_per_sample"] = lang_whitespace_tokens_per_sample
+                    debug_info["lang_non_whitespace_tokens_per_sample"] = lang_non_whitespace_tokens_per_sample
+                    debug_info["lang_non_whitespace_ratio_per_sample"] = lang_non_whitespace_ratio_per_sample
+                    debug_info["lang_non_whitespace_ratio_mean"] = (
+                        float(np.mean(lang_non_whitespace_ratio_per_sample))
+                        if len(lang_non_whitespace_ratio_per_sample) > 0
+                        else None
+                    )
                     debug_info["lang_decode_available"] = tokenizer is not None
                     debug_info["image_token_special_token_integrity_ok"] = bool(
                         debug_info.get("image_token_present_all_samples", False)
@@ -574,6 +639,11 @@ class MapAnythingLlava3D_PI(baseframework):
                     debug_info["padding_mixed_present"] = None
                     debug_info["padding_modes_unique"] = None
                     debug_info["image_token_special_token_integrity_ok"] = None
+                    debug_info["lang_token_ids_full"] = None
+                    debug_info["lang_whitespace_tokens_per_sample"] = None
+                    debug_info["lang_non_whitespace_tokens_per_sample"] = None
+                    debug_info["lang_non_whitespace_ratio_per_sample"] = None
+                    debug_info["lang_non_whitespace_ratio_mean"] = None
 
                 vl_layer_mean = []
                 vl_layer_std = []
