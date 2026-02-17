@@ -397,7 +397,11 @@ class MapAnythingLlava3D_PI(baseframework):
                             return_attention_mask=False,
                             return_token_type_ids=False,
                         )
-                        ids = out.get("input_ids", None) if isinstance(out, dict) else None
+                        ids = None
+                        if hasattr(out, "get"):
+                            ids = out.get("input_ids", None)
+                        if ids is None and hasattr(out, "input_ids"):
+                            ids = out.input_ids
                         if ids is None:
                             return None
                         if isinstance(ids, torch.Tensor):
