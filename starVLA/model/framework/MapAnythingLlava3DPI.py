@@ -172,6 +172,9 @@ class MapAnythingLlava3D_PI(baseframework):
             if self.normalize_vl_hidden:
                 vl_embs_list = [F.layer_norm(h, h.shape[-1:]) for h in vl_embs_list]
             base_hidden = vl_embs_list[-1]
+            attention_mask = vlm_inputs.get("attention_mask", None)
+            if isinstance(attention_mask, torch.Tensor):
+                attention_mask = attention_mask.to(device=base_hidden.device)
             debug_metrics = {}
             try:
                 try:
@@ -244,6 +247,9 @@ class MapAnythingLlava3D_PI(baseframework):
             repeated_diffusion_steps = max(1, repeated_diffusion_steps)
             actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
             vl_embs_list_repeated = [h.repeat(repeated_diffusion_steps, 1, 1) for h in vl_embs_list]
+            attention_mask_repeated = None
+            if isinstance(attention_mask, torch.Tensor):
+                attention_mask_repeated = attention_mask.repeat(repeated_diffusion_steps, 1)
 
             state_repeated = None
             if state is not None:
@@ -252,7 +258,12 @@ class MapAnythingLlava3D_PI(baseframework):
                 )
                 state_repeated = state.repeat(repeated_diffusion_steps, 1, 1)
 
-            action_loss = self.action_model(vl_embs_list_repeated, actions_target_repeated, state_repeated)
+            action_loss = self.action_model(
+                vl_embs_list_repeated,
+                actions_target_repeated,
+                state_repeated,
+                encoder_attention_mask=attention_mask_repeated,
+            )
             try:
                 layer_means = getattr(self.action_model, "_last_dit_layer_means", None)
                 layer_vars = getattr(self.action_model, "_last_dit_layer_vars", None)
@@ -493,10 +504,10 @@ class MapAnythingLlava3D_PI(baseframework):
                 debug_info["space_token_probe_ids"] = space_token_probe_ids
                 debug_info["image_token_probe_is_single_token"] = image_probe_is_single
                 debug_info["image_token_probe_matches_expected_id"] = image_probe_matches_expected
-                debug_info["action_head_uses_encoder_attention_mask"] = False
 
                 input_ids = vlm_inputs.get("input_ids", None)
                 attention_mask = vlm_inputs.get("attention_mask", None)
+                debug_info["action_head_uses_encoder_attention_mask"] = bool(isinstance(attention_mask, torch.Tensor))
                 image_token_index = vlm_inputs.get("image_token_index", None)
                 if isinstance(image_token_index, torch.Tensor):
                     image_token_index = int(image_token_index.detach().item())
@@ -679,12 +690,16 @@ class MapAnythingLlava3D_PI(baseframework):
                 debug_info["image_layer_rms"] = image_layer_rms
 
         state_tensor = torch.from_numpy(np.array(state)).to(base_hidden.device, dtype=base_hidden.dtype) if state is not None else None
+        attention_mask = vlm_inputs.get("attention_mask", None)
+        if isinstance(attention_mask, torch.Tensor):
+            attention_mask = attention_mask.to(device=base_hidden.device)
 
         with torch.autocast("cuda", dtype=torch.float32):
             pred_actions = self.action_model.predict_action(
                 vl_embs_list,
                 state_tensor,
                 noise_seed=deterministic_seed,
+                encoder_attention_mask=attention_mask,
             )
 
         normalized_actions = pred_actions.detach().cpu().numpy()

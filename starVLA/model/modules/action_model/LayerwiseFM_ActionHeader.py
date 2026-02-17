@@ -379,7 +379,14 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             self._last_dit_layer_vars[-1],
         )
 
-    def _apply_layerwise_cross_attention(self, saction_embs, vl_embs_list, temb, log_context="train"):
+    def _apply_layerwise_cross_attention(
+        self,
+        saction_embs,
+        vl_embs_list,
+        temb,
+        encoder_attention_mask=None,
+        log_context="train",
+    ):
         """
         Apply layerwise cross-attention between state-action embeddings and vision-language embeddings.
 
@@ -393,17 +400,34 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         """
         self._validate_cross_attention_inputs(saction_embs, vl_embs_list)
         hidden_states = saction_embs
+        if isinstance(encoder_attention_mask, torch.Tensor):
+            encoder_attention_mask = encoder_attention_mask.to(device=saction_embs.device)
+            if encoder_attention_mask.dtype != torch.bool:
+                encoder_attention_mask = encoder_attention_mask != 0
         self._layerwise_forward_calls += 1
         self._last_dit_layer_means = []
         self._last_dit_layer_vars = []
         for layer_idx, layer in enumerate(self.model.transformer_blocks):
             if self.use_concat_cross_context:
                 cross_context = torch.cat((vl_embs_list[layer_idx], hidden_states), dim=1)
+                layer_encoder_attention_mask = None
+                if isinstance(encoder_attention_mask, torch.Tensor):
+                    hidden_tokens = torch.ones(
+                        hidden_states.shape[:2],
+                        dtype=torch.bool,
+                        device=hidden_states.device,
+                    )
+                    layer_encoder_attention_mask = torch.cat(
+                        (encoder_attention_mask, hidden_tokens),
+                        dim=1,
+                    )
             else:
                 cross_context = vl_embs_list[layer_idx]
+                layer_encoder_attention_mask = encoder_attention_mask
             hidden_states = layer(
                 hidden_states=hidden_states,
                 encoder_hidden_states=cross_context,
+                encoder_attention_mask=layer_encoder_attention_mask,
                 temb=temb,
             )
             stats = hidden_states.detach().float()
@@ -432,7 +456,13 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         pred_velocity = pred[:, -actions_length:]
         return pred_velocity
 
-    def forward(self, vl_embs_list: list, actions: torch.Tensor, state: torch.Tensor = None):
+    def forward(
+        self,
+        vl_embs_list: list,
+        actions: torch.Tensor,
+        state: torch.Tensor = None,
+        encoder_attention_mask: torch.Tensor = None,
+    ):
         """
         vl_embs: list of torch.Tensor, each shape (B, seq_length, feature_dim)
         actions: shape (B, future_action_window_size, D_action)
@@ -467,7 +497,13 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             if state_features is not None else torch.cat((future_tokens, action_features), dim=1)
         
         temb = self.model.timestep_encoder(t_discretized)
-        hidden_states = self._apply_layerwise_cross_attention(sa_embs, vl_embs_list, temb, log_context="train")
+        hidden_states = self._apply_layerwise_cross_attention(
+            sa_embs,
+            vl_embs_list,
+            temb,
+            encoder_attention_mask=encoder_attention_mask,
+            log_context="train",
+        )
         pred_velocity = self._process_output(hidden_states, temb, actions.shape[1])
         loss = ((pred_velocity - velocity) ** 2).mean()
         return loss
@@ -478,6 +514,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         vl_embs_list: list,
         state: torch.Tensor = None,
         noise_seed: int = None,
+        encoder_attention_mask: torch.Tensor = None,
     ) -> torch.Tensor:
         # Set initial actions as the sampled noise.
         batch_size = vl_embs_list[0].shape[0]
@@ -534,7 +571,13 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             )
 
             temb = self.model.timestep_encoder(timesteps_tensor)
-            hidden_states = self._apply_layerwise_cross_attention(sa_embs, vl_embs_list, temb, log_context="infer")
+            hidden_states = self._apply_layerwise_cross_attention(
+                sa_embs,
+                vl_embs_list,
+                temb,
+                encoder_attention_mask=encoder_attention_mask,
+                log_context="infer",
+            )
             pred_velocity = self._process_output(hidden_states, temb, self.action_horizon)
             actions = actions + dt * pred_velocity
         return actions
