@@ -73,6 +73,9 @@ class _MapAnythingLlava3D_Interface(nn.Module):
         use_geom = True
         prefix_image_dropout_prob = 0.0
         prefix_lang_dropout_prob = 0.0
+        image_token_joiner = "auto"
+        normalize_instruction_whitespace = False
+        strip_instruction = True
         base_vlm_path = None
         vision_model_name_or_path = _DEFAULT_VISION_MODEL
         language_model_name_or_path = _DEFAULT_LANGUAGE_MODEL
@@ -87,10 +90,19 @@ class _MapAnythingLlava3D_Interface(nn.Module):
                     use_geom = bool(getattr(ma_cfg, "use_geometric_branch"))
                 elif hasattr(ma_cfg, "use_geom"):
                     use_geom = bool(getattr(ma_cfg, "use_geom"))
+                if hasattr(ma_cfg, "image_token_joiner"):
+                    image_token_joiner = str(getattr(ma_cfg, "image_token_joiner"))
+                if hasattr(ma_cfg, "normalize_instruction_whitespace"):
+                    normalize_instruction_whitespace = bool(getattr(ma_cfg, "normalize_instruction_whitespace"))
+                if hasattr(ma_cfg, "strip_instruction"):
+                    strip_instruction = bool(getattr(ma_cfg, "strip_instruction"))
         except Exception:
             prefix_image_dropout_prob = 0.0
             prefix_lang_dropout_prob = 0.0
             use_geom = True
+            image_token_joiner = "auto"
+            normalize_instruction_whitespace = False
+            strip_instruction = True
         print(f"prefix_image_dropout_prob: {prefix_image_dropout_prob}")
         print(f"prefix_lang_dropout_prob: {prefix_lang_dropout_prob}")
 
@@ -147,12 +159,24 @@ class _MapAnythingLlava3D_Interface(nn.Module):
             statistics=statistics,
             intrinsic_config=intrinsic_config,
             action_config=action_config,
+            image_token_joiner=image_token_joiner,
         )
         self.model = model
         self.processor = processor
         self.config = mapanything_cfg
         self.runtime_config = config
+        self.normalize_instruction_whitespace = bool(normalize_instruction_whitespace)
+        self.strip_instruction = bool(strip_instruction)
         self.model.config.hidden_size = self.model.config.hidden_size
+
+    def _normalize_instruction(self, instruction: str) -> str:
+        text = "" if instruction is None else str(instruction)
+        if self.strip_instruction:
+            text = text.strip()
+        if self.normalize_instruction_whitespace:
+            text = " ".join(text.split())
+        return text
+
     def forward(self, **kwargs) -> CausalLMOutputWithPast:
         with torch.autocast("cuda", dtype=torch.bfloat16):
             outputs = self.model(**kwargs)
@@ -172,10 +196,11 @@ class _MapAnythingLlava3D_Interface(nn.Module):
             cot_prompt = getattr(vla_cfg, "CoT_prompt")
         processed_instructions = []
         for instruction in instructions:
+            normalized_instruction = self._normalize_instruction(instruction)
             if cot_prompt:
-                processed_instructions.append(cot_prompt.replace("{instruction}", instruction))
+                processed_instructions.append(cot_prompt.replace("{instruction}", normalized_instruction))
             else:
-                processed_instructions.append(instruction)
+                processed_instructions.append(normalized_instruction)
         if _is_rank0():
             print(f"[mapanything_llava3d] processed_instructions: {processed_instructions}")
         model_inputs = self.processor(

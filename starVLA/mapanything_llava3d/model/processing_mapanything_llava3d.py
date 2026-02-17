@@ -56,6 +56,7 @@ class MapAnythingLlava3DProcessor(ProcessorMixin):
         obs_delta=1,
         action_chunk_size=1,
         min_sigma=0.0,
+        image_token_joiner: str = "auto",
         **kwargs,
     ):
         if image_processor is None:
@@ -74,6 +75,8 @@ class MapAnythingLlava3DProcessor(ProcessorMixin):
         else:
             self.image_token_id = tokenizer.image_token_id
         self.image_token_index = self.image_token_id
+        self.image_token_joiner_mode = str(image_token_joiner).strip().lower() if image_token_joiner is not None else "auto"
+        self.image_token_joiner = self._resolve_image_token_joiner(tokenizer, self.image_token_id, self.image_token_joiner_mode)
         
         # 2. Derive Image Sequence Length
         # (Needed to expand <image> token into multiple embeddings)
@@ -120,6 +123,56 @@ class MapAnythingLlava3DProcessor(ProcessorMixin):
             
         self.num_obs_steps = num_obs_steps
         self.action_chunk_size = action_chunk_size
+
+    @staticmethod
+    def _extract_ids(tokenizer_output):
+        ids = None
+        if hasattr(tokenizer_output, "get"):
+            ids = tokenizer_output.get("input_ids", None)
+        if ids is None and hasattr(tokenizer_output, "input_ids"):
+            ids = tokenizer_output.input_ids
+        if ids is None:
+            return None
+        if isinstance(ids, torch.Tensor):
+            ids = ids.detach().cpu().tolist()
+        if isinstance(ids, np.ndarray):
+            ids = ids.tolist()
+        if isinstance(ids, tuple):
+            ids = list(ids)
+        if isinstance(ids, list) and len(ids) > 0 and isinstance(ids[0], list):
+            ids = ids[0]
+        if not isinstance(ids, list):
+            return None
+        try:
+            return [int(x) for x in ids]
+        except Exception:
+            return None
+
+    @classmethod
+    def _resolve_image_token_joiner(cls, tokenizer, image_token_id: int, mode: str) -> str:
+        if mode in ("space", "spaced", " "):
+            return " "
+        if mode in ("empty", "none", "nospace", ""):
+            return ""
+
+        token = getattr(tokenizer, "image_token", DEFAULT_IMAGE_TOKEN)
+        probe = f"{token}{token}"
+        try:
+            out = tokenizer(
+                probe,
+                add_special_tokens=False,
+                return_attention_mask=False,
+                return_token_type_ids=False,
+            )
+            ids = cls._extract_ids(out)
+            if ids is not None and len(ids) == 2 and all(int(x) == int(image_token_id) for x in ids):
+                logger.info("MapAnythingLlava3DProcessor: auto-selected empty image token joiner.")
+                return ""
+        except Exception:
+            pass
+
+        logger.info("MapAnythingLlava3DProcessor: auto-selected space image token joiner.")
+        return " "
 
     def __call__(
         self,
@@ -201,7 +254,7 @@ class MapAnythingLlava3DProcessor(ProcessorMixin):
                 num_images = 1
                 if num_images_per_sample is not None and idx < len(num_images_per_sample):
                     num_images = num_images_per_sample[idx]
-                replacement = " ".join([DEFAULT_IMAGE_TOKEN] * (self.image_seq_length * num_images))
+                replacement = self.image_token_joiner.join([DEFAULT_IMAGE_TOKEN] * (self.image_seq_length * num_images))
                 t_expanded = t.replace(DEFAULT_IMAGE_TOKEN, replacement)
                 expanded_text.append(t_expanded)
             else:

@@ -509,6 +509,12 @@ class MapAnythingLlava3D_PI(baseframework):
                 debug_info["processor_chat_template_preview"] = (
                     str(processor_chat_template)[:256] if processor_chat_template else None
                 )
+                debug_info["processor_image_token_joiner"] = (
+                    getattr(processor, "image_token_joiner", None) if processor is not None else None
+                )
+                debug_info["processor_image_token_joiner_mode"] = (
+                    getattr(processor, "image_token_joiner_mode", None) if processor is not None else None
+                )
                 debug_info["cot_prompt_present"] = bool(cot_prompt)
                 debug_info["cot_prompt_preview"] = str(cot_prompt)[:256] if cot_prompt else None
 
