@@ -400,6 +400,15 @@ class MapAnythingLlava3D_PI(baseframework):
                         ids = out.get("input_ids", None) if isinstance(out, dict) else None
                         if ids is None:
                             return None
+                        if isinstance(ids, torch.Tensor):
+                            ids = ids.detach().to("cpu")
+                            if ids.ndim >= 2:
+                                ids = ids[0]
+                            ids = ids.tolist()
+                        elif isinstance(ids, np.ndarray):
+                            ids = ids.tolist()
+                        elif isinstance(ids, tuple):
+                            ids = list(ids)
                         if isinstance(ids, list) and len(ids) > 0 and isinstance(ids[0], list):
                             ids = ids[0]
                         if not isinstance(ids, list):
@@ -464,17 +473,21 @@ class MapAnythingLlava3D_PI(baseframework):
                 processor_image_token_index = getattr(processor, "image_token_index", None) if processor is not None else None
                 image_token_probe_ids = _safe_tokenize(image_token_text)
                 space_token_probe_ids = _safe_tokenize(" ")
-                space_token_probe_id_set = (
+                image_separator_token_id_set_probe = (
                     {int(x) for x in space_token_probe_ids}
                     if isinstance(space_token_probe_ids, list) and len(space_token_probe_ids) > 0
                     else set()
                 )
+                image_separator_token_id_set = set(image_separator_token_id_set_probe)
                 expected_special_id = (
                     processor_image_token_id
                     if processor_image_token_id is not None
                     else tokenizer_image_token_id
                 )
-                image_probe_is_single = bool(image_token_probe_ids is not None and len(image_token_probe_ids) == 1)
+                if image_token_probe_ids is None:
+                    image_probe_is_single = None
+                else:
+                    image_probe_is_single = bool(len(image_token_probe_ids) == 1)
                 image_probe_matches_expected = None
                 if image_probe_is_single and expected_special_id is not None:
                     try:
@@ -508,8 +521,14 @@ class MapAnythingLlava3D_PI(baseframework):
                 debug_info["image_token_probe_ids"] = image_token_probe_ids
                 debug_info["space_token_probe_ids"] = space_token_probe_ids
                 debug_info["image_separator_token_ids"] = (
-                    sorted([int(x) for x in space_token_probe_id_set]) if len(space_token_probe_id_set) > 0 else None
+                    sorted([int(x) for x in image_separator_token_id_set]) if len(image_separator_token_id_set) > 0 else None
                 )
+                debug_info["image_separator_token_ids_probe"] = (
+                    sorted([int(x) for x in image_separator_token_id_set_probe])
+                    if len(image_separator_token_id_set_probe) > 0
+                    else None
+                )
+                debug_info["image_separator_token_ids_inferred"] = None
                 debug_info["image_token_probe_is_single_token"] = image_probe_is_single
                 debug_info["image_token_probe_matches_expected_id"] = image_probe_matches_expected
 
@@ -538,20 +557,40 @@ class MapAnythingLlava3D_PI(baseframework):
                         image_mask_cpu = torch.zeros_like(ids_cpu, dtype=torch.bool)
                     lang_mask_raw_cpu = (~image_mask_cpu) & active_cpu
 
+                    image_left_neighbor = torch.zeros_like(image_mask_cpu, dtype=torch.bool)
+                    image_right_neighbor = torch.zeros_like(image_mask_cpu, dtype=torch.bool)
+                    image_left_neighbor[:, 1:] = image_mask_cpu[:, :-1]
+                    image_right_neighbor[:, :-1] = image_mask_cpu[:, 1:]
+                    between_two_images_cpu = image_left_neighbor & image_right_neighbor
+
+                    # Infer separator token ids from `image - sep - image` patterns when tokenizer probing is unavailable.
+                    inferred_separator_token_id_set = set()
+                    between_non_image_cpu = active_cpu & (~image_mask_cpu) & between_two_images_cpu
+                    if bool(between_non_image_cpu.any().item()):
+                        inferred_ids = ids_cpu[between_non_image_cpu].to(torch.int64).tolist()
+                        inferred_separator_token_id_set = {int(x) for x in inferred_ids}
+                        image_separator_token_id_set |= inferred_separator_token_id_set
+
                     # Exclude separator tokens used by expanded image placeholders from language debug stats.
                     image_sep_mask_cpu = torch.zeros_like(ids_cpu, dtype=torch.bool)
-                    if len(space_token_probe_id_set) > 0:
+                    if len(image_separator_token_id_set) > 0:
                         sep_mask_cpu = torch.zeros_like(ids_cpu, dtype=torch.bool)
-                        for token_id in sorted(space_token_probe_id_set):
+                        for token_id in sorted(image_separator_token_id_set):
                             sep_mask_cpu |= ids_cpu == int(token_id)
-                        image_left_neighbor = torch.zeros_like(image_mask_cpu, dtype=torch.bool)
-                        image_right_neighbor = torch.zeros_like(image_mask_cpu, dtype=torch.bool)
-                        image_left_neighbor[:, 1:] = image_mask_cpu[:, :-1]
-                        image_right_neighbor[:, :-1] = image_mask_cpu[:, 1:]
-                        image_sep_mask_cpu = sep_mask_cpu & active_cpu & (image_left_neighbor | image_right_neighbor)
+                        image_sep_mask_cpu = sep_mask_cpu & active_cpu & between_two_images_cpu
 
                     lang_mask_cpu = lang_mask_raw_cpu & (~image_sep_mask_cpu)
                     debug_info["image_token_index"] = image_token_index
+                    debug_info["image_separator_token_ids"] = (
+                        sorted([int(x) for x in image_separator_token_id_set])
+                        if len(image_separator_token_id_set) > 0
+                        else None
+                    )
+                    debug_info["image_separator_token_ids_inferred"] = (
+                        sorted([int(x) for x in inferred_separator_token_id_set])
+                        if len(inferred_separator_token_id_set) > 0
+                        else None
+                    )
                     debug_info["active_tokens_per_sample"] = [int(x) for x in active_cpu.sum(dim=1).tolist()]
                     debug_info["image_tokens_per_sample"] = [int(x) for x in image_mask_cpu.sum(dim=1).tolist()]
                     debug_info["image_separator_tokens_per_sample"] = [int(x) for x in image_sep_mask_cpu.sum(dim=1).tolist()]
@@ -595,7 +634,7 @@ class MapAnythingLlava3D_PI(baseframework):
                         token_id_int = int(token_id)
                         if token_id_int in whitespace_token_cache:
                             return whitespace_token_cache[token_id_int]
-                        if token_id_int in space_token_probe_id_set:
+                        if token_id_int in image_separator_token_id_set:
                             whitespace_token_cache[token_id_int] = True
                             return True
                         piece = _decode_single_token(token_id_int)
