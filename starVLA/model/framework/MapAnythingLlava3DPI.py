@@ -464,6 +464,11 @@ class MapAnythingLlava3D_PI(baseframework):
                 processor_image_token_index = getattr(processor, "image_token_index", None) if processor is not None else None
                 image_token_probe_ids = _safe_tokenize(image_token_text)
                 space_token_probe_ids = _safe_tokenize(" ")
+                space_token_probe_id_set = (
+                    {int(x) for x in space_token_probe_ids}
+                    if isinstance(space_token_probe_ids, list) and len(space_token_probe_ids) > 0
+                    else set()
+                )
                 expected_special_id = (
                     processor_image_token_id
                     if processor_image_token_id is not None
@@ -502,6 +507,9 @@ class MapAnythingLlava3D_PI(baseframework):
                 )
                 debug_info["image_token_probe_ids"] = image_token_probe_ids
                 debug_info["space_token_probe_ids"] = space_token_probe_ids
+                debug_info["image_separator_token_ids"] = (
+                    sorted([int(x) for x in space_token_probe_id_set]) if len(space_token_probe_id_set) > 0 else None
+                )
                 debug_info["image_token_probe_is_single_token"] = image_probe_is_single
                 debug_info["image_token_probe_matches_expected_id"] = image_probe_matches_expected
 
@@ -528,10 +536,29 @@ class MapAnythingLlava3D_PI(baseframework):
                         image_mask_cpu = (ids_cpu == image_token_index) & active_cpu
                     else:
                         image_mask_cpu = torch.zeros_like(ids_cpu, dtype=torch.bool)
-                    lang_mask_cpu = (~image_mask_cpu) & active_cpu
+                    lang_mask_raw_cpu = (~image_mask_cpu) & active_cpu
+
+                    # Exclude separator tokens used by expanded image placeholders from language debug stats.
+                    image_sep_mask_cpu = torch.zeros_like(ids_cpu, dtype=torch.bool)
+                    if len(space_token_probe_id_set) > 0:
+                        sep_mask_cpu = torch.zeros_like(ids_cpu, dtype=torch.bool)
+                        for token_id in sorted(space_token_probe_id_set):
+                            sep_mask_cpu |= ids_cpu == int(token_id)
+                        image_left_neighbor = torch.zeros_like(image_mask_cpu, dtype=torch.bool)
+                        image_right_neighbor = torch.zeros_like(image_mask_cpu, dtype=torch.bool)
+                        image_left_neighbor[:, 1:] = image_mask_cpu[:, :-1]
+                        image_right_neighbor[:, :-1] = image_mask_cpu[:, 1:]
+                        image_sep_mask_cpu = sep_mask_cpu & active_cpu & (image_left_neighbor | image_right_neighbor)
+
+                    lang_mask_cpu = lang_mask_raw_cpu & (~image_sep_mask_cpu)
                     debug_info["image_token_index"] = image_token_index
                     debug_info["active_tokens_per_sample"] = [int(x) for x in active_cpu.sum(dim=1).tolist()]
                     debug_info["image_tokens_per_sample"] = [int(x) for x in image_mask_cpu.sum(dim=1).tolist()]
+                    debug_info["image_separator_tokens_per_sample"] = [int(x) for x in image_sep_mask_cpu.sum(dim=1).tolist()]
+                    debug_info["image_placeholder_tokens_per_sample"] = [
+                        int(x) for x in (image_mask_cpu | image_sep_mask_cpu).sum(dim=1).tolist()
+                    ]
+                    debug_info["lang_tokens_raw_per_sample"] = [int(x) for x in lang_mask_raw_cpu.sum(dim=1).tolist()]
                     debug_info["lang_tokens_per_sample"] = [int(x) for x in lang_mask_cpu.sum(dim=1).tolist()]
                     image_present_each = [int(x) > 0 for x in image_mask_cpu.sum(dim=1).tolist()]
                     debug_info["image_token_present_in_each_sample"] = image_present_each
@@ -568,6 +595,9 @@ class MapAnythingLlava3D_PI(baseframework):
                         token_id_int = int(token_id)
                         if token_id_int in whitespace_token_cache:
                             return whitespace_token_cache[token_id_int]
+                        if token_id_int in space_token_probe_id_set:
+                            whitespace_token_cache[token_id_int] = True
+                            return True
                         piece = _decode_single_token(token_id_int)
                         if piece is None:
                             whitespace_token_cache[token_id_int] = False
@@ -648,6 +678,9 @@ class MapAnythingLlava3D_PI(baseframework):
                     debug_info["padding_right_count_per_sample"] = None
                     debug_info["padding_right_present"] = None
                     debug_info["padding_mixed_present"] = None
+                    debug_info["image_separator_tokens_per_sample"] = None
+                    debug_info["image_placeholder_tokens_per_sample"] = None
+                    debug_info["lang_tokens_raw_per_sample"] = None
                     debug_info["padding_modes_unique"] = None
                     debug_info["image_token_special_token_integrity_ok"] = None
                     debug_info["lang_token_ids_full"] = None
