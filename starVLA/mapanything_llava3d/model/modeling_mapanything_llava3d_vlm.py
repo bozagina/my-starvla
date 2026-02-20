@@ -1,7 +1,7 @@
 # coding=utf-8
 import copy
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -122,6 +122,10 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
         self._llava_vision_available = True
         self.prefix_lang_dropout_prob = getattr(config, "prefix_lang_dropout_prob", 0.0)
         self.prefix_image_dropout_prob = getattr(config, "prefix_image_dropout_prob", 0.0)
+        self.debug_health_trace_enabled = bool(getattr(config, "debug_health_trace_enabled", True))
+        self.debug_health_trace_max_len = int(getattr(config, "debug_health_trace_max_len", 128))
+        self.debug_health_trace: List[Dict[str, Any]] = []
+        self.debug_first_nonfinite_stage: Optional[str] = None
 
     def _infer_geom_dim(self) -> int:
         mam = getattr(self.geometric_model, "map_anything_model", None)
@@ -226,6 +230,57 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
             query_mask[bid, :take_n] = True
         return queries, query_mask
 
+    @staticmethod
+    def _tensor_health(tensor: torch.Tensor) -> Dict[str, Any]:
+        with torch.no_grad():
+            t = tensor.detach()
+            if t.numel() == 0:
+                return {
+                    "shape": tuple(t.shape),
+                    "dtype": str(t.dtype),
+                    "finite_ratio": 1.0,
+                    "nan_count": 0,
+                    "inf_count": 0,
+                    "absmax": 0.0,
+                    "mean": 0.0,
+                    "std": 0.0,
+                }
+            tf = t.float()
+            finite = torch.isfinite(tf)
+            nan_count = int(torch.isnan(tf).sum().item())
+            inf_count = int(torch.isinf(tf).sum().item())
+            return {
+                "shape": tuple(t.shape),
+                "dtype": str(t.dtype),
+                "finite_ratio": float(finite.float().mean().item()),
+                "nan_count": nan_count,
+                "inf_count": inf_count,
+                "absmax": float(tf.abs().max().item()),
+                "mean": float(tf.mean().item()),
+                "std": float(tf.std(unbiased=False).item()),
+            }
+
+    def _reset_health_trace(self):
+        self.debug_health_trace = []
+        self.debug_first_nonfinite_stage = None
+
+    def _record_health(self, stage: str, tensor: Optional[torch.Tensor]):
+        if (not self.debug_health_trace_enabled) or (tensor is None) or (not isinstance(tensor, torch.Tensor)):
+            return
+        record = {"stage": str(stage)}
+        try:
+            record.update(self._tensor_health(tensor))
+        except Exception as e:
+            record["error"] = str(e)
+        self.debug_health_trace.append(record)
+        if len(self.debug_health_trace) > self.debug_health_trace_max_len:
+            self.debug_health_trace = self.debug_health_trace[-self.debug_health_trace_max_len :]
+        if (
+            self.debug_first_nonfinite_stage is None
+            and float(record.get("finite_ratio", 1.0)) < 1.0
+        ):
+            self.debug_first_nonfinite_stage = str(stage)
+
     def get_image_features(
         self,
         pixel_values: torch.FloatTensor,
@@ -278,6 +333,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
             vision_feats = self.vision_projector(vision_feats)
             if getattr(self, "geom_feature_hook_enabled", False):
                 self._record_geom_stats("vision_proj", vision_feats)
+        self._record_health("vision_feats", vision_feats)
         if multi_view and vision_feats is not None:
             vision_feats = vision_feats.view(b, v * vision_feats.shape[1], vision_feats.shape[2])
         if vision_feats is not None:
@@ -303,6 +359,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
                 self._last_task_tokens = vision_feats[:, :token_num].contiguous()
             else:
                 self._last_task_tokens = None
+            self._record_health("image_features_output_vision_only", vision_feats)
             return vision_feats
 
         if multi_view:
@@ -321,6 +378,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
         if geometric_features.dim() == 4:
             b, c, h, w = geometric_features.shape
             geometric_features = geometric_features.permute(0, 2, 3, 1).reshape(b, h * w, c)
+        self._record_health("geometric_features", geometric_features)
         
         print(f"[mapanything_llava3d] geom_seq.shape: {tuple(geometric_features.shape)}")
 
@@ -330,6 +388,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
             language_queries=language_queries,
             language_query_mask=language_query_mask,
         )
+        self._record_health("image_features_output_fused", final_features)
 
         self._last_image_features = final_features
         self._last_task_tokens = task_tokens
@@ -343,6 +402,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
         language_query_mask: Optional[torch.Tensor] = None,
     ):
         geometric_features = self.geometric_projector(geometric_features).to(vision_features.dtype)
+        self._record_health("fusion/geometric_projected", geometric_features)
         if language_queries is None:
             query_len = min(max(1, self.semantic_query_max_tokens), vision_features.shape[1])
             semantic_query = vision_features[:, :query_len]
@@ -361,6 +421,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
             need_weights=True,
             average_attn_weights=False,
         )
+        self._record_health("fusion/semantic_attn_out", semantic_attn_out)
         semantic_attn_out = self.semantic_anchor_norm(semantic_attn_out + semantic_query)
         if semantic_attn_weights.dim() == 4:
             # [B, H, Nq, Ng] -> [B, Ng]
@@ -374,6 +435,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
         task_tokens = torch.gather(geometric_features, dim=1, index=gather_idx)
         semantic_summary = semantic_attn_out.mean(dim=1, keepdim=True)
         task_tokens = task_tokens + semantic_summary
+        self._record_health("fusion/task_tokens", task_tokens)
 
         vision_context, _ = self.vision_semantic_attention(
             query=vision_features,
@@ -382,7 +444,9 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
             need_weights=False,
         )
         fused_features_pre = torch.cat([vision_features, vision_context], dim=-1)
+        self._record_health("fusion/fused_features_pre", fused_features_pre)
         final_features = self.fusion_projector(fused_features_pre)
+        self._record_health("fusion/final_features", final_features)
         return final_features, task_tokens
 
         
@@ -405,6 +469,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
         image_token_id: Optional[int] = None,
         **kwargs,
     ) -> Union[Tuple, MapAnythingLlava3DOutput]:
+        self._reset_health_trace()
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -416,6 +481,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
                 raise ValueError("Either input_ids or inputs_embeds must be provided.")
             input_ids = input_ids.clamp(max=vocab_size - 1)
             inputs_embeds = embed(input_ids)
+        self._record_health("forward/inputs_embeds_init", inputs_embeds)
 
         image_features = None
         task_tokens = None
@@ -449,6 +515,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
                 language_query_mask=language_query_mask,
             )
             task_tokens = getattr(self, "_last_task_tokens", None)
+            self._record_health("forward/image_features", image_features)
 
             if spatial_img_id is not None:
                 image_mask = input_ids == spatial_img_id
@@ -484,6 +551,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
                             mask_exp, image_features_flat.to(zero_embeds.dtype)
                         )
                         inputs_embeds = torch.where(mask_exp, zero_embeds, inputs_embeds)
+                        self._record_health("forward/inputs_embeds_after_image_injection", inputs_embeds)
                     else:
                         logger.warning(
                             "Image token count per sample does not match image feature sequence length. "
@@ -518,6 +586,9 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
                     if scale_lang_mask.any():
                         keep = keep.masked_fill(scale_lang_mask, 1.0 / (1.0 - p_lang))
                     inputs_embeds = inputs_embeds * keep.unsqueeze(-1)
+                    self._record_health("forward/inputs_embeds_after_lang_dropout", inputs_embeds)
+
+        self._record_health("forward/inputs_embeds_before_language_model", inputs_embeds)
 
         outputs = self.language_model(
             attention_mask=attention_mask,
@@ -530,6 +601,12 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
+        try:
+            if outputs.hidden_states is not None and len(outputs.hidden_states) > 0:
+                self._record_health("forward/lm_hidden_0", outputs.hidden_states[0])
+                self._record_health("forward/lm_hidden_last", outputs.hidden_states[-1])
+        except Exception:
+            pass
 
         loss = outputs.loss
 

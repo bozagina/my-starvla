@@ -14,6 +14,7 @@ Conventions:
 # Standard Library
 import argparse
 import contextlib
+import inspect
 import json
 import math
 import os
@@ -178,6 +179,10 @@ class VLATrainer(TrainerUtils):
         self.total_batch_size = self._calculate_total_batch_size()
         self.best_metric = None
         self.steps_since_improvement = 0
+        self.nan_debug_enabled = bool(getattr(self.config.trainer, "nan_debug_enabled", True))
+        self.nan_debug_fail_fast = bool(getattr(self.config.trainer, "nan_debug_fail_fast", False))
+        self.nan_debug_dump_max = int(getattr(self.config.trainer, "nan_debug_dump_max", 1))
+        self.nan_debug_dump_count = 0
         trackers = getattr(self.config, "trackers", None)
         backend = None
         if trackers is not None:
@@ -206,11 +211,15 @@ class VLATrainer(TrainerUtils):
                 "Refuse to start training to avoid silent behavior drift."
             )
 
+        self._log_runtime_fingerprint()
+
         # load pretrained weights
         self._init_checkpointing() # TODO merge with load pretrained weights
 
         # 根据  resume 调整 lr_scheduler
         self._adjust_lr_scheduler_for_resume()
+
+        self._assert_no_meta_parameters(self.model)
 
         # freeze parameters
         freeze_modules = (
@@ -236,6 +245,176 @@ class VLATrainer(TrainerUtils):
         self._register_grad_hooks(base_model)
 
         self._init_wandb()
+
+    def _log_runtime_fingerprint(self):
+        if not self.accelerator.is_main_process:
+            return
+        base_model = self.model
+        vlm_interface = getattr(base_model, "mapanythingllava3d_vlm_interface", None)
+        vlm_core = getattr(vlm_interface, "model", None) if vlm_interface is not None else None
+        action_model = getattr(base_model, "action_model", None)
+        fingerprint = {
+            "model_class": type(base_model).__name__,
+            "model_file": None,
+            "vlm_class": type(vlm_core).__name__ if vlm_core is not None else None,
+            "vlm_file": None,
+            "action_class": type(action_model).__name__ if action_model is not None else None,
+            "action_file": None,
+        }
+        try:
+            fingerprint["model_file"] = inspect.getfile(type(base_model))
+        except Exception:
+            pass
+        try:
+            if vlm_core is not None:
+                fingerprint["vlm_file"] = inspect.getfile(type(vlm_core))
+        except Exception:
+            pass
+        try:
+            if action_model is not None:
+                fingerprint["action_file"] = inspect.getfile(type(action_model))
+        except Exception:
+            pass
+        logger.info(f"Runtime fingerprint: {fingerprint}")
+
+    @staticmethod
+    def _tensor_snapshot_stats(value):
+        if not isinstance(value, torch.Tensor):
+            return None
+        with torch.no_grad():
+            t = value.detach()
+            if t.numel() == 0:
+                return {
+                    "shape": tuple(t.shape),
+                    "dtype": str(t.dtype),
+                    "finite_ratio": 1.0,
+                    "min": 0.0,
+                    "max": 0.0,
+                    "mean": 0.0,
+                    "std": 0.0,
+                }
+            tf = t.float()
+            finite = torch.isfinite(tf)
+            return {
+                "shape": tuple(t.shape),
+                "dtype": str(t.dtype),
+                "finite_ratio": float(finite.float().mean().item()),
+                "min": float(tf.min().item()),
+                "max": float(tf.max().item()),
+                "mean": float(tf.mean().item()),
+                "std": float(tf.std(unbiased=False).item()),
+            }
+
+    def _assert_no_meta_parameters(self, model):
+        meta_params = []
+        meta_buffers = []
+        for name, p in model.named_parameters():
+            if getattr(p, "is_meta", False):
+                meta_params.append(name)
+        for name, b in model.named_buffers():
+            if getattr(b, "is_meta", False):
+                meta_buffers.append(name)
+        if meta_params or meta_buffers:
+            payload = {
+                "meta_params_count": len(meta_params),
+                "meta_buffers_count": len(meta_buffers),
+                "meta_params_head": meta_params[:20],
+                "meta_buffers_head": meta_buffers[:20],
+            }
+            raise RuntimeError(f"Detected meta tensors after model load: {payload}")
+
+    def _safe_json(self, obj):
+        try:
+            return json.loads(json.dumps(obj, default=str))
+        except Exception:
+            return str(obj)
+
+    def _summarize_batch(self, batch_vla):
+        if not isinstance(batch_vla, list):
+            return {"type": str(type(batch_vla))}
+        summary = {"batch_size": len(batch_vla), "samples": []}
+        for idx, sample in enumerate(batch_vla[:3]):
+            sample_info = {"index": idx}
+            if isinstance(sample, dict):
+                lang = sample.get("lang", None)
+                if isinstance(lang, str):
+                    sample_info["lang"] = lang[:256]
+                action = sample.get("action", None)
+                if action is not None:
+                    action_np = np.asarray(action)
+                    sample_info["action_shape"] = tuple(action_np.shape)
+                    if action_np.size > 0:
+                        sample_info["action_min"] = float(np.min(action_np))
+                        sample_info["action_max"] = float(np.max(action_np))
+                        sample_info["action_finite_ratio"] = float(np.isfinite(action_np).mean())
+                state = sample.get("state", None)
+                if state is not None:
+                    state_np = np.asarray(state)
+                    sample_info["state_shape"] = tuple(state_np.shape)
+                    if state_np.size > 0:
+                        sample_info["state_min"] = float(np.min(state_np))
+                        sample_info["state_max"] = float(np.max(state_np))
+                        sample_info["state_finite_ratio"] = float(np.isfinite(state_np).mean())
+                images = sample.get("image", None)
+                if isinstance(images, list):
+                    sample_info["image_count"] = len(images)
+            summary["samples"].append(sample_info)
+        return summary
+
+    def _collect_model_nonfinite_context(self):
+        try:
+            base_model = self.accelerator.unwrap_model(self.model)
+        except Exception:
+            base_model = self.model
+        context = {}
+        try:
+            vlm_interface = getattr(base_model, "mapanythingllava3d_vlm_interface", None)
+            vlm_core = getattr(vlm_interface, "model", None) if vlm_interface is not None else None
+            if vlm_core is not None:
+                context["vlm_first_nonfinite_stage"] = getattr(vlm_core, "debug_first_nonfinite_stage", None)
+                context["vlm_health_trace"] = getattr(vlm_core, "debug_health_trace", None)
+        except Exception as e:
+            context["vlm_context_error"] = str(e)
+        try:
+            action_model = getattr(base_model, "action_model", None)
+            if action_model is not None:
+                context["action_first_nonfinite_stage"] = getattr(action_model, "_first_nonfinite_stage", None)
+                context["action_health_trace"] = getattr(action_model, "_last_health_trace", None)
+        except Exception as e:
+            context["action_context_error"] = str(e)
+        return context
+
+    def _dump_nonfinite_snapshot(self, reason: str, batch_vla, output_dict, step_metrics):
+        if (not self.nan_debug_enabled) or (not self.accelerator.is_main_process):
+            return None
+        if self.nan_debug_dump_count >= self.nan_debug_dump_max:
+            return None
+
+        debug_dir = Path(self.config.output_dir) / "nonfinite_debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        dump_path = debug_dir / f"step_{int(self.completed_steps):08d}_{self.nan_debug_dump_count}_{reason}.json"
+
+        payload = {
+            "reason": str(reason),
+            "completed_steps": int(self.completed_steps),
+            "step_metrics": step_metrics,
+            "batch_summary": self._summarize_batch(batch_vla),
+            "output_keys": list(output_dict.keys()) if isinstance(output_dict, dict) else str(type(output_dict)),
+            "model_context": self._collect_model_nonfinite_context(),
+        }
+
+        action_loss = None
+        if isinstance(output_dict, dict):
+            action_loss = output_dict.get("action_loss", None)
+        if isinstance(action_loss, torch.Tensor):
+            payload["action_loss_tensor"] = self._tensor_snapshot_stats(action_loss)
+
+        with open(dump_path, "w") as f:
+            json.dump(self._safe_json(payload), f, indent=2)
+
+        self.nan_debug_dump_count += 1
+        logger.warning(f"Non-finite debug snapshot saved: {dump_path}")
+        return str(dump_path)
 
     def _patch_deepspeed_no_sync_if_needed(self):
         """
@@ -904,7 +1083,20 @@ class VLATrainer(TrainerUtils):
                     self.completed_steps,
                 )
                 step_metrics["debug/nonfinite_loss"] = 1.0
+                dump_path = self._dump_nonfinite_snapshot(
+                    reason="nonfinite_total_loss",
+                    batch_vla=batch_vla,
+                    output_dict=output_dict,
+                    step_metrics=step_metrics,
+                )
+                if dump_path is not None:
+                    step_metrics["debug/nonfinite_dump_written"] = 1.0
                 self.optimizer.zero_grad()
+                if self.nan_debug_fail_fast:
+                    raise FloatingPointError(
+                        f"Non-finite loss detected at step={self.completed_steps}. "
+                        f"Dump count={self.nan_debug_dump_count}"
+                    )
                 return step_metrics
 
             # VLA backward propagation
@@ -969,7 +1161,20 @@ class VLATrainer(TrainerUtils):
                         self.completed_steps,
                     )
                     step_metrics["debug/nonfinite_grad_norm"] = 1.0
+                    dump_path = self._dump_nonfinite_snapshot(
+                        reason="nonfinite_clipped_grad_norm",
+                        batch_vla=batch_vla,
+                        output_dict=output_dict,
+                        step_metrics=step_metrics,
+                    )
+                    if dump_path is not None:
+                        step_metrics["debug/nonfinite_dump_written"] = 1.0
                     self.optimizer.zero_grad()
+                    if self.nan_debug_fail_fast:
+                        raise FloatingPointError(
+                            f"Non-finite clipped grad norm detected at step={self.completed_steps}. "
+                            f"Dump count={self.nan_debug_dump_count}"
+                        )
                     return step_metrics
 
                 self.optimizer.step()

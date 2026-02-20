@@ -134,6 +134,21 @@ class MapAnythingLlava3D_PI(baseframework):
             return value.strip().lower() in ("1", "true", "yes", "y", "on")
         return bool(value)
 
+    @staticmethod
+    def _safe_metric_key(text: str) -> str:
+        if text is None:
+            return "unknown"
+        out = []
+        for ch in str(text):
+            if ch.isalnum() or ch in ("_", "-"):
+                out.append(ch)
+            else:
+                out.append("_")
+        key = "".join(out).strip("_")
+        if not key:
+            return "unknown"
+        return key[:64]
+
     def forward(
         self,
         examples: List[dict] = None,
@@ -229,6 +244,20 @@ class MapAnythingLlava3D_PI(baseframework):
                         debug_metrics[f"{prefix}_std"] = float(rec.get("std", 0.0))
                         debug_metrics[f"{prefix}_min"] = float(rec.get("min", 0.0))
                         debug_metrics[f"{prefix}_max"] = float(rec.get("max", 0.0))
+                health_trace = getattr(vlm_core, "debug_health_trace", None)
+                first_nonfinite = getattr(vlm_core, "debug_first_nonfinite_stage", None)
+                debug_metrics["debug/health/has_nonfinite"] = 1.0 if first_nonfinite else 0.0
+                if isinstance(health_trace, list):
+                    debug_metrics["debug/health/trace_len"] = float(len(health_trace))
+                    for local_idx, rec in enumerate(health_trace[-6:]):
+                        if not isinstance(rec, dict):
+                            continue
+                        stage = self._safe_metric_key(rec.get("stage", f"stage_{local_idx}"))
+                        prefix = f"debug/health/{local_idx}_{stage}"
+                        if "finite_ratio" in rec:
+                            debug_metrics[f"{prefix}_finite_ratio"] = float(rec["finite_ratio"])
+                        if "absmax" in rec:
+                            debug_metrics[f"{prefix}_absmax"] = float(rec["absmax"])
                 first_indices = range(1, 1 + expected_layers)
                 last_indices = range(len(all_hidden) - expected_layers, len(all_hidden))
                 for rel_idx, layer_idx in enumerate(first_indices):
@@ -364,6 +393,20 @@ class MapAnythingLlava3D_PI(baseframework):
                 if isinstance(loss_breakdown, dict):
                     for k, v in loss_breakdown.items():
                         debug_metrics[f"debug/sagr/{k}"] = float(v)
+                action_health_trace = getattr(self.action_model, "_last_health_trace", None)
+                action_first_nonfinite = getattr(self.action_model, "_first_nonfinite_stage", None)
+                debug_metrics["debug/action_health/has_nonfinite"] = 1.0 if action_first_nonfinite else 0.0
+                if isinstance(action_health_trace, list):
+                    debug_metrics["debug/action_health/trace_len"] = float(len(action_health_trace))
+                    for local_idx, rec in enumerate(action_health_trace[-6:]):
+                        if not isinstance(rec, dict):
+                            continue
+                        stage = self._safe_metric_key(rec.get("stage", f"stage_{local_idx}"))
+                        prefix = f"debug/action_health/{local_idx}_{stage}"
+                        if "finite_ratio" in rec:
+                            debug_metrics[f"{prefix}_finite_ratio"] = float(rec["finite_ratio"])
+                        if "absmax" in rec:
+                            debug_metrics[f"{prefix}_absmax"] = float(rec["absmax"])
             except Exception:
                 debug_metrics = debug_metrics
 

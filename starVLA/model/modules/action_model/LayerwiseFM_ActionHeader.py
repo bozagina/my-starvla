@@ -6,7 +6,7 @@
 
 from dataclasses import dataclass, field
 import logging
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -375,6 +375,8 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 world_params,
                 self.world_max_params,
             )
+        self._last_health_trace = []
+        self._first_nonfinite_stage = None
         logger.info(
             "LayerwiseFMActionHead initialized: use_concat_cross_context=%s, cross_attention_assert_inputs=%s, cross_attention_debug_log_interval=%d, world_params=%d",
             self.use_concat_cross_context,
@@ -449,6 +451,49 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             self._last_dit_layer_vars[-1],
         )
 
+    @staticmethod
+    def _tensor_health(tensor: torch.Tensor) -> Dict[str, Any]:
+        with torch.no_grad():
+            t = tensor.detach()
+            if t.numel() == 0:
+                return {
+                    "shape": tuple(t.shape),
+                    "dtype": str(t.dtype),
+                    "finite_ratio": 1.0,
+                    "nan_count": 0,
+                    "inf_count": 0,
+                    "absmax": 0.0,
+                    "mean": 0.0,
+                    "std": 0.0,
+                }
+            tf = t.float()
+            finite = torch.isfinite(tf)
+            return {
+                "shape": tuple(t.shape),
+                "dtype": str(t.dtype),
+                "finite_ratio": float(finite.float().mean().item()),
+                "nan_count": int(torch.isnan(tf).sum().item()),
+                "inf_count": int(torch.isinf(tf).sum().item()),
+                "absmax": float(tf.abs().max().item()),
+                "mean": float(tf.mean().item()),
+                "std": float(tf.std(unbiased=False).item()),
+            }
+
+    def _record_health(self, stage: str, tensor: torch.Tensor):
+        if tensor is None or not isinstance(tensor, torch.Tensor):
+            return
+        record = {"stage": str(stage)}
+        try:
+            record.update(self._tensor_health(tensor))
+        except Exception as e:
+            record["error"] = str(e)
+        self._last_health_trace.append(record)
+        if (
+            self._first_nonfinite_stage is None
+            and float(record.get("finite_ratio", 1.0)) < 1.0
+        ):
+            self._first_nonfinite_stage = str(stage)
+
     def _apply_layerwise_cross_attention(
         self,
         saction_embs,
@@ -478,6 +523,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         self._layerwise_forward_calls += 1
         self._last_dit_layer_means = []
         self._last_dit_layer_vars = []
+        self._record_health("cross_attn/input_saction_embs", hidden_states)
         for layer_idx, layer in enumerate(self.model.transformer_blocks):
             if self.use_concat_cross_context:
                 cross_context = torch.cat((vl_embs_list[layer_idx], hidden_states), dim=1)
@@ -505,12 +551,14 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                         device=task_context.device,
                     )
                     layer_encoder_attention_mask = torch.cat((layer_encoder_attention_mask, task_mask), dim=1)
+            self._record_health(f"cross_attn/layer_{layer_idx}_context", cross_context)
             hidden_states = layer(
                 hidden_states=hidden_states,
                 encoder_hidden_states=cross_context,
                 encoder_attention_mask=layer_encoder_attention_mask,
                 temb=temb,
             )
+            self._record_health(f"cross_attn/layer_{layer_idx}_hidden", hidden_states)
             stats = hidden_states.detach().float()
             self._last_dit_layer_means.append(stats.mean().item())
             self._last_dit_layer_vars.append(stats.var(unbiased=False).item())
@@ -674,28 +722,40 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         actions: shape (B, future_action_window_size, D_action)
         """
         device = actions.device
+        self._last_health_trace = []
+        self._first_nonfinite_stage = None
         num_layers = len(vl_embs_list)
         B, L, D = vl_embs_list[0].shape
+        self._record_health("forward/actions", actions)
+        self._record_health("forward/vl_embs_layer0", vl_embs_list[0])
         # Embed noised action trajectory.
         noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
+        self._record_health("forward/noise", noise)
         t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
         t = t[:, None, None]  # shape (B,1,1) for broadcast
 
         noisy_trajectory = (1 - t) * noise + t * actions
         velocity = actions - noise
+        self._record_health("forward/noisy_trajectory", noisy_trajectory)
+        self._record_health("forward/velocity_target", velocity)
 
         # Convert (continuous) t -> discrete if needed
         t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
+        t_discretized = t_discretized.clamp_(0, max(self.num_timestep_buckets - 1, 0))
         action_features = self.action_encoder(noisy_trajectory, t_discretized)
+        self._record_health("forward/action_features", action_features)
 
         # Embed state
         state_features = self.state_encoder(state) if state is not None else None
+        if state_features is not None:
+            self._record_health("forward/state_features", state_features)
 
         # Maybe add position embedding.
         if self.config.add_pos_embed:
             pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
             pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
             action_features = action_features + pos_embs
+            self._record_health("forward/action_features_plus_pos", action_features)
 
         # state and action embedding along sequence dimension.
         future_tokens = self.future_tokens.weight.unsqueeze(0).expand(B, -1, -1)
@@ -713,7 +773,11 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             device=device,
             dtype=sa_embs.dtype,
         )
+        self._record_health("forward/sa_embs", sa_embs)
+        self._record_health("forward/task_tokens", task_tokens) if isinstance(task_tokens, torch.Tensor) else None
+        self._record_health("forward/task_tokens_next", task_tokens_next) if isinstance(task_tokens_next, torch.Tensor) else None
         temb = self.model.timestep_encoder(t_discretized)
+        self._record_health("forward/temb", temb)
         hidden_states = self._apply_layerwise_cross_attention(
             sa_embs,
             vl_embs_list,
@@ -722,7 +786,9 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             task_tokens=task_tokens,
             log_context="train",
         )
+        self._record_health("forward/hidden_states", hidden_states)
         pred_velocity = self._process_output(hidden_states, temb, actions.shape[1])
+        self._record_health("forward/pred_velocity_raw", pred_velocity)
         world_guidance = self._compute_world_guidance(
             task_tokens=task_tokens,
             action_sequence=noisy_trajectory,
@@ -733,7 +799,9 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         )
         drift = world_guidance["drift"]
         if isinstance(drift, torch.Tensor):
+            self._record_health("forward/drift", drift)
             pred_velocity = pred_velocity + drift
+        self._record_health("forward/pred_velocity_corrected", pred_velocity)
         loss_cfm = ((pred_velocity - velocity) ** 2).mean()
         loss_dyn = world_guidance["loss_dyn"]
         loss_geo = world_guidance["loss_geo"]
@@ -756,6 +824,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         if isinstance(rrr, torch.Tensor) and rrr.numel() > 0:
             self._last_rrr = float(rrr.detach().mean().item())
             self._last_loss_breakdown["rrr_mean"] = self._last_rrr
+        self._record_health("forward/loss_total", total_loss.unsqueeze(0))
         return total_loss
 
     @torch.no_grad()
