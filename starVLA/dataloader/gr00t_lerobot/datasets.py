@@ -1653,48 +1653,111 @@ class LeRobotMixtureDataset(Dataset):
                         break
                     index = random.randint(0, len(self) - 1)
                     
-                raw_data = dataset.get_step_data(trajectory_id, step)    
+                raw_data = dataset.get_step_data(trajectory_id, step)
                 data = dataset.transforms(raw_data)
-                
-                # Process all video keys dynamically
-                prim_images = []
-                wrist_views = []
+
+                # Temporal contract:
+                # - t index: delta == 0
+                # - target index: delta == k, where k=max(action_deltas)
+                # If exact k is unavailable in observation indices, we fallback to nearest
+                # observed frame and mark valid_tk=0.0 so upper-level training can ignore it.
+                first_video_key = dataset.modality_keys["video"][0]
+                first_action_key = dataset.modality_keys["action"][0]
+                obs_deltas = np.asarray(dataset.delta_indices[first_video_key], dtype=np.int64).reshape(-1)
+                action_deltas = np.asarray(dataset.delta_indices[first_action_key], dtype=np.int64).reshape(-1)
+
+                if obs_deltas.size == 0:
+                    obs_deltas = np.array([0], dtype=np.int64)
+                if action_deltas.size == 0:
+                    action_deltas = np.array([0], dtype=np.int64)
+
+                target_delta_k = int(np.max(action_deltas))
+                if np.any(obs_deltas == 0):
+                    obs_t_idx = int(np.where(obs_deltas == 0)[0][0])
+                else:
+                    obs_t_idx = int(np.argmin(np.abs(obs_deltas)))
+
+                has_exact_tk = bool(np.any(obs_deltas == target_delta_k))
+                if has_exact_tk:
+                    obs_tk_idx = int(np.where(obs_deltas == target_delta_k)[0][0])
+                else:
+                    obs_tk_idx = int(np.argmin(np.abs(obs_deltas - target_delta_k)))
+
+                traj_index = dataset.get_trajectory_index(trajectory_id)
+                traj_len = int(dataset.trajectory_lengths[traj_index])
+                valid_tk = float(has_exact_tk and (0 <= int(step) + target_delta_k < traj_len))
+
+                # Build temporal images for t and t+k while preserving camera order.
+                prim_images_t = []
+                wrist_views_t = []
+                prim_images_tk = []
+                wrist_views_tk = []
                 for video_key in dataset.modality_keys["video"]:
-                    image = data[video_key][0]
-                    
-                    # Apply image cropping if enabled and the video key is base_view
-                    # Note: crop_obs_camera functionality has been removed
-                    image = Image.fromarray(image).resize((224, 224))
+                    frames = np.asarray(data[video_key])
+                    if frames.ndim == 3:
+                        frames = frames[None, ...]
+                    if frames.ndim != 4:
+                        raise ValueError(
+                            f"Expected video frames shape [T,H,W,C], got {frames.shape} for key={video_key}"
+                        )
+
+                    t_idx = min(max(obs_t_idx, 0), frames.shape[0] - 1)
+                    tk_idx = min(max(obs_tk_idx, 0), frames.shape[0] - 1)
+                    image_t = Image.fromarray(frames[t_idx]).resize((224, 224))
+                    image_tk = Image.fromarray(frames[tk_idx]).resize((224, 224))
+
                     if "wrist" not in video_key:
-                        prim_images.append(image)
+                        prim_images_t.append(image_t)
+                        prim_images_tk.append(image_tk)
                     else:
-                        wrist_views.append(image)
-                all_images = prim_images + wrist_views
-                
-                # Get language and action data
-                language = data[dataset.modality_keys["language"][0]][0]
+                        wrist_views_t.append(image_t)
+                        wrist_views_tk.append(image_tk)
+
+                all_images_t = prim_images_t + wrist_views_t
+                all_images_tk = prim_images_tk + wrist_views_tk
+
+                # Get language and action data.
+                language_seq = data[dataset.modality_keys["language"][0]]
+                language = language_seq[obs_t_idx] if len(language_seq) > obs_t_idx else language_seq[0]
+
                 action = []
                 for action_key in dataset.modality_keys["action"]:
-                    action.append(data[action_key])
+                    action_val = np.asarray(data[action_key])
+                    if action_val.ndim == 1:
+                        action_val = action_val[:, None]
+                    action.append(action_val)
                 action = np.concatenate(action, axis=1).astype(np.float16)
 
-                state = []
-                for state_key in dataset.modality_keys["state"]:
-                    state.append(data[state_key])
-                state = np.concatenate(state, axis=1).astype(np.float16)
-                
-                state = None
-                
+                sample = {
+                    "action": action,
+                    # Keep legacy key for compatibility with existing model input path.
+                    "image": all_images_t,
+                    # Explicit temporal keys for t -> t+k supervision.
+                    "image_t": all_images_t,
+                    "image_tk": all_images_tk,
+                    "lang": language,
+                    "valid_tk": valid_tk,
+                    "temporal_delta_k": int(target_delta_k),
+                }
+
                 if self.data_cfg is not None and self.data_cfg.get("include_state", False) not in ["False", False]:
-                    
                     state = []
                     for state_key in dataset.modality_keys["state"]:
-                        state.append(data[state_key])
+                        state_val = np.asarray(data[state_key])
+                        if state_val.ndim == 1:
+                            state_val = state_val[:, None]
+                        state.append(state_val)
                     state = np.concatenate(state, axis=1).astype(np.float16)
-                    # prim_images
-                    return dict(action=action, image=all_images, lang=language, state=state)
 
-                return dict(action=action, image=all_images, lang=language)
+                    t_state_idx = min(max(obs_t_idx, 0), state.shape[0] - 1)
+                    tk_state_idx = min(max(obs_tk_idx, 0), state.shape[0] - 1)
+                    state_t = state[t_state_idx : t_state_idx + 1]
+                    state_tk = state[tk_state_idx : tk_state_idx + 1]
+                    sample["state"] = state_t
+                    sample["state_t"] = state_t
+                    sample["state_tk"] = state_tk
+
+                return sample
                 
             except Exception as e:
                 last_exception = e
@@ -2184,5 +2247,4 @@ class LeRobotMixtureDataset(Dataset):
                 dataset.set_transforms_metadata(self.merged_metadata[dataset.tag])
         
         print(f"Applied cached statistics for {len(self.merged_metadata)} embodiment tags.")
-
 

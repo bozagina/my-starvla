@@ -463,7 +463,10 @@ class Libero4in1DataConfig:
     
     language_keys = ["annotation.human.action.task_description"]
 
-    observation_indices = [0]
+    # Use dual observations so each sample can carry both current frame (t)
+    # and supervision target frame (t+k) aligned with action chunk.
+    # Current action_indices are [0..7], so k=7.
+    observation_indices = [0, 7]
     action_indices = list(range(8))
 
 
@@ -918,4 +921,3 @@ ROBOT_TYPE_CONFIG_MAP = {
     
     "custom_robot_config": SingleFrankaRobotiqDeltaEefDataConfig(),
 }
-

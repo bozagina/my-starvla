@@ -356,13 +356,35 @@ def check_current_getitem_temporal_behavior() -> CheckResult:
     if not datasets_py.exists():
         return CheckResult(False, f"Source file missing: {datasets_py}")
     text = datasets_py.read_text(encoding="utf-8")
-    marker = "image = data[video_key][0]"
-    if marker in text:
+    class_marker = "class LeRobotMixtureDataset"
+    class_pos = text.find(class_marker)
+    if class_pos < 0:
+        return CheckResult(False, "Cannot locate `LeRobotMixtureDataset` class in datasets.py.")
+
+    mixture_text = text[class_pos:]
+    getitem_marker = "def __getitem__(self, index: int) -> dict:"
+    if getitem_marker not in mixture_text:
+        return CheckResult(False, "Cannot locate `LeRobotMixtureDataset.__getitem__` implementation.")
+
+    legacy_single_frame_marker = "image = data[video_key][0]"
+    if legacy_single_frame_marker in mixture_text:
         return CheckResult(
             False,
-            "Current __getitem__ uses only temporal index 0 per video key (`data[video_key][0]`), so extra observation_indices are dropped unless this logic is changed.",
+            "Detected hard-coded single-frame selection in LeRobotMixtureDataset (`data[video_key][0]`).",
         )
-    return CheckResult(True, "Did not detect hard-coded `[0]` image selection in __getitem__.")
+
+    required_markers = ['"image_t"', '"image_tk"', '"valid_tk"']
+    missing = [m for m in required_markers if m not in mixture_text]
+    if missing:
+        return CheckResult(
+            False,
+            f"LeRobotMixtureDataset.__getitem__ missing temporal output keys: {missing}",
+        )
+
+    return CheckResult(
+        True,
+        "LeRobotMixtureDataset.__getitem__ exposes temporal keys (image_t/image_tk/valid_tk) without hard-coded single-frame selection.",
+    )
 
 
 def print_result(prefix: str, result: CheckResult) -> None:

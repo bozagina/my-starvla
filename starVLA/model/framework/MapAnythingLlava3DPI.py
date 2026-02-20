@@ -139,10 +139,19 @@ class MapAnythingLlava3D_PI(baseframework):
         examples: List[dict] = None,
         **kwargs,
     ) -> Tuple:
-        batch_images = [example["image"] for example in examples]
+        # Prefer explicit temporal keys when available; fall back to legacy keys.
+        batch_images_t = [example.get("image_t", example["image"]) for example in examples]
+        batch_images_tk = [
+            example.get("image_tk", example.get("image_t", example["image"])) for example in examples
+        ]
         instructions = [example["lang"] for example in examples]
         actions = [example["action"] for example in examples]
-        state = [example["state"] for example in examples] if "state" in examples[0] else None
+        if "state" in examples[0] or "state_t" in examples[0]:
+            state = [example.get("state_t", example.get("state")) for example in examples]
+        else:
+            state = None
+        has_temporal_images = any("image_tk" in example for example in examples)
+        valid_tk_values = [float(example.get("valid_tk", 1.0)) for example in examples]
 
         if not hasattr(self, "_debug_logged_instructions"):
             try:
@@ -157,7 +166,12 @@ class MapAnythingLlava3D_PI(baseframework):
                 pass
             self._debug_logged_instructions += 1
 
-        vlm_inputs = self.mapanythingllava3d_vlm_interface.build_mapanythingllava3d_inputs(images=batch_images, instructions=instructions)
+        vlm_inputs = self.mapanythingllava3d_vlm_interface.build_mapanythingllava3d_inputs(
+            images=batch_images_t,
+            instructions=instructions,
+        )
+        task_tokens_next = None
+        valid_tk_tensor = None
         with torch.autocast("cuda", dtype=torch.bfloat16):
             vlm_outputs = self.mapanythingllava3d_vlm_interface(
                 **vlm_inputs,
@@ -185,6 +199,11 @@ class MapAnythingLlava3D_PI(baseframework):
             attention_mask = vlm_inputs.get("attention_mask", None)
             if isinstance(attention_mask, torch.Tensor):
                 attention_mask = attention_mask.to(device=base_hidden.device)
+            valid_tk_tensor = torch.tensor(
+                valid_tk_values,
+                device=base_hidden.device,
+                dtype=base_hidden.dtype,
+            ).clamp_(0.0, 1.0)
             debug_metrics = {}
             try:
                 try:
@@ -235,6 +254,42 @@ class MapAnythingLlava3D_PI(baseframework):
             except Exception:
                 debug_metrics = debug_metrics
 
+            if has_temporal_images:
+                try:
+                    vlm_inputs_next = self.mapanythingllava3d_vlm_interface.build_mapanythingllava3d_inputs(
+                        images=batch_images_tk,
+                        instructions=instructions,
+                    )
+                    with torch.no_grad():
+                        vlm_outputs_next = self.mapanythingllava3d_vlm_interface(
+                            **vlm_inputs_next,
+                            use_cache=self.vlm_use_cache,
+                            output_attentions=False,
+                            output_hidden_states=False,
+                            return_dict=True,
+                        )
+                    task_tokens_next = getattr(vlm_outputs_next, "task_hidden_states", None)
+                    if isinstance(task_tokens_next, torch.Tensor):
+                        task_tokens_next = task_tokens_next.to(
+                            device=base_hidden.device,
+                            dtype=base_hidden.dtype,
+                        )
+                        if isinstance(task_tokens, torch.Tensor) and task_tokens_next.shape[0] != task_tokens.shape[0]:
+                            logger.warning(
+                                f"[temporal_supervision] batch mismatch for task_tokens_next: "
+                                f"{tuple(task_tokens_next.shape)} vs {tuple(task_tokens.shape)}; drop next tokens."
+                            )
+                            task_tokens_next = None
+                except Exception as exc:
+                    logger.warning(f"[temporal_supervision] failed to build next-step task tokens: {exc}")
+                    task_tokens_next = None
+
+            debug_metrics["debug/temporal/has_image_tk"] = float(has_temporal_images)
+            debug_metrics["debug/temporal/valid_tk_ratio"] = float(valid_tk_tensor.mean().item())
+            debug_metrics["debug/temporal/task_tokens_next_available"] = float(
+                isinstance(task_tokens_next, torch.Tensor)
+            )
+
         with torch.autocast("cuda", dtype=torch.float32):
             actions = torch.tensor(
                 np.array(actions), device=base_hidden.device, dtype=base_hidden.dtype
@@ -260,9 +315,26 @@ class MapAnythingLlava3D_PI(baseframework):
             task_tokens_repeated = None
             if isinstance(task_tokens, torch.Tensor):
                 task_tokens_repeated = task_tokens.repeat(repeated_diffusion_steps, 1, 1)
+            task_tokens_next_repeated = None
+            if isinstance(task_tokens_next, torch.Tensor):
+                task_tokens_next_repeated = task_tokens_next.repeat(repeated_diffusion_steps, 1, 1)
             attention_mask_repeated = None
             if isinstance(attention_mask, torch.Tensor):
                 attention_mask_repeated = attention_mask.repeat(repeated_diffusion_steps, 1)
+            valid_tk_repeated = None
+            if isinstance(valid_tk_tensor, torch.Tensor):
+                valid_tk_repeated = valid_tk_tensor.repeat(repeated_diffusion_steps)
+            if (
+                isinstance(task_tokens_repeated, torch.Tensor)
+                and isinstance(task_tokens_next_repeated, torch.Tensor)
+                and isinstance(valid_tk_repeated, torch.Tensor)
+            ):
+                valid_mask = (valid_tk_repeated > 0.5).view(-1, 1, 1)
+                task_tokens_next_repeated = torch.where(
+                    valid_mask,
+                    task_tokens_next_repeated,
+                    task_tokens_repeated.detach(),
+                )
 
             state_repeated = None
             if state is not None:
@@ -277,6 +349,7 @@ class MapAnythingLlava3D_PI(baseframework):
                 state_repeated,
                 encoder_attention_mask=attention_mask_repeated,
                 task_tokens=task_tokens_repeated,
+                task_tokens_next=task_tokens_next_repeated,
             )
             try:
                 layer_means = getattr(self.action_model, "_last_dit_layer_means", None)
