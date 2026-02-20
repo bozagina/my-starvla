@@ -6,6 +6,7 @@
 
 from dataclasses import dataclass, field
 import logging
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -300,17 +301,86 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         self.num_timestep_buckets = action_config.num_timestep_buckets
         self.config = action_config
         self.use_concat_cross_context = bool(_cfg_get(action_config, "use_concat_cross_context", False))
+        self.use_task_token_context = bool(_cfg_get(action_config, "use_task_token_context", True))
         self.cross_attention_assert_inputs = bool(_cfg_get(action_config, "cross_attention_assert_inputs", True))
         log_interval = _cfg_get(action_config, "cross_attention_debug_log_interval", 0)
         self.cross_attention_debug_log_interval = int(log_interval) if log_interval is not None else 0
         self._layerwise_forward_calls = 0
         self._last_dit_layer_means = []
         self._last_dit_layer_vars = []
+        self._last_loss_breakdown = {}
+        self._last_rrr = None
+
+        self.world_hidden_dim = int(_cfg_get(action_config, "world_hidden_dim", 512))
+        self.world_num_layers = int(_cfg_get(action_config, "world_num_layers", 4))
+        self.world_num_heads = int(_cfg_get(action_config, "world_num_heads", 8))
+        self.world_max_params = int(_cfg_get(action_config, "world_predictor_max_params", 30_000_000))
+        self.num_task_tokens = int(_cfg_get(action_config, "num_task_tokens", 32))
+        if self.world_num_heads < 1 or (self.world_hidden_dim % self.world_num_heads != 0):
+            self.world_num_heads = 1
+        state_dim = int(_cfg_get(action_config, "state_dim", 0) or 0)
+        self.world_task_proj = nn.Linear(self.input_embedding_dim, self.world_hidden_dim)
+        self.world_action_proj = nn.Linear(self.action_dim, self.world_hidden_dim)
+        self.world_state_proj = nn.Linear(state_dim, self.world_hidden_dim) if state_dim > 0 else None
+        world_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.world_hidden_dim,
+            nhead=self.world_num_heads,
+            dim_feedforward=self.world_hidden_dim * 4,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+        )
+        self.world_predictor = nn.TransformerEncoder(world_encoder_layer, num_layers=self.world_num_layers)
+        self.world_delta_head = nn.Sequential(
+            nn.LayerNorm(self.world_hidden_dim),
+            nn.Linear(self.world_hidden_dim, self.world_hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.world_hidden_dim, self.input_embedding_dim),
+        )
+        self.residual_proj = nn.Linear(self.input_embedding_dim, self.world_hidden_dim)
+        self.temb_proj = nn.Linear(self.input_embedding_dim, self.world_hidden_dim)
+        self.drift_head = nn.Sequential(
+            nn.LayerNorm(self.world_hidden_dim * 2),
+            nn.Linear(self.world_hidden_dim * 2, self.world_hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.world_hidden_dim, self.action_dim),
+        )
+        self.geo_weight_diag = nn.Parameter(torch.ones(self.input_embedding_dim))
+
+        self.loss_w_fm = float(_cfg_get(action_config, "loss_w_fm", 1.0))
+        self.loss_w_dyn = float(_cfg_get(action_config, "loss_w_dyn", 0.2))
+        self.loss_w_geo = float(_cfg_get(action_config, "loss_w_geo", 0.1))
+        self.loss_w_reg = float(_cfg_get(action_config, "loss_w_reg", 1e-3))
+        self.drift_eta = float(_cfg_get(action_config, "drift_eta", 0.2))
+        self.rrr_threshold = float(_cfg_get(action_config, "rrr_replan_threshold", 2.5))
+        self.rrr_eps = float(_cfg_get(action_config, "rrr_eps", 1e-4))
+        self.rrr_max_replans = int(_cfg_get(action_config, "rrr_max_replans", 1))
+
+        world_modules = [
+            self.world_task_proj,
+            self.world_action_proj,
+            self.world_predictor,
+            self.world_delta_head,
+            self.residual_proj,
+            self.temb_proj,
+            self.drift_head,
+        ]
+        if self.world_state_proj is not None:
+            world_modules.append(self.world_state_proj)
+        world_params = sum(p.numel() for module in world_modules for p in module.parameters())
+        self.world_predictor_param_count = int(world_params)
+        if world_params > self.world_max_params:
+            logger.warning(
+                "WorldPredictor parameter budget exceeded: params=%d > max=%d",
+                world_params,
+                self.world_max_params,
+            )
         logger.info(
-            "LayerwiseFMActionHead initialized: use_concat_cross_context=%s, cross_attention_assert_inputs=%s, cross_attention_debug_log_interval=%d",
+            "LayerwiseFMActionHead initialized: use_concat_cross_context=%s, cross_attention_assert_inputs=%s, cross_attention_debug_log_interval=%d, world_params=%d",
             self.use_concat_cross_context,
             self.cross_attention_assert_inputs,
             self.cross_attention_debug_log_interval,
+            self.world_predictor_param_count,
         )
 
     def sample_time(self, batch_size, device, dtype):
@@ -385,6 +455,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         vl_embs_list,
         temb,
         encoder_attention_mask=None,
+        task_tokens: Optional[torch.Tensor] = None,
         log_context="train",
     ):
         """
@@ -424,6 +495,16 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             else:
                 cross_context = vl_embs_list[layer_idx]
                 layer_encoder_attention_mask = encoder_attention_mask
+            if self.use_task_token_context and isinstance(task_tokens, torch.Tensor):
+                task_context = task_tokens.to(device=saction_embs.device, dtype=saction_embs.dtype)
+                cross_context = torch.cat((cross_context, task_context), dim=1)
+                if isinstance(layer_encoder_attention_mask, torch.Tensor):
+                    task_mask = torch.ones(
+                        task_context.shape[:2],
+                        dtype=torch.bool,
+                        device=task_context.device,
+                    )
+                    layer_encoder_attention_mask = torch.cat((layer_encoder_attention_mask, task_mask), dim=1)
             hidden_states = layer(
                 hidden_states=hidden_states,
                 encoder_hidden_states=cross_context,
@@ -456,12 +537,137 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         pred_velocity = pred[:, -actions_length:]
         return pred_velocity
 
+    def _normalize_task_tokens(
+        self,
+        task_tokens: Optional[torch.Tensor],
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if not isinstance(task_tokens, torch.Tensor):
+            return None
+        if task_tokens.ndim != 3:
+            raise ValueError(f"`task_tokens` must be [B, Ns, D], got shape={tuple(task_tokens.shape)}")
+        if task_tokens.shape[0] != batch_size:
+            raise ValueError(
+                f"`task_tokens` batch mismatch: got B={task_tokens.shape[0]}, expected B={batch_size}"
+            )
+        out = task_tokens.to(device=device, dtype=dtype)
+        if out.shape[1] > self.num_task_tokens:
+            out = out[:, : self.num_task_tokens]
+        return out
+
+    def _predict_next_task_tokens(
+        self,
+        task_tokens: Optional[torch.Tensor],
+        action_context: torch.Tensor,
+        state_context: Optional[torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if task_tokens is None:
+            return None, None
+        projected_task = self.world_task_proj(task_tokens)
+        world_tokens = [self.world_action_proj(action_context).unsqueeze(1)]
+        if self.world_state_proj is not None and isinstance(state_context, torch.Tensor):
+            state_token = state_context
+            if state_token.ndim == 3:
+                state_token = state_token[:, -1, :]
+            world_tokens.append(self.world_state_proj(state_token).unsqueeze(1))
+        world_tokens.append(projected_task)
+        world_input = torch.cat(world_tokens, dim=1)
+        num_prefix = len(world_tokens) - 1
+        world_out = self.world_predictor(world_input)
+        task_out = world_out[:, num_prefix:, :]
+        delta_task = self.world_delta_head(task_out)
+        pred_next_task = task_tokens + delta_task
+        return pred_next_task, delta_task
+
+    def _compute_world_guidance(
+        self,
+        task_tokens: Optional[torch.Tensor],
+        action_sequence: torch.Tensor,
+        state_context: Optional[torch.Tensor],
+        temb: torch.Tensor,
+        timestep_bucket: torch.Tensor,
+        observed_next_task_tokens: Optional[torch.Tensor] = None,
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        if task_tokens is None:
+            zeros_b = action_sequence.new_zeros((action_sequence.shape[0], action_sequence.shape[1], self.action_dim))
+            return {
+                "drift": zeros_b,
+                "pred_next_task_tokens": None,
+                "loss_dyn": action_sequence.new_tensor(0.0),
+                "loss_geo": action_sequence.new_tensor(0.0),
+                "loss_reg": action_sequence.new_tensor(0.0),
+                "rrr": action_sequence.new_zeros((action_sequence.shape[0],)),
+                "expected_change": action_sequence.new_zeros((action_sequence.shape[0],)),
+            }
+
+        action_context = action_sequence[:, 0, :]
+        pred_next_task, _ = self._predict_next_task_tokens(
+            task_tokens=task_tokens,
+            action_context=action_context,
+            state_context=state_context,
+        )
+        if pred_next_task is None:
+            zeros_b = action_sequence.new_zeros((action_sequence.shape[0], action_sequence.shape[1], self.action_dim))
+            return {
+                "drift": zeros_b,
+                "pred_next_task_tokens": None,
+                "loss_dyn": action_sequence.new_tensor(0.0),
+                "loss_geo": action_sequence.new_tensor(0.0),
+                "loss_reg": action_sequence.new_tensor(0.0),
+                "rrr": action_sequence.new_zeros((action_sequence.shape[0],)),
+                "expected_change": action_sequence.new_zeros((action_sequence.shape[0],)),
+            }
+
+        if isinstance(observed_next_task_tokens, torch.Tensor):
+            target_next = observed_next_task_tokens.to(device=pred_next_task.device, dtype=pred_next_task.dtype)
+            if target_next.shape[1] != pred_next_task.shape[1]:
+                target_next = target_next[:, : pred_next_task.shape[1]]
+        else:
+            target_next = task_tokens.detach()
+
+        delta_z = target_next - pred_next_task
+        pooled_residual = delta_z.mean(dim=1)
+        geo_weight = F.softplus(self.geo_weight_diag).to(device=pooled_residual.device, dtype=pooled_residual.dtype)
+        loss_dyn = F.mse_loss(pred_next_task, target_next)
+        loss_geo = 0.5 * ((pooled_residual * geo_weight) * pooled_residual).sum(dim=-1).mean()
+
+        drift_input = torch.cat(
+            [
+                self.residual_proj(pooled_residual),
+                self.temb_proj(temb),
+            ],
+            dim=-1,
+        )
+        drift_base = self.drift_head(drift_input).unsqueeze(1).expand(-1, action_sequence.shape[1], -1)
+        t_ratio = timestep_bucket.float() / float(max(1, self.num_timestep_buckets))
+        eta = (self.drift_eta * (1.0 - t_ratio)).clamp(min=0.0).view(-1, 1, 1)
+        drift = eta * drift_base
+        loss_reg = drift.pow(2).mean()
+
+        expected_change = (pred_next_task - task_tokens).norm(dim=-1).mean(dim=-1)
+        residual_norm = delta_z.norm(dim=-1).mean(dim=-1)
+        rrr = residual_norm / expected_change.clamp_min(self.rrr_eps)
+
+        return {
+            "drift": drift,
+            "pred_next_task_tokens": pred_next_task,
+            "loss_dyn": loss_dyn,
+            "loss_geo": loss_geo,
+            "loss_reg": loss_reg,
+            "rrr": rrr,
+            "expected_change": expected_change,
+        }
+
     def forward(
         self,
         vl_embs_list: list,
         actions: torch.Tensor,
         state: torch.Tensor = None,
         encoder_attention_mask: torch.Tensor = None,
+        task_tokens: Optional[torch.Tensor] = None,
+        task_tokens_next: Optional[torch.Tensor] = None,
     ):
         """
         vl_embs: list of torch.Tensor, each shape (B, seq_length, feature_dim)
@@ -495,18 +701,62 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         future_tokens = self.future_tokens.weight.unsqueeze(0).expand(B, -1, -1)
         sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1) \
             if state_features is not None else torch.cat((future_tokens, action_features), dim=1)
-        
+        task_tokens = self._normalize_task_tokens(
+            task_tokens=task_tokens,
+            batch_size=B,
+            device=device,
+            dtype=sa_embs.dtype,
+        )
+        task_tokens_next = self._normalize_task_tokens(
+            task_tokens=task_tokens_next,
+            batch_size=B,
+            device=device,
+            dtype=sa_embs.dtype,
+        )
         temb = self.model.timestep_encoder(t_discretized)
         hidden_states = self._apply_layerwise_cross_attention(
             sa_embs,
             vl_embs_list,
             temb,
             encoder_attention_mask=encoder_attention_mask,
+            task_tokens=task_tokens,
             log_context="train",
         )
         pred_velocity = self._process_output(hidden_states, temb, actions.shape[1])
-        loss = ((pred_velocity - velocity) ** 2).mean()
-        return loss
+        world_guidance = self._compute_world_guidance(
+            task_tokens=task_tokens,
+            action_sequence=noisy_trajectory,
+            state_context=state,
+            temb=temb,
+            timestep_bucket=t_discretized,
+            observed_next_task_tokens=task_tokens_next,
+        )
+        drift = world_guidance["drift"]
+        if isinstance(drift, torch.Tensor):
+            pred_velocity = pred_velocity + drift
+        loss_cfm = ((pred_velocity - velocity) ** 2).mean()
+        loss_dyn = world_guidance["loss_dyn"]
+        loss_geo = world_guidance["loss_geo"]
+        loss_reg = world_guidance["loss_reg"]
+        total_loss = (
+            self.loss_w_fm * loss_cfm
+            + self.loss_w_dyn * loss_dyn
+            + self.loss_w_geo * loss_geo
+            + self.loss_w_reg * loss_reg
+        )
+        self._last_loss_breakdown = {
+            "loss_cfm": float(loss_cfm.detach().item()),
+            "loss_dyn": float(loss_dyn.detach().item()),
+            "loss_geo": float(loss_geo.detach().item()),
+            "loss_reg": float(loss_reg.detach().item()),
+            "loss_total": float(total_loss.detach().item()),
+            "world_predictor_params": float(self.world_predictor_param_count),
+        }
+        rrr = world_guidance.get("rrr")
+        if isinstance(rrr, torch.Tensor) and rrr.numel() > 0:
+            self._last_rrr = float(rrr.detach().mean().item())
+            self._last_loss_breakdown["rrr_mean"] = self._last_rrr
+        return total_loss
 
     @torch.no_grad()
     def predict_action(
@@ -515,6 +765,10 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         state: torch.Tensor = None,
         noise_seed: int = None,
         encoder_attention_mask: torch.Tensor = None,
+        task_tokens: Optional[torch.Tensor] = None,
+        force_replan: bool = False,
+        rrr_threshold: Optional[float] = None,
+        return_info: bool = False,
     ) -> torch.Tensor:
         # Set initial actions as the sampled noise.
         batch_size = vl_embs_list[0].shape[0]
@@ -546,8 +800,19 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         dt = 1.0 / num_steps
 
         state_features = self.state_encoder(state) if state is not None else None
-
-        for t in range(num_steps):
+        threshold = float(self.rrr_threshold if rrr_threshold is None else rrr_threshold)
+        task_tokens = self._normalize_task_tokens(
+            task_tokens=task_tokens,
+            batch_size=batch_size,
+            device=device,
+            dtype=vl_embs_list[0].dtype,
+        )
+        replans = 0
+        t = 0
+        predicted_task_tokens = None
+        expected_change = None
+        rrr_trace = []
+        while t < num_steps:
             t_cont = t / float(num_steps)
             t_discretized_int = int(t_cont * self.num_timestep_buckets)
             timesteps_tensor = torch.full(
@@ -576,11 +841,56 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 vl_embs_list,
                 temb,
                 encoder_attention_mask=encoder_attention_mask,
+                task_tokens=task_tokens,
                 log_context="infer",
             )
             pred_velocity = self._process_output(hidden_states, temb, self.action_horizon)
+            world_guidance = self._compute_world_guidance(
+                task_tokens=task_tokens,
+                action_sequence=actions,
+                state_context=state,
+                temb=temb,
+                timestep_bucket=timesteps_tensor,
+                observed_next_task_tokens=task_tokens,
+            )
+            drift = world_guidance["drift"]
+            if isinstance(drift, torch.Tensor):
+                pred_velocity = pred_velocity + drift
+            rrr = world_guidance.get("rrr")
+            if isinstance(rrr, torch.Tensor) and rrr.numel() > 0:
+                rrr_mean = float(rrr.detach().mean().item())
+                rrr_trace.append(rrr_mean)
+                self._last_rrr = rrr_mean
+                if (force_replan or rrr_mean > threshold) and replans < self.rrr_max_replans:
+                    replans += 1
+                    if generator is None:
+                        actions = torch.randn_like(actions)
+                    else:
+                        actions = torch.randn(
+                            size=actions.shape,
+                            dtype=actions.dtype,
+                            device=actions.device,
+                            generator=generator,
+                        )
+                    t = 0
+                    force_replan = False
+                    continue
+            predicted_task_tokens = world_guidance.get("pred_next_task_tokens")
+            expected_change = world_guidance.get("expected_change")
             actions = actions + dt * pred_velocity
-        return actions
+            t += 1
+
+        if not return_info:
+            return actions
+        info = {
+            "rrr_last": float(rrr_trace[-1]) if len(rrr_trace) > 0 else None,
+            "rrr_max": float(max(rrr_trace)) if len(rrr_trace) > 0 else None,
+            "rrr_trace": rrr_trace,
+            "replan_count": int(replans),
+            "predicted_task_tokens": predicted_task_tokens.detach() if isinstance(predicted_task_tokens, torch.Tensor) else None,
+            "expected_change": expected_change.detach() if isinstance(expected_change, torch.Tensor) else None,
+        }
+        return actions, info
 
     @property
     def device(self):

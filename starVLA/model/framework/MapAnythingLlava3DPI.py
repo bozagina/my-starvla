@@ -50,6 +50,13 @@ class MapAnythingLlava3D_PI(baseframework):
         self.past_action_window_size = config.framework.action_model.past_action_window_size
         self.chunk_len = self.past_action_window_size + 1 + self.future_action_window_size
         self.vlm_use_cache = False
+        self.rrr_replan_threshold = float(
+            getattr(self.config.framework.action_model, "rrr_replan_threshold", 2.5)
+        )
+        self.rrr_eps = float(getattr(self.config.framework.action_model, "rrr_eps", 1e-4))
+        self._rrr_prev_observed_task_tokens = None
+        self._rrr_prev_predicted_task_tokens = None
+        self._rrr_prev_expected_change = None
         self._configure_memory_optimizations()
 
     @staticmethod
@@ -172,6 +179,9 @@ class MapAnythingLlava3D_PI(baseframework):
             if self.normalize_vl_hidden:
                 vl_embs_list = [F.layer_norm(h, h.shape[-1:]) for h in vl_embs_list]
             base_hidden = vl_embs_list[-1]
+            task_tokens = getattr(vlm_outputs, "task_hidden_states", None)
+            if isinstance(task_tokens, torch.Tensor):
+                task_tokens = task_tokens.to(device=base_hidden.device, dtype=base_hidden.dtype)
             attention_mask = vlm_inputs.get("attention_mask", None)
             if isinstance(attention_mask, torch.Tensor):
                 attention_mask = attention_mask.to(device=base_hidden.device)
@@ -247,6 +257,9 @@ class MapAnythingLlava3D_PI(baseframework):
             repeated_diffusion_steps = max(1, repeated_diffusion_steps)
             actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
             vl_embs_list_repeated = [h.repeat(repeated_diffusion_steps, 1, 1) for h in vl_embs_list]
+            task_tokens_repeated = None
+            if isinstance(task_tokens, torch.Tensor):
+                task_tokens_repeated = task_tokens.repeat(repeated_diffusion_steps, 1, 1)
             attention_mask_repeated = None
             if isinstance(attention_mask, torch.Tensor):
                 attention_mask_repeated = attention_mask.repeat(repeated_diffusion_steps, 1)
@@ -263,16 +276,21 @@ class MapAnythingLlava3D_PI(baseframework):
                 actions_target_repeated,
                 state_repeated,
                 encoder_attention_mask=attention_mask_repeated,
+                task_tokens=task_tokens_repeated,
             )
             try:
                 layer_means = getattr(self.action_model, "_last_dit_layer_means", None)
                 layer_vars = getattr(self.action_model, "_last_dit_layer_vars", None)
+                loss_breakdown = getattr(self.action_model, "_last_loss_breakdown", None)
                 if layer_means is not None:
                     for idx, m in enumerate(layer_means):
                         debug_metrics[f"debug/dit_layer/{idx}_mean"] = float(m)
                 if layer_vars is not None:
                     for idx, v in enumerate(layer_vars):
                         debug_metrics[f"debug/dit_layer/{idx}_var"] = float(v)
+                if isinstance(loss_breakdown, dict):
+                    for k, v in loss_breakdown.items():
+                        debug_metrics[f"debug/sagr/{k}"] = float(v)
             except Exception:
                 debug_metrics = debug_metrics
 
@@ -325,6 +343,46 @@ class MapAnythingLlava3D_PI(baseframework):
             if self.normalize_vl_hidden:
                 vl_embs_list = [F.layer_norm(h, h.shape[-1:]) for h in vl_embs_list]
             base_hidden = vl_embs_list[-1]
+            task_tokens = getattr(vlm_outputs, "task_hidden_states", None)
+            if isinstance(task_tokens, torch.Tensor):
+                task_tokens = task_tokens.to(device=base_hidden.device, dtype=base_hidden.dtype)
+            force_replan = False
+            rrr_entry = None
+            if (
+                isinstance(task_tokens, torch.Tensor)
+                and isinstance(self._rrr_prev_predicted_task_tokens, torch.Tensor)
+                and isinstance(self._rrr_prev_observed_task_tokens, torch.Tensor)
+            ):
+                prev_pred = self._rrr_prev_predicted_task_tokens.to(
+                    device=task_tokens.device,
+                    dtype=task_tokens.dtype,
+                )
+                prev_obs = self._rrr_prev_observed_task_tokens.to(
+                    device=task_tokens.device,
+                    dtype=task_tokens.dtype,
+                )
+                token_n = min(task_tokens.shape[1], prev_pred.shape[1], prev_obs.shape[1])
+                if token_n > 0:
+                    curr_task = task_tokens[:, :token_n]
+                    pred_task = prev_pred[:, :token_n]
+                    obs_task = prev_obs[:, :token_n]
+                    residual = curr_task - pred_task
+                    residual_norm = residual.norm(dim=-1).mean(dim=-1)
+                    expected_change = self._rrr_prev_expected_change
+                    if isinstance(expected_change, torch.Tensor):
+                        expected_change = expected_change.to(
+                            device=task_tokens.device,
+                            dtype=task_tokens.dtype,
+                        )
+                        if expected_change.ndim == 0:
+                            expected_change = expected_change.expand_as(residual_norm)
+                        elif expected_change.shape[0] != residual_norm.shape[0]:
+                            expected_change = expected_change.mean().expand_as(residual_norm)
+                    else:
+                        expected_change = (pred_task - obs_task).norm(dim=-1).mean(dim=-1)
+                    rrr_tensor = residual_norm / expected_change.clamp_min(self.rrr_eps)
+                    rrr_entry = float(rrr_tensor.mean().item())
+                    force_replan = bool(rrr_entry > self.rrr_replan_threshold)
             if return_debug_info:
                 debug_info = {
                     "deterministic_seed": deterministic_seed,
@@ -332,6 +390,9 @@ class MapAnythingLlava3D_PI(baseframework):
                     "vl_layer_selection": str(self.vl_layer_selection),
                     "selected_vl_layer_indices": [int(i) for i in indices],
                     "vl_num_selected_layers": int(len(vl_embs_list)),
+                    "rrr_threshold": float(self.rrr_replan_threshold),
+                    "rrr_entry": rrr_entry,
+                    "rrr_force_replan": bool(force_replan),
                 }
                 tokenizer = None
                 processor = None
@@ -777,12 +838,30 @@ class MapAnythingLlava3D_PI(baseframework):
             attention_mask = attention_mask.to(device=base_hidden.device)
 
         with torch.autocast("cuda", dtype=torch.float32):
-            pred_actions = self.action_model.predict_action(
+            pred_action_output = self.action_model.predict_action(
                 vl_embs_list,
                 state_tensor,
                 noise_seed=deterministic_seed,
                 encoder_attention_mask=attention_mask,
+                task_tokens=task_tokens,
+                force_replan=force_replan,
+                rrr_threshold=self.rrr_replan_threshold,
+                return_info=True,
             )
+            if isinstance(pred_action_output, tuple):
+                pred_actions, planning_info = pred_action_output
+            else:
+                pred_actions = pred_action_output
+                planning_info = {}
+
+        if isinstance(task_tokens, torch.Tensor):
+            self._rrr_prev_observed_task_tokens = task_tokens.detach()
+        pred_task_tokens = planning_info.get("predicted_task_tokens", None) if isinstance(planning_info, dict) else None
+        if isinstance(pred_task_tokens, torch.Tensor):
+            self._rrr_prev_predicted_task_tokens = pred_task_tokens.detach()
+        expected_change = planning_info.get("expected_change", None) if isinstance(planning_info, dict) else None
+        if isinstance(expected_change, torch.Tensor):
+            self._rrr_prev_expected_change = expected_change.detach()
 
         normalized_actions = pred_actions.detach().cpu().numpy()
         output = {"normalized_actions": normalized_actions}
@@ -800,6 +879,11 @@ class MapAnythingLlava3D_PI(baseframework):
                 debug_info["dit_layer_means"] = [float(x) for x in layer_means]
             if layer_vars is not None:
                 debug_info["dit_layer_vars"] = [float(x) for x in layer_vars]
+            if isinstance(planning_info, dict):
+                debug_info["rrr_last"] = planning_info.get("rrr_last")
+                debug_info["rrr_max"] = planning_info.get("rrr_max")
+                debug_info["rrr_trace"] = planning_info.get("rrr_trace")
+                debug_info["rrr_replan_count"] = planning_info.get("replan_count")
             output["debug_info"] = debug_info
         return output
 
