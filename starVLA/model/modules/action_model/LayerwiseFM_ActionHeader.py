@@ -527,7 +527,10 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             raise ValueError(
                 f"Mask batch mismatch: values.shape[0]={values.shape[0]}, mask.shape[0]={mask.shape[0]}"
             )
-        mask = mask.to(device=values.device, dtype=values.dtype).clamp_(0.0, 1.0)
+        # Important: avoid in-place ops on mask because the same mask can be
+        # reused across multiple loss branches in one forward pass, which can
+        # break autograd version tracking.
+        mask = mask.to(device=values.device, dtype=values.dtype).clamp(0.0, 1.0)
         denom = mask.sum()
         if float(denom.item()) <= 0.0:
             return values.new_tensor(0.0)
@@ -761,7 +764,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 raise ValueError(
                     f"`valid_tk_mask` batch mismatch: got {mask.shape[0]}, expected {pred_next_task.shape[0]}"
                 )
-            mask = mask.clamp_(0.0, 1.0)
+            mask = mask.clamp(0.0, 1.0)
 
         delta_z = target_next - pred_next_task
         pooled_residual = delta_z.mean(dim=1)
@@ -839,7 +842,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
 
         # Convert (continuous) t -> discrete if needed
         t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
-        t_discretized = t_discretized.clamp_(0, max(self.num_timestep_buckets - 1, 0))
+        t_discretized = t_discretized.clamp(0, max(self.num_timestep_buckets - 1, 0))
         action_features = self.action_encoder(noisy_trajectory, t_discretized)
         self._record_health("forward/action_features", action_features)
 
@@ -878,7 +881,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 raise ValueError(
                     f"`valid_tk` batch mismatch: got {valid_tk_mask.shape[0]}, expected {B}"
                 )
-            valid_tk_mask = valid_tk_mask.clamp_(0.0, 1.0)
+            valid_tk_mask = valid_tk_mask.clamp(0.0, 1.0)
         self._record_health("forward/sa_embs", sa_embs)
         self._record_health("forward/task_tokens", task_tokens) if isinstance(task_tokens, torch.Tensor) else None
         self._record_health("forward/task_tokens_next", task_tokens_next) if isinstance(task_tokens_next, torch.Tensor) else None

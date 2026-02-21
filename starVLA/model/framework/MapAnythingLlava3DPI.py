@@ -218,7 +218,7 @@ class MapAnythingLlava3D_PI(baseframework):
                 valid_tk_values,
                 device=base_hidden.device,
                 dtype=base_hidden.dtype,
-            ).clamp_(0.0, 1.0)
+            ).clamp(0.0, 1.0)
             debug_metrics = {}
             try:
                 try:
