@@ -40,6 +40,32 @@ def _has_prefix(state_dict: dict, prefix: str) -> bool:
             return True
     return False
 
+
+def _prefix_keys(state_dict: dict, prefix: str) -> list[str]:
+    return [k for k in state_dict.keys() if k.startswith(prefix)]
+
+
+def _assert_prefix_tensors_finite(state_dict: dict, prefixes: list[str]) -> None:
+    bad_entries = []
+    for prefix in prefixes:
+        keys = _prefix_keys(state_dict, prefix)
+        if not keys:
+            bad_entries.append((prefix, "__missing__", 0.0))
+            continue
+        for key in keys:
+            value = state_dict[key]
+            if not isinstance(value, torch.Tensor):
+                continue
+            finite_ratio = float(torch.isfinite(value.detach().float()).float().mean().item())
+            if finite_ratio < 1.0:
+                bad_entries.append((prefix, key, finite_ratio))
+    if bad_entries:
+        head = bad_entries[:20]
+        raise RuntimeError(
+            "Detected missing/non-finite tensors in critical prefixes: "
+            f"{head} (total={len(bad_entries)})"
+        )
+
 def _remap_layerscale_weights(state_dict: dict) -> int:
     to_add = {}
     to_del = []
@@ -186,10 +212,26 @@ def build_base_checkpoint(args) -> None:
         "geometric_model",
         "geometric_projector",
         "fusion_projector",
+        "semantic_anchor_attention",
+        "semantic_anchor_norm",
+        "vision_semantic_attention",
     ]
     missing = [p for p in required_prefixes if not _has_prefix(state_dict, p)]
     if missing:
         raise RuntimeError(f"Missing parameter groups in assembled model: {missing}")
+
+    semantic_prefixes = [
+        "semantic_anchor_attention",
+        "semantic_anchor_norm",
+        "vision_semantic_attention",
+    ]
+    semantic_param_count = 0
+    for prefix in semantic_prefixes:
+        semantic_param_count += len(_prefix_keys(state_dict, prefix))
+    if semantic_param_count == 0:
+        raise RuntimeError("No semantic-attention parameters found in assembled state_dict.")
+    _assert_prefix_tensors_finite(state_dict, semantic_prefixes)
+    print(f"OK: semantic-attention tensors are present and finite (num_tensors={semantic_param_count}).")
     print("OK: assembled model contains all required parameter groups.")
 
     model.save_pretrained(
