@@ -243,6 +243,17 @@ def _build_mapanything_from_local_config(model_id: str) -> nn.Module:
             f"model_id={model_id}, top_level_keys={list(cfg.keys())[:30]}"
         )
 
+    init_kwargs = dict(init_kwargs)
+    # IMPORTANT:
+    # In outer VLM unified loading flow, MapAnything must NOT try loading its own
+    # pretrained checkpoint in __init__, otherwise it can hit meta no-op loads.
+    if "pretrained_checkpoint_path" in init_kwargs:
+        init_kwargs["pretrained_checkpoint_path"] = None
+    if "load_specific_pretrained_submodules" in init_kwargs:
+        init_kwargs["load_specific_pretrained_submodules"] = False
+    if "specific_pretrained_submodules" in init_kwargs:
+        init_kwargs["specific_pretrained_submodules"] = None
+
     return MapAnything(**init_kwargs)
 
 
