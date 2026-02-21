@@ -58,6 +58,17 @@ def _suspend_meta_device():
             torch.set_default_device(str(prev_device))
 
 
+@contextmanager
+def _force_cpu_device():
+    """Force module construction on CPU even if outer context sets a meta device."""
+    try:
+        with torch.device("cpu"):
+            yield
+    except Exception:
+        # Fallback for environments where torch.device context manager is unavailable.
+        yield
+
+
 def _meta_tensor_summary(module: nn.Module, max_items: int = 20) -> Tuple[int, int, list, list]:
     meta_params = []
     meta_buffers = []
@@ -70,11 +81,44 @@ def _meta_tensor_summary(module: nn.Module, max_items: int = 20) -> Tuple[int, i
     return len(meta_params), len(meta_buffers), meta_params[:max_items], meta_buffers[:max_items]
 
 
+def _load_mapanything_with_meta_recovery(model_id: str) -> nn.Module:
+    """
+    Load MapAnything weights robustly under distributed/meta-init environments.
+    Retry with explicit CPU device scope if first attempt still leaves meta tensors.
+    """
+    attempts = [
+        ("default", False),
+        ("force_cpu", True),
+    ]
+    last_issue = None
+    for tag, force_cpu in attempts:
+        try:
+            with _suspend_meta_device():
+                if force_cpu:
+                    with _force_cpu_device():
+                        model = MapAnything.from_pretrained(model_id)
+                else:
+                    model = MapAnything.from_pretrained(model_id)
+            meta_p_cnt, meta_b_cnt, _, _ = _meta_tensor_summary(model)
+            if meta_p_cnt == 0 and meta_b_cnt == 0:
+                return model
+            last_issue = (
+                f"attempt={tag}, meta_params_count={meta_p_cnt}, meta_buffers_count={meta_b_cnt}"
+            )
+        except Exception as exc:
+            last_issue = f"attempt={tag}, error={exc}"
+    raise RuntimeError(
+        "MapAnything load failed to materialize parameters after retry. "
+        f"model_id={model_id}, last_issue={last_issue}"
+    )
+
+
 class MapAnythingWrapper(nn.Module):
     def __init__(self, config):
         super().__init__()
-        with _suspend_meta_device():
-            self.map_anything_model = MapAnything.from_pretrained(config.mapanything_model_name_or_path)
+        self.map_anything_model = _load_mapanything_with_meta_recovery(
+            config.mapanything_model_name_or_path
+        )
         meta_p_cnt, meta_b_cnt, meta_p_head, meta_b_head = _meta_tensor_summary(self.map_anything_model)
         if meta_p_cnt > 0 or meta_b_cnt > 0:
             raise RuntimeError(
