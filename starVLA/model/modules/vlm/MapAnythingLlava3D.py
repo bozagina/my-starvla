@@ -122,6 +122,7 @@ class _MapAnythingLlava3D_Interface(nn.Module):
                         low_cpu_mem_usage=False,
                         device_map=None,
                         skip_language_model_preload=True,
+                        skip_geometric_model_preload=True,
                     )
                 mapanything_cfg = model.config
                 mapanything_cfg.prefix_image_dropout_prob = prefix_image_dropout_prob

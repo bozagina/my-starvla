@@ -59,6 +59,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
         mapanything_model=None,
         projector_model=None,
         skip_language_model_preload: bool = False,
+        skip_geometric_model_preload: bool = False,
     ):
         super().__init__(config)
 
@@ -81,7 +82,10 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
         if mapanything_model is not None:
             self.geometric_model = mapanything_model
         else:
-            self.geometric_model = MapAnythingWrapper(config)
+            self.geometric_model = MapAnythingWrapper(
+                config,
+                load_pretrained=not skip_geometric_model_preload,
+            )
 
         self.hidden_size = config.hidden_size
         self.vision_hidden_size = config.vision_config.hidden_size
