@@ -422,13 +422,16 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
             average_attn_weights=False,
         )
         self._record_health("fusion/semantic_attn_out", semantic_attn_out)
+        self._record_health("fusion/semantic_attn_weights", semantic_attn_weights)
         semantic_attn_out = self.semantic_anchor_norm(semantic_attn_out + semantic_query)
+        self._record_health("fusion/semantic_attn_out_post_norm", semantic_attn_out)
         if semantic_attn_weights.dim() == 4:
             # [B, H, Nq, Ng] -> [B, Ng]
             token_scores = semantic_attn_weights.mean(dim=(1, 2))
         else:
             # [B, Nq, Ng] -> [B, Ng]
             token_scores = semantic_attn_weights.mean(dim=1)
+        self._record_health("fusion/token_scores", token_scores)
         topk_num = min(max(1, self.semantic_topk_tokens), geometric_features.shape[1])
         topk_indices = torch.topk(token_scores, k=topk_num, dim=-1).indices
         gather_idx = topk_indices.unsqueeze(-1).expand(-1, -1, geometric_features.shape[-1])
