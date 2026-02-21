@@ -1,5 +1,6 @@
 # coding=utf-8
 import copy
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -126,6 +127,13 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
         self.debug_health_trace_max_len = int(getattr(config, "debug_health_trace_max_len", 128))
         self.debug_health_trace: List[Dict[str, Any]] = []
         self.debug_first_nonfinite_stage: Optional[str] = None
+        self.debug_first_nonfinite_record: Optional[Dict[str, float]] = None
+        self.debug_shape_log_interval = int(getattr(config, "debug_shape_log_interval", 0))
+        self._debug_shape_log_counter = 0
+        self.debug_timing_enabled = bool(getattr(config, "debug_timing_enabled", True))
+        self.debug_timing_cuda_sync = bool(getattr(config, "debug_timing_cuda_sync", True))
+        self.debug_last_geom_model_forward_ms: float = 0.0
+        self.debug_last_geom_feature_extract_ms: float = 0.0
 
     def _infer_geom_dim(self) -> int:
         mam = getattr(self.geometric_model, "map_anything_model", None)
@@ -263,6 +271,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
     def _reset_health_trace(self):
         self.debug_health_trace = []
         self.debug_first_nonfinite_stage = None
+        self.debug_first_nonfinite_record = None
 
     def _record_health(self, stage: str, tensor: Optional[torch.Tensor]):
         if (not self.debug_health_trace_enabled) or (tensor is None) or (not isinstance(tensor, torch.Tensor)):
@@ -280,6 +289,38 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
             and float(record.get("finite_ratio", 1.0)) < 1.0
         ):
             self.debug_first_nonfinite_stage = str(stage)
+            self.debug_first_nonfinite_record = {
+                "stage": str(stage),
+                "finite_ratio": float(record.get("finite_ratio", 1.0)),
+                "nan_count": float(record.get("nan_count", 0.0)),
+                "inf_count": float(record.get("inf_count", 0.0)),
+                "absmax": float(record.get("absmax", 0.0)),
+            }
+
+    def _maybe_log_tensor_shape(self, tag: str, tensor: Optional[torch.Tensor]):
+        if self.debug_shape_log_interval <= 0:
+            return
+        if not isinstance(tensor, torch.Tensor):
+            return
+        self._debug_shape_log_counter += 1
+        if self._debug_shape_log_counter % self.debug_shape_log_interval != 0:
+            return
+        logger.info("[mapanything_llava3d] %s.shape=%s dtype=%s", tag, tuple(tensor.shape), tensor.dtype)
+
+    def _maybe_cuda_synchronize(self, tensor: Optional[torch.Tensor] = None):
+        if not self.debug_timing_enabled or not self.debug_timing_cuda_sync:
+            return
+        if not torch.cuda.is_available():
+            return
+        try:
+            if isinstance(tensor, torch.Tensor):
+                if tensor.device.type == "cuda":
+                    torch.cuda.synchronize(device=tensor.device)
+            else:
+                torch.cuda.synchronize()
+        except Exception:
+            # Timing must never break training.
+            pass
 
     def get_image_features(
         self,
@@ -336,8 +377,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
         self._record_health("vision_feats", vision_feats)
         if multi_view and vision_feats is not None:
             vision_feats = vision_feats.view(b, v * vision_feats.shape[1], vision_feats.shape[2])
-        if vision_feats is not None:
-            print(f"[mapanything_llava3d] vision_feats.shape: {tuple(vision_feats.shape)}")
+        self._maybe_log_tensor_shape("vision_feats", vision_feats)
 
         if self.training:
             p_img = getattr(self, "prefix_image_dropout_prob", 0.0)
@@ -353,6 +393,8 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
 
         use_geom = getattr(self.config, "use_geometric_branch", True)
         if not use_geom:
+            self.debug_last_geom_model_forward_ms = 0.0
+            self.debug_last_geom_feature_extract_ms = 0.0
             self._last_image_features = vision_feats
             if isinstance(vision_feats, torch.Tensor):
                 token_num = min(max(1, self.semantic_topk_tokens), vision_feats.shape[1])
@@ -373,14 +415,26 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
                 min_v = float(geom_pixel_values.detach().amin().item())
             if min_v < -0.05:
                 geom_pixel_values = (geom_pixel_values * 0.5 + 0.5).clamp(0.0, 1.0)
+        geom_extract_t0 = None
+        geom_forward_t1 = None
+        if self.debug_timing_enabled:
+            self._maybe_cuda_synchronize(geom_pixel_values if isinstance(geom_pixel_values, torch.Tensor) else None)
+            geom_extract_t0 = time.perf_counter()
         geometric_out = self.geometric_model(pixel_values=geom_pixel_values, intrinsics=intrinsic)
+        if self.debug_timing_enabled and geom_extract_t0 is not None:
+            self._maybe_cuda_synchronize(getattr(geometric_out, "last_hidden_state", None))
+            geom_forward_t1 = time.perf_counter()
+            self.debug_last_geom_model_forward_ms = float((geom_forward_t1 - geom_extract_t0) * 1000.0)
         geometric_features = geometric_out.last_hidden_state
         if geometric_features.dim() == 4:
             b, c, h, w = geometric_features.shape
             geometric_features = geometric_features.permute(0, 2, 3, 1).reshape(b, h * w, c)
+        if self.debug_timing_enabled and geom_extract_t0 is not None:
+            self._maybe_cuda_synchronize(geometric_features)
+            geom_extract_t1 = time.perf_counter()
+            self.debug_last_geom_feature_extract_ms = float((geom_extract_t1 - geom_extract_t0) * 1000.0)
         self._record_health("geometric_features", geometric_features)
-        
-        print(f"[mapanything_llava3d] geom_seq.shape: {tuple(geometric_features.shape)}")
+        self._maybe_log_tensor_shape("geom_seq", geometric_features)
 
         final_features, task_tokens = self.fusion_module(
             geometric_features,

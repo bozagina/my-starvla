@@ -3,6 +3,9 @@
 
 import os
 import sys
+from contextlib import contextmanager
+from typing import Optional, Tuple
+
 import torch
 import torch.nn as nn
 
@@ -21,10 +24,64 @@ from mapanything.models.mapanything.model import MapAnything
 from uniception.models.info_sharing.base import MultiViewTransformerInput
 
 
+def _get_default_device() -> Optional[torch.device]:
+    if hasattr(torch, "get_default_device"):
+        return torch.get_default_device()
+    if hasattr(torch, "_C") and hasattr(torch._C, "_get_default_device"):
+        return torch._C._get_default_device()
+    return None
+
+
+@contextmanager
+def _suspend_meta_device():
+    """Ensure checkpoint load does not run under meta-device init context."""
+    prev_device = _get_default_device()
+    reset_device = prev_device is not None and str(prev_device) == "meta"
+    try:
+        if reset_device and hasattr(torch, "set_default_device"):
+            torch.set_default_device("cpu")
+        try:
+            from accelerate.utils import init_empty_weights
+        except Exception:
+            init_empty_weights = None
+        prev_flag = None
+        if init_empty_weights is not None and hasattr(init_empty_weights, "_is_enabled"):
+            prev_flag = init_empty_weights._is_enabled
+            init_empty_weights._is_enabled = False
+        try:
+            yield
+        finally:
+            if prev_flag is not None:
+                init_empty_weights._is_enabled = prev_flag
+    finally:
+        if reset_device and hasattr(torch, "set_default_device"):
+            torch.set_default_device(str(prev_device))
+
+
+def _meta_tensor_summary(module: nn.Module, max_items: int = 20) -> Tuple[int, int, list, list]:
+    meta_params = []
+    meta_buffers = []
+    for name, p in module.named_parameters():
+        if getattr(p, "is_meta", False):
+            meta_params.append(name)
+    for name, b in module.named_buffers():
+        if getattr(b, "is_meta", False):
+            meta_buffers.append(name)
+    return len(meta_params), len(meta_buffers), meta_params[:max_items], meta_buffers[:max_items]
+
+
 class MapAnythingWrapper(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.map_anything_model = MapAnything.from_pretrained(config.mapanything_model_name_or_path)
+        with _suspend_meta_device():
+            self.map_anything_model = MapAnything.from_pretrained(config.mapanything_model_name_or_path)
+        meta_p_cnt, meta_b_cnt, meta_p_head, meta_b_head = _meta_tensor_summary(self.map_anything_model)
+        if meta_p_cnt > 0 or meta_b_cnt > 0:
+            raise RuntimeError(
+                "MapAnything loaded with meta tensors; checkpoint load likely became a no-op. "
+                f"meta_params_count={meta_p_cnt}, meta_buffers_count={meta_b_cnt}, "
+                f"meta_params_head={meta_p_head}, meta_buffers_head={meta_b_head}"
+            )
         enc_dim = getattr(self.map_anything_model.encoder, "enc_embed_dim", None)
         class _Cfg:
             pass

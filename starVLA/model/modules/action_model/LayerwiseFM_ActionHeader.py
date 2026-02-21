@@ -377,6 +377,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             )
         self._last_health_trace = []
         self._first_nonfinite_stage = None
+        self._first_nonfinite_record = None
         logger.info(
             "LayerwiseFMActionHead initialized: use_concat_cross_context=%s, cross_attention_assert_inputs=%s, cross_attention_debug_log_interval=%d, world_params=%d",
             self.use_concat_cross_context,
@@ -493,6 +494,13 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             and float(record.get("finite_ratio", 1.0)) < 1.0
         ):
             self._first_nonfinite_stage = str(stage)
+            self._first_nonfinite_record = {
+                "stage": str(stage),
+                "finite_ratio": float(record.get("finite_ratio", 1.0)),
+                "nan_count": float(record.get("nan_count", 0.0)),
+                "inf_count": float(record.get("inf_count", 0.0)),
+                "absmax": float(record.get("absmax", 0.0)),
+            }
 
     def _apply_layerwise_cross_attention(
         self,
@@ -724,6 +732,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         device = actions.device
         self._last_health_trace = []
         self._first_nonfinite_stage = None
+        self._first_nonfinite_record = None
         num_layers = len(vl_embs_list)
         B, L, D = vl_embs_list[0].shape
         self._record_health("forward/actions", actions)
@@ -839,6 +848,9 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         rrr_threshold: Optional[float] = None,
         return_info: bool = False,
     ) -> torch.Tensor:
+        self._last_health_trace = []
+        self._first_nonfinite_stage = None
+        self._first_nonfinite_record = None
         # Set initial actions as the sampled noise.
         batch_size = vl_embs_list[0].shape[0]
         device = vl_embs_list[0].device

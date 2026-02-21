@@ -230,6 +230,12 @@ class MapAnythingLlava3D_PI(baseframework):
                     debug_metrics = debug_metrics
                 vlm_core = getattr(self.mapanythingllava3d_vlm_interface, "model", None)
                 geom_stats = getattr(vlm_core, "geom_feature_stats", None)
+                geom_model_forward_ms = getattr(vlm_core, "debug_last_geom_model_forward_ms", None)
+                geom_feature_extract_ms = getattr(vlm_core, "debug_last_geom_feature_extract_ms", None)
+                if isinstance(geom_model_forward_ms, (int, float)):
+                    debug_metrics["debug/timing/geom_model_forward_ms"] = float(geom_model_forward_ms)
+                if isinstance(geom_feature_extract_ms, (int, float)):
+                    debug_metrics["debug/timing/geom_feature_extract_ms"] = float(geom_feature_extract_ms)
                 if isinstance(geom_stats, list) and geom_stats:
                     by_tag = {}
                     for record in reversed(geom_stats):
@@ -246,9 +252,40 @@ class MapAnythingLlava3D_PI(baseframework):
                         debug_metrics[f"{prefix}_max"] = float(rec.get("max", 0.0))
                 health_trace = getattr(vlm_core, "debug_health_trace", None)
                 first_nonfinite = getattr(vlm_core, "debug_first_nonfinite_stage", None)
+                first_nonfinite_record = getattr(vlm_core, "debug_first_nonfinite_record", None)
                 debug_metrics["debug/health/has_nonfinite"] = 1.0 if first_nonfinite else 0.0
+                debug_metrics["debug/health/first_nonfinite_present"] = (
+                    1.0 if isinstance(first_nonfinite_record, dict) else 0.0
+                )
+                if isinstance(first_nonfinite_record, dict):
+                    if "finite_ratio" in first_nonfinite_record:
+                        debug_metrics["debug/health/first_nonfinite_finite_ratio"] = float(
+                            first_nonfinite_record["finite_ratio"]
+                        )
+                    if "nan_count" in first_nonfinite_record:
+                        debug_metrics["debug/health/first_nonfinite_nan_count"] = float(
+                            first_nonfinite_record["nan_count"]
+                        )
+                    if "inf_count" in first_nonfinite_record:
+                        debug_metrics["debug/health/first_nonfinite_inf_count"] = float(
+                            first_nonfinite_record["inf_count"]
+                        )
+                    if "absmax" in first_nonfinite_record:
+                        debug_metrics["debug/health/first_nonfinite_absmax"] = float(
+                            first_nonfinite_record["absmax"]
+                        )
                 if isinstance(health_trace, list):
                     debug_metrics["debug/health/trace_len"] = float(len(health_trace))
+                    if first_nonfinite:
+                        first_idx = -1
+                        for idx, rec in enumerate(health_trace):
+                            if not isinstance(rec, dict):
+                                continue
+                            if str(rec.get("stage", "")) == str(first_nonfinite) and float(rec.get("finite_ratio", 1.0)) < 1.0:
+                                first_idx = idx
+                                break
+                        if first_idx >= 0:
+                            debug_metrics["debug/health/first_nonfinite_index"] = float(first_idx)
                     for local_idx, rec in enumerate(health_trace[-6:]):
                         if not isinstance(rec, dict):
                             continue
@@ -395,9 +432,40 @@ class MapAnythingLlava3D_PI(baseframework):
                         debug_metrics[f"debug/sagr/{k}"] = float(v)
                 action_health_trace = getattr(self.action_model, "_last_health_trace", None)
                 action_first_nonfinite = getattr(self.action_model, "_first_nonfinite_stage", None)
+                action_first_nonfinite_record = getattr(self.action_model, "_first_nonfinite_record", None)
                 debug_metrics["debug/action_health/has_nonfinite"] = 1.0 if action_first_nonfinite else 0.0
+                debug_metrics["debug/action_health/first_nonfinite_present"] = (
+                    1.0 if isinstance(action_first_nonfinite_record, dict) else 0.0
+                )
+                if isinstance(action_first_nonfinite_record, dict):
+                    if "finite_ratio" in action_first_nonfinite_record:
+                        debug_metrics["debug/action_health/first_nonfinite_finite_ratio"] = float(
+                            action_first_nonfinite_record["finite_ratio"]
+                        )
+                    if "nan_count" in action_first_nonfinite_record:
+                        debug_metrics["debug/action_health/first_nonfinite_nan_count"] = float(
+                            action_first_nonfinite_record["nan_count"]
+                        )
+                    if "inf_count" in action_first_nonfinite_record:
+                        debug_metrics["debug/action_health/first_nonfinite_inf_count"] = float(
+                            action_first_nonfinite_record["inf_count"]
+                        )
+                    if "absmax" in action_first_nonfinite_record:
+                        debug_metrics["debug/action_health/first_nonfinite_absmax"] = float(
+                            action_first_nonfinite_record["absmax"]
+                        )
                 if isinstance(action_health_trace, list):
                     debug_metrics["debug/action_health/trace_len"] = float(len(action_health_trace))
+                    if action_first_nonfinite:
+                        first_idx = -1
+                        for idx, rec in enumerate(action_health_trace):
+                            if not isinstance(rec, dict):
+                                continue
+                            if str(rec.get("stage", "")) == str(action_first_nonfinite) and float(rec.get("finite_ratio", 1.0)) < 1.0:
+                                first_idx = idx
+                                break
+                        if first_idx >= 0:
+                            debug_metrics["debug/action_health/first_nonfinite_index"] = float(first_idx)
                     for local_idx, rec in enumerate(action_health_trace[-6:]):
                         if not isinstance(rec, dict):
                             continue

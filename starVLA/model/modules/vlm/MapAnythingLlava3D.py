@@ -76,6 +76,7 @@ class _MapAnythingLlava3D_Interface(nn.Module):
         image_token_joiner = "auto"
         normalize_instruction_whitespace = False
         strip_instruction = True
+        instruction_log_interval = 0
         base_vlm_path = None
         vision_model_name_or_path = _DEFAULT_VISION_MODEL
         language_model_name_or_path = _DEFAULT_LANGUAGE_MODEL
@@ -96,6 +97,8 @@ class _MapAnythingLlava3D_Interface(nn.Module):
                     normalize_instruction_whitespace = bool(getattr(ma_cfg, "normalize_instruction_whitespace"))
                 if hasattr(ma_cfg, "strip_instruction"):
                     strip_instruction = bool(getattr(ma_cfg, "strip_instruction"))
+                if hasattr(ma_cfg, "instruction_log_interval"):
+                    instruction_log_interval = int(getattr(ma_cfg, "instruction_log_interval"))
         except Exception:
             prefix_image_dropout_prob = 0.0
             prefix_lang_dropout_prob = 0.0
@@ -103,6 +106,7 @@ class _MapAnythingLlava3D_Interface(nn.Module):
             image_token_joiner = "auto"
             normalize_instruction_whitespace = False
             strip_instruction = True
+            instruction_log_interval = 0
         print(f"prefix_image_dropout_prob: {prefix_image_dropout_prob}")
         print(f"prefix_lang_dropout_prob: {prefix_lang_dropout_prob}")
 
@@ -167,6 +171,8 @@ class _MapAnythingLlava3D_Interface(nn.Module):
         self.runtime_config = config
         self.normalize_instruction_whitespace = bool(normalize_instruction_whitespace)
         self.strip_instruction = bool(strip_instruction)
+        self.instruction_log_interval = max(0, int(instruction_log_interval))
+        self._instruction_log_counter = 0
         self.model.config.hidden_size = self.model.config.hidden_size
 
     def _normalize_instruction(self, instruction: str) -> str:
@@ -201,8 +207,10 @@ class _MapAnythingLlava3D_Interface(nn.Module):
                 processed_instructions.append(cot_prompt.replace("{instruction}", normalized_instruction))
             else:
                 processed_instructions.append(normalized_instruction)
-        if _is_rank0():
-            print(f"[mapanything_llava3d] processed_instructions: {processed_instructions}")
+        if _is_rank0() and self.instruction_log_interval > 0:
+            self._instruction_log_counter += 1
+            if self._instruction_log_counter % self.instruction_log_interval == 0:
+                logger.info("[mapanything_llava3d] processed_instructions: %s", processed_instructions)
         model_inputs = self.processor(
             text=processed_instructions,
             images=images,
