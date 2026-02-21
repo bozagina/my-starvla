@@ -234,11 +234,29 @@ def build_base_checkpoint(args) -> None:
     print(f"OK: semantic-attention tensors are present and finite (num_tensors={semantic_param_count}).")
     print("OK: assembled model contains all required parameter groups.")
 
-    model.save_pretrained(
-        output_dir,
-        safe_serialization=bool(args.safe_serialization),
-        state_dict=state_dict,
-    )
+    requested_safe_serialization = bool(args.safe_serialization)
+    try:
+        model.save_pretrained(
+            output_dir,
+            safe_serialization=requested_safe_serialization,
+            state_dict=state_dict,
+        )
+    except RuntimeError as e:
+        # MapAnything has many intentionally shared/tied tensors.
+        # Some transformers versions reject shared tensors under safetensors export.
+        msg = str(e)
+        if requested_safe_serialization and ("shared tensors" in msg or "tensor sharing" in msg):
+            print(
+                "Warning: safetensors export failed due to shared tensors. "
+                "Retrying with safe_serialization=False (pytorch_model.bin)."
+            )
+            model.save_pretrained(
+                output_dir,
+                safe_serialization=False,
+                state_dict=state_dict,
+            )
+        else:
+            raise
     config.save_pretrained(output_dir)
     print(f"Saved base VLM checkpoint to: {output_dir}")
 
