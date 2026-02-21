@@ -183,6 +183,9 @@ class VLATrainer(TrainerUtils):
         self.nan_debug_fail_fast = bool(getattr(self.config.trainer, "nan_debug_fail_fast", False))
         self.nan_debug_dump_max = int(getattr(self.config.trainer, "nan_debug_dump_max", 1))
         self.nan_debug_dump_count = 0
+        self.sagr_phase_a_steps = max(0, int(getattr(self.config.trainer, "sagr_phase_a_steps", 0)))
+        self.sagr_phase_b_ramp_steps = max(0, int(getattr(self.config.trainer, "sagr_phase_b_ramp_steps", 0)))
+        self._sagr_base_loss_weights = None
         trackers = getattr(self.config, "trackers", None)
         backend = None
         if trackers is not None:
@@ -196,6 +199,76 @@ class VLATrainer(TrainerUtils):
         if backend is None:
             backend = "wandb"
         self.logger_backend = backend
+
+    def _maybe_apply_sagr_loss_schedule(self):
+        """Apply optional two-phase SA-GR loss schedule on action head."""
+        info = {}
+        try:
+            base_model = self.accelerator.unwrap_model(self.model)
+            action_model = getattr(base_model, "action_model", None)
+            if action_model is None:
+                return info
+            if not hasattr(action_model, "set_loss_weight_override"):
+                return info
+
+            if self._sagr_base_loss_weights is None:
+                self._sagr_base_loss_weights = {
+                    "loss_w_fm": float(getattr(action_model, "base_loss_w_fm", getattr(action_model, "loss_w_fm", 1.0))),
+                    "loss_w_dyn": float(getattr(action_model, "base_loss_w_dyn", getattr(action_model, "loss_w_dyn", 0.0))),
+                    "loss_w_geo": float(getattr(action_model, "base_loss_w_geo", getattr(action_model, "loss_w_geo", 0.0))),
+                    "loss_w_reg": float(getattr(action_model, "base_loss_w_reg", getattr(action_model, "loss_w_reg", 0.0))),
+                }
+
+            base_w = dict(self._sagr_base_loss_weights)
+            phase = 0
+            alpha = 1.0
+            override = None
+
+            if self.sagr_phase_a_steps > 0 or self.sagr_phase_b_ramp_steps > 0:
+                if self.completed_steps < self.sagr_phase_a_steps:
+                    phase = 1
+                    alpha = 0.0
+                    override = {
+                        "loss_w_fm": base_w["loss_w_fm"],
+                        "loss_w_dyn": 0.0,
+                        "loss_w_geo": 0.0,
+                        "loss_w_reg": 0.0,
+                    }
+                elif self.sagr_phase_b_ramp_steps > 0 and self.completed_steps < (self.sagr_phase_a_steps + self.sagr_phase_b_ramp_steps):
+                    phase = 2
+                    alpha = float(self.completed_steps - self.sagr_phase_a_steps + 1) / float(
+                        max(1, self.sagr_phase_b_ramp_steps)
+                    )
+                    alpha = min(max(alpha, 0.0), 1.0)
+                    override = {
+                        "loss_w_fm": base_w["loss_w_fm"],
+                        "loss_w_dyn": base_w["loss_w_dyn"] * alpha,
+                        "loss_w_geo": base_w["loss_w_geo"] * alpha,
+                        "loss_w_reg": base_w["loss_w_reg"] * alpha,
+                    }
+                else:
+                    phase = 3
+                    alpha = 1.0
+
+            if override is None:
+                action_model.clear_loss_weight_override()
+                active_w = base_w
+            else:
+                action_model.set_loss_weight_override(**override)
+                active_w = override
+
+            info = {
+                "phase": float(phase),
+                "alpha": float(alpha),
+                "loss_w_fm": float(active_w["loss_w_fm"]),
+                "loss_w_dyn": float(active_w["loss_w_dyn"]),
+                "loss_w_geo": float(active_w["loss_w_geo"]),
+                "loss_w_reg": float(active_w["loss_w_reg"]),
+            }
+        except Exception as e:
+            logger.warning(f"Failed to apply SA-GR loss schedule: {e}")
+            info = {"error": str(e)}
+        return info
     
     def prepare_training(self):
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -1065,6 +1138,7 @@ class VLATrainer(TrainerUtils):
     def _train_step(self, batch_vla, batch_vlm=None):
         """execute single training step"""
         with self.accelerator.accumulate(self.model):
+            sagr_schedule = self._maybe_apply_sagr_loss_schedule()
             # VLA task forward propagation
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla)
@@ -1073,6 +1147,19 @@ class VLATrainer(TrainerUtils):
 
             debug_metrics = output_dict.get("debug_metrics", None)
             step_metrics = {"action_dit_loss": float(action_loss.item())}
+            if isinstance(sagr_schedule, dict) and len(sagr_schedule) > 0:
+                if "phase" in sagr_schedule:
+                    step_metrics["debug/sagr_schedule/phase"] = float(sagr_schedule["phase"])
+                if "alpha" in sagr_schedule:
+                    step_metrics["debug/sagr_schedule/alpha"] = float(sagr_schedule["alpha"])
+                if "loss_w_fm" in sagr_schedule:
+                    step_metrics["debug/sagr_schedule/loss_w_fm"] = float(sagr_schedule["loss_w_fm"])
+                if "loss_w_dyn" in sagr_schedule:
+                    step_metrics["debug/sagr_schedule/loss_w_dyn"] = float(sagr_schedule["loss_w_dyn"])
+                if "loss_w_geo" in sagr_schedule:
+                    step_metrics["debug/sagr_schedule/loss_w_geo"] = float(sagr_schedule["loss_w_geo"])
+                if "loss_w_reg" in sagr_schedule:
+                    step_metrics["debug/sagr_schedule/loss_w_reg"] = float(sagr_schedule["loss_w_reg"])
             if isinstance(debug_metrics, dict):
                 step_metrics.update(debug_metrics)
 

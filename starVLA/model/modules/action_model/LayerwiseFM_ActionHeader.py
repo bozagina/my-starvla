@@ -351,10 +351,22 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         self.loss_w_dyn = float(_cfg_get(action_config, "loss_w_dyn", 0.2))
         self.loss_w_geo = float(_cfg_get(action_config, "loss_w_geo", 0.1))
         self.loss_w_reg = float(_cfg_get(action_config, "loss_w_reg", 1e-3))
+        self.base_loss_w_fm = float(self.loss_w_fm)
+        self.base_loss_w_dyn = float(self.loss_w_dyn)
+        self.base_loss_w_geo = float(self.loss_w_geo)
+        self.base_loss_w_reg = float(self.loss_w_reg)
+        self._runtime_loss_weight_override: Optional[Dict[str, float]] = None
         self.drift_eta = float(_cfg_get(action_config, "drift_eta", 0.2))
         self.rrr_threshold = float(_cfg_get(action_config, "rrr_replan_threshold", 2.5))
         self.rrr_eps = float(_cfg_get(action_config, "rrr_eps", 1e-4))
         self.rrr_max_replans = int(_cfg_get(action_config, "rrr_max_replans", 1))
+        self.world_action_source = str(_cfg_get(action_config, "world_action_source", "teacher")).lower()
+        if self.world_action_source not in ("teacher", "noisy"):
+            logger.warning(
+                "Invalid world_action_source=%s, fallback to `teacher`.",
+                self.world_action_source,
+            )
+            self.world_action_source = "teacher"
 
         world_modules = [
             self.world_task_proj,
@@ -379,11 +391,12 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         self._first_nonfinite_stage = None
         self._first_nonfinite_record = None
         logger.info(
-            "LayerwiseFMActionHead initialized: use_concat_cross_context=%s, cross_attention_assert_inputs=%s, cross_attention_debug_log_interval=%d, world_params=%d",
+            "LayerwiseFMActionHead initialized: use_concat_cross_context=%s, cross_attention_assert_inputs=%s, cross_attention_debug_log_interval=%d, world_params=%d, world_action_source=%s",
             self.use_concat_cross_context,
             self.cross_attention_assert_inputs,
             self.cross_attention_debug_log_interval,
             self.world_predictor_param_count,
+            self.world_action_source,
         )
 
     def sample_time(self, batch_size, device, dtype):
@@ -501,6 +514,64 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 "inf_count": float(record.get("inf_count", 0.0)),
                 "absmax": float(record.get("absmax", 0.0)),
             }
+
+    @staticmethod
+    def _masked_mean(values: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+        if values.ndim != 1:
+            raise ValueError(f"`values` must be 1D [B], got shape={tuple(values.shape)}")
+        if mask is None:
+            return values.mean()
+        if mask.ndim != 1:
+            mask = mask.view(-1)
+        if mask.shape[0] != values.shape[0]:
+            raise ValueError(
+                f"Mask batch mismatch: values.shape[0]={values.shape[0]}, mask.shape[0]={mask.shape[0]}"
+            )
+        mask = mask.to(device=values.device, dtype=values.dtype).clamp_(0.0, 1.0)
+        denom = mask.sum()
+        if float(denom.item()) <= 0.0:
+            return values.new_tensor(0.0)
+        return torch.sum(values * mask) / denom
+
+    def set_loss_weight_override(
+        self,
+        *,
+        loss_w_fm: Optional[float] = None,
+        loss_w_dyn: Optional[float] = None,
+        loss_w_geo: Optional[float] = None,
+        loss_w_reg: Optional[float] = None,
+    ):
+        override = {}
+        if loss_w_fm is not None:
+            override["loss_w_fm"] = float(loss_w_fm)
+        if loss_w_dyn is not None:
+            override["loss_w_dyn"] = float(loss_w_dyn)
+        if loss_w_geo is not None:
+            override["loss_w_geo"] = float(loss_w_geo)
+        if loss_w_reg is not None:
+            override["loss_w_reg"] = float(loss_w_reg)
+        self._runtime_loss_weight_override = override if len(override) > 0 else None
+
+    def clear_loss_weight_override(self):
+        self._runtime_loss_weight_override = None
+
+    def _resolve_loss_weights(
+        self,
+        loss_weight_override: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, float]:
+        weights = {
+            "loss_w_fm": float(self.base_loss_w_fm),
+            "loss_w_dyn": float(self.base_loss_w_dyn),
+            "loss_w_geo": float(self.base_loss_w_geo),
+            "loss_w_reg": float(self.base_loss_w_reg),
+        }
+        for override in (self._runtime_loss_weight_override, loss_weight_override):
+            if not isinstance(override, dict):
+                continue
+            for key in ("loss_w_fm", "loss_w_dyn", "loss_w_geo", "loss_w_reg"):
+                if key in override and override[key] is not None:
+                    weights[key] = float(override[key])
+        return weights
 
     def _apply_layerwise_cross_attention(
         self,
@@ -645,6 +716,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         temb: torch.Tensor,
         timestep_bucket: torch.Tensor,
         observed_next_task_tokens: Optional[torch.Tensor] = None,
+        valid_tk_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, Optional[torch.Tensor]]:
         if task_tokens is None:
             zeros_b = action_sequence.new_zeros((action_sequence.shape[0], action_sequence.shape[1], self.action_dim))
@@ -682,12 +754,22 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 target_next = target_next[:, : pred_next_task.shape[1]]
         else:
             target_next = task_tokens.detach()
+        mask = None
+        if isinstance(valid_tk_mask, torch.Tensor):
+            mask = valid_tk_mask.to(device=pred_next_task.device, dtype=pred_next_task.dtype).view(-1)
+            if mask.shape[0] != pred_next_task.shape[0]:
+                raise ValueError(
+                    f"`valid_tk_mask` batch mismatch: got {mask.shape[0]}, expected {pred_next_task.shape[0]}"
+                )
+            mask = mask.clamp_(0.0, 1.0)
 
         delta_z = target_next - pred_next_task
         pooled_residual = delta_z.mean(dim=1)
         geo_weight = F.softplus(self.geo_weight_diag).to(device=pooled_residual.device, dtype=pooled_residual.dtype)
-        loss_dyn = F.mse_loss(pred_next_task, target_next)
-        loss_geo = 0.5 * ((pooled_residual * geo_weight) * pooled_residual).sum(dim=-1).mean()
+        dyn_per_sample = (pred_next_task - target_next).pow(2).mean(dim=(1, 2))
+        geo_per_sample = 0.5 * ((pooled_residual * geo_weight) * pooled_residual).sum(dim=-1)
+        loss_dyn = self._masked_mean(dyn_per_sample, mask)
+        loss_geo = self._masked_mean(geo_per_sample, mask)
 
         drift_input = torch.cat(
             [
@@ -700,11 +782,16 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         t_ratio = timestep_bucket.float() / float(max(1, self.num_timestep_buckets))
         eta = (self.drift_eta * (1.0 - t_ratio)).clamp(min=0.0).view(-1, 1, 1)
         drift = eta * drift_base
-        loss_reg = drift.pow(2).mean()
+        reg_per_sample = drift.pow(2).mean(dim=(1, 2))
+        loss_reg = self._masked_mean(reg_per_sample, mask)
 
         expected_change = (pred_next_task - task_tokens).norm(dim=-1).mean(dim=-1)
         residual_norm = delta_z.norm(dim=-1).mean(dim=-1)
         rrr = residual_norm / expected_change.clamp_min(self.rrr_eps)
+        if mask is not None:
+            keep = mask > 0.5
+            rrr = torch.where(keep, rrr, torch.zeros_like(rrr))
+            expected_change = torch.where(keep, expected_change, torch.zeros_like(expected_change))
 
         return {
             "drift": drift,
@@ -724,6 +811,8 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         encoder_attention_mask: torch.Tensor = None,
         task_tokens: Optional[torch.Tensor] = None,
         task_tokens_next: Optional[torch.Tensor] = None,
+        valid_tk: Optional[torch.Tensor] = None,
+        loss_weight_override: Optional[Dict[str, float]] = None,
     ):
         """
         vl_embs: list of torch.Tensor, each shape (B, seq_length, feature_dim)
@@ -782,9 +871,18 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             device=device,
             dtype=sa_embs.dtype,
         )
+        valid_tk_mask = None
+        if isinstance(valid_tk, torch.Tensor):
+            valid_tk_mask = valid_tk.to(device=device, dtype=sa_embs.dtype).view(-1)
+            if valid_tk_mask.shape[0] != B:
+                raise ValueError(
+                    f"`valid_tk` batch mismatch: got {valid_tk_mask.shape[0]}, expected {B}"
+                )
+            valid_tk_mask = valid_tk_mask.clamp_(0.0, 1.0)
         self._record_health("forward/sa_embs", sa_embs)
         self._record_health("forward/task_tokens", task_tokens) if isinstance(task_tokens, torch.Tensor) else None
         self._record_health("forward/task_tokens_next", task_tokens_next) if isinstance(task_tokens_next, torch.Tensor) else None
+        self._record_health("forward/valid_tk", valid_tk_mask) if isinstance(valid_tk_mask, torch.Tensor) else None
         temb = self.model.timestep_encoder(t_discretized)
         self._record_health("forward/temb", temb)
         hidden_states = self._apply_layerwise_cross_attention(
@@ -798,13 +896,15 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         self._record_health("forward/hidden_states", hidden_states)
         pred_velocity = self._process_output(hidden_states, temb, actions.shape[1])
         self._record_health("forward/pred_velocity_raw", pred_velocity)
+        world_action_sequence = actions if self.world_action_source == "teacher" else noisy_trajectory
         world_guidance = self._compute_world_guidance(
             task_tokens=task_tokens,
-            action_sequence=noisy_trajectory,
+            action_sequence=world_action_sequence,
             state_context=state,
             temb=temb,
             timestep_bucket=t_discretized,
             observed_next_task_tokens=task_tokens_next,
+            valid_tk_mask=valid_tk_mask,
         )
         drift = world_guidance["drift"]
         if isinstance(drift, torch.Tensor):
@@ -815,11 +915,12 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         loss_dyn = world_guidance["loss_dyn"]
         loss_geo = world_guidance["loss_geo"]
         loss_reg = world_guidance["loss_reg"]
+        loss_weights = self._resolve_loss_weights(loss_weight_override=loss_weight_override)
         total_loss = (
-            self.loss_w_fm * loss_cfm
-            + self.loss_w_dyn * loss_dyn
-            + self.loss_w_geo * loss_geo
-            + self.loss_w_reg * loss_reg
+            loss_weights["loss_w_fm"] * loss_cfm
+            + loss_weights["loss_w_dyn"] * loss_dyn
+            + loss_weights["loss_w_geo"] * loss_geo
+            + loss_weights["loss_w_reg"] * loss_reg
         )
         self._last_loss_breakdown = {
             "loss_cfm": float(loss_cfm.detach().item()),
@@ -828,7 +929,13 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             "loss_reg": float(loss_reg.detach().item()),
             "loss_total": float(total_loss.detach().item()),
             "world_predictor_params": float(self.world_predictor_param_count),
+            "weight_fm": float(loss_weights["loss_w_fm"]),
+            "weight_dyn": float(loss_weights["loss_w_dyn"]),
+            "weight_geo": float(loss_weights["loss_w_geo"]),
+            "weight_reg": float(loss_weights["loss_w_reg"]),
         }
+        if isinstance(valid_tk_mask, torch.Tensor):
+            self._last_loss_breakdown["valid_tk_ratio"] = float((valid_tk_mask > 0.5).float().mean().item())
         rrr = world_guidance.get("rrr")
         if isinstance(rrr, torch.Tensor) and rrr.numel() > 0:
             self._last_rrr = float(rrr.detach().mean().item())

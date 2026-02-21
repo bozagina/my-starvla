@@ -416,6 +416,7 @@ class MapAnythingLlava3D_PI(baseframework):
                 encoder_attention_mask=attention_mask_repeated,
                 task_tokens=task_tokens_repeated,
                 task_tokens_next=task_tokens_next_repeated,
+                valid_tk=valid_tk_repeated,
             )
             try:
                 layer_means = getattr(self.action_model, "_last_dit_layer_means", None)
