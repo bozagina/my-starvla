@@ -30,6 +30,7 @@ class ModelClient:
         num_ddim_steps: int = 10,
         adaptive_ensemble_alpha = 0.1,
         deterministic_seed: Optional[int] = None,
+        return_debug_info: bool = False,
         host="0.0.0.0",
         port=10095,
     ) -> None:
@@ -47,6 +48,7 @@ class ModelClient:
         self.action_ensemble = action_ensemble
         self.adaptive_ensemble_alpha = adaptive_ensemble_alpha
         self.deterministic_seed = deterministic_seed
+        self.return_debug_info = bool(return_debug_info)
         self.action_ensemble_horizon = action_ensemble_horizon
         self.sticky_action_is_on = False
         self.gripper_action_repeat = 0
@@ -63,6 +65,7 @@ class ModelClient:
 
         self.action_norm_stats = self.get_action_stats(self.unnorm_key, policy_ckpt_path=policy_ckpt_path)
         self.action_chunk_size = self.get_action_chunk_size(policy_ckpt_path=policy_ckpt_path)
+        self.last_policy_debug_info = None
         
 
     def _add_image_to_history(self, image: np.ndarray) -> None:
@@ -110,12 +113,15 @@ class ModelClient:
             "use_ddim": self.use_ddim,
             "num_ddim_steps": self.num_ddim_steps,
         }
+        if self.return_debug_info:
+            vla_input["return_debug_info"] = True
         if self.deterministic_seed is not None:
             # Keep deterministic across runs while allowing step-wise variation.
             vla_input["deterministic_seed"] = int(self.deterministic_seed + step)
         
 
         action_chunk_size = self.action_chunk_size
+        chunk_refresh = bool(step % action_chunk_size == 0)
         if step % action_chunk_size == 0:
             response = self.client.predict_action(vla_input)
             try:
@@ -123,11 +129,14 @@ class ModelClient:
             except KeyError:
                 print(f"Response data: {response}")
                 raise KeyError(f"Key 'normalized_actions' not found in response data: {response['data'].keys()}")
+            data = response.get("data", {})
+            self.last_policy_debug_info = data.get("debug_info", None)
             
             normalized_actions = normalized_actions[0]    
             self.raw_actions = self.unnormalize_actions(normalized_actions=normalized_actions, action_norm_stats=self.action_norm_stats)
         
-        raw_actions = self.raw_actions[step % action_chunk_size][None]    
+        action_index_in_chunk = int(step % action_chunk_size)
+        raw_actions = self.raw_actions[action_index_in_chunk][None]    
 
         raw_action = {
             "world_vector": np.array(raw_actions[0, :3]),
@@ -135,7 +144,13 @@ class ModelClient:
             "open_gripper": np.array(raw_actions[0, 6:7]),  # range [0, 1]; 1 = open; 0 = close
         }
 
-        return {"raw_action": raw_action}
+        return {
+            "raw_action": raw_action,
+            "action_chunk_size": int(action_chunk_size),
+            "action_index_in_chunk": int(action_index_in_chunk),
+            "chunk_refresh": bool(chunk_refresh),
+            "policy_debug_info": self.last_policy_debug_info,
+        }
 
     @staticmethod
     def unnormalize_actions(normalized_actions: np.ndarray, action_norm_stats: Dict[str, np.ndarray]) -> np.ndarray:

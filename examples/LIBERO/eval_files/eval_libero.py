@@ -6,6 +6,7 @@ import math
 import os
 import pathlib
 from pathlib import Path
+from collections import defaultdict
 import requests
 import time
 
@@ -34,6 +35,30 @@ def _binarize_gripper_open(open_val: np.ndarray | float) -> np.ndarray:
     v = float(arr[0])
     bin_val = 1.0 - 2.0 * (v > 0.5)
     return np.asarray([bin_val], dtype=np.float32)
+
+
+def _now_ms() -> float:
+    return float(time.perf_counter() * 1000.0)
+
+
+def _safe_float(value):
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _percentile(values: list[float], q: float):
+    if not values:
+        return None
+    return float(np.percentile(np.asarray(values, dtype=np.float64), q))
+
+
+def _append_jsonl(path: Path, payload: dict) -> None:
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 @dataclasses.dataclass
@@ -69,6 +94,10 @@ class Args:
     log_payload_every_n_steps: int = 20
     repeat_infer_debug_times: int = 1
     deterministic_seed: int = -1
+    request_policy_debug_info: bool = False
+    enable_rt_metrics: bool = True
+    rt_metrics_filename: str = "rt_metrics.jsonl"
+    rt_metrics_log_every_n_steps: int = 20
 
 
 def eval_libero(args: Args) -> None:
@@ -86,6 +115,12 @@ def eval_libero(args: Args) -> None:
     # args.video_out_path = f"{date_base}+{args.job_name}"
     
     pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
+    rt_metrics_path = pathlib.Path(args.video_out_path) / args.rt_metrics_filename
+    if args.enable_rt_metrics:
+        rt_metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        if rt_metrics_path.exists():
+            rt_metrics_path.unlink()
+        logging.info(f"[rt_metrics] writing runtime metrics to {rt_metrics_path}")
 
     if args.task_suite_name == "libero_spatial":
         max_steps = 220  # longest training demo has 193 steps
@@ -106,6 +141,7 @@ def eval_libero(args: Args) -> None:
         port=args.port,
         image_size=args.resize_size,
         deterministic_seed=(None if int(args.deterministic_seed) < 0 else int(args.deterministic_seed)),
+        return_debug_info=bool(args.request_policy_debug_info),
     )
 
 
@@ -141,6 +177,8 @@ def eval_libero(args: Args) -> None:
 
             logging.info(f"Starting episode {task_episodes + 1}...")
             step = 0
+            step_metric_rows = []
+            chunk_update_counts = defaultdict(int)
             
             # full_actions = np.load("./debug/action.npy")
             
@@ -219,8 +257,8 @@ def eval_libero(args: Args) -> None:
                     f"Sending to policy server | task_id={task_id}, episode={episode_idx}, lang='{example_dict['lang']}'"
                 )
 
-                
-                start_time = time.time()
+                t_img_ms = _now_ms()
+                t_policy_send_ms = _now_ms()
                 
                 repeat_times = max(1, int(args.repeat_infer_debug_times))
                 response = client_model.step(example=example_dict, step=step)
@@ -252,12 +290,18 @@ def eval_libero(args: Args) -> None:
                     )
                     if cached_raw_actions is not None:
                         client_model.raw_actions = cached_raw_actions
-                
-                end_time = time.time()
-                # print(f"time: {end_time - start_time}")
+                t_policy_recv_ms = _now_ms()
                 
                 # # 
                 raw_action = response["raw_action"]
+                action_chunk_size = int(response.get("action_chunk_size", getattr(client_model, "action_chunk_size", 1)))
+                action_chunk_size = max(1, action_chunk_size)
+                action_index_in_chunk = int(response.get("action_index_in_chunk", int(step % action_chunk_size)))
+                chunk_refresh = bool(response.get("chunk_refresh", action_index_in_chunk == 0))
+                policy_debug_info = response.get("policy_debug_info", None)
+                chunk_id = int(step // action_chunk_size)
+                if chunk_refresh:
+                    chunk_update_counts[chunk_id] += 1
                 
                 world_vector_delta = np.asarray(raw_action.get("world_vector"), dtype=np.float32).reshape(-1)
                 rotation_delta = np.asarray(raw_action.get("rotation_delta"), dtype=np.float32).reshape(-1)
@@ -279,7 +323,75 @@ def eval_libero(args: Args) -> None:
                 
                 # __import__("ipdb").set_trace()
                 # see ../robosuite/controllers/controller_factory.py
+                t_action_send_ms = _now_ms()
                 obs, reward, done, info = env.step(delta_action.tolist())
+                t_env_step_done_ms = _now_ms()
+                i_exec = int(action_index_in_chunk)
+                j_ref = int(response.get("action_ref_index", action_index_in_chunk))
+                phase_shift_steps_true = int(i_exec - j_ref)
+                l_fresh_ms_true = float(t_action_send_ms - t_img_ms)
+                policy_latency_ms_true = float(t_policy_recv_ms - t_policy_send_ms)
+                post_policy_apply_ms_true = float(t_action_send_ms - t_policy_recv_ms)
+                env_step_ms_true = float(t_env_step_done_ms - t_action_send_ms)
+                step_loop_ms_true = float(t_env_step_done_ms - t_img_ms)
+                rt_row = {
+                    "record_type": "step",
+                    "task_id": int(task_id),
+                    "episode_idx": int(episode_idx),
+                    "step": int(step),
+                    "sim_t": int(t),
+                    "rt/t_img_ms": float(t_img_ms),
+                    "rt/t_policy_send_ms": float(t_policy_send_ms),
+                    "rt/t_policy_recv_ms": float(t_policy_recv_ms),
+                    "rt/t_action_send_ms": float(t_action_send_ms),
+                    "rt/t_env_step_done_ms": float(t_env_step_done_ms),
+                    "rt/l_fresh_ms_true": l_fresh_ms_true,
+                    "rt/policy_latency_ms_true": policy_latency_ms_true,
+                    "rt/post_policy_apply_ms_true": post_policy_apply_ms_true,
+                    "rt/env_step_ms_true": env_step_ms_true,
+                    "rt/step_loop_ms_true": step_loop_ms_true,
+                    "rt/action_chunk_size": int(action_chunk_size),
+                    "rt/chunk_id": int(chunk_id),
+                    "rt/chunk_refresh": int(chunk_refresh),
+                    "rt/action_index_i_exec": int(i_exec),
+                    "rt/action_index_j_ref": int(j_ref),
+                    "rt/phase_shift_steps_true": int(phase_shift_steps_true),
+                    "rt/command_overlap_true_running": int(chunk_update_counts.get(chunk_id, 0)),
+                }
+                if isinstance(policy_debug_info, dict):
+                    rt_row["rt/policy_debug_timing/perception_ms"] = _safe_float(
+                        policy_debug_info.get("timing/perception_ms")
+                    )
+                    rt_row["rt/policy_debug_timing/brain_total_ms"] = _safe_float(
+                        policy_debug_info.get("timing/brain_total_ms")
+                    )
+                    rt_row["rt/policy_debug_timing/flow_total_ms"] = _safe_float(
+                        policy_debug_info.get("timing/flow_total_ms_agg")
+                    )
+                    rt_row["rt/policy_debug_timing/reflex_total_ms"] = _safe_float(
+                        policy_debug_info.get("timing/reflex_total_ms_agg")
+                    )
+                    rt_row["rt/policy_debug_timing/drift_response_lag_ms"] = _safe_float(
+                        policy_debug_info.get("timing/drift_response_lag_ms")
+                    )
+                    rt_row["rt/policy_debug_timing/effective_control_hz"] = _safe_float(
+                        policy_debug_info.get("timing/effective_control_hz")
+                    )
+                step_metric_rows.append(rt_row)
+                if args.enable_rt_metrics:
+                    _append_jsonl(rt_metrics_path, rt_row)
+                log_rt_every = max(1, int(args.rt_metrics_log_every_n_steps))
+                if step % log_rt_every == 0:
+                    logging.info(
+                        "[rt_metrics] task=%s ep=%s step=%s fresh_ms=%.2f policy_ms=%.2f phase_shift=%s overlap_running=%s",
+                        task_id,
+                        episode_idx,
+                        step,
+                        l_fresh_ms_true,
+                        policy_latency_ms_true,
+                        phase_shift_steps_true,
+                        int(chunk_update_counts.get(chunk_id, 0)),
+                    )
                 if done:
                     task_successes += 1
                     total_successes += 1
@@ -302,6 +414,47 @@ def eval_libero(args: Args) -> None:
             
             full_actions = np.stack(full_actions)
             # np.save(pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_episode{episode_idx}_{suffix}.npy", full_actions)
+            if step_metric_rows:
+                fresh_values = [float(r["rt/l_fresh_ms_true"]) for r in step_metric_rows]
+                policy_values = [float(r["rt/policy_latency_ms_true"]) for r in step_metric_rows]
+                phase_values = [abs(float(r["rt/phase_shift_steps_true"])) for r in step_metric_rows]
+                overlap_values = [int(v) for _, v in sorted(chunk_update_counts.items(), key=lambda x: x[0])]
+                overlap_mean = float(np.mean(overlap_values)) if overlap_values else 0.0
+                episode_rt_summary = {
+                    "record_type": "episode_summary",
+                    "task_id": int(task_id),
+                    "episode_idx": int(episode_idx),
+                    "done": bool(done),
+                    "n_control_steps": int(len(step_metric_rows)),
+                    "n_chunks": int(len(overlap_values)),
+                    "rt/l_fresh_ms_true_mean": float(np.mean(fresh_values)),
+                    "rt/l_fresh_ms_true_p95": _percentile(fresh_values, 95),
+                    "rt/l_fresh_ms_true_max": float(np.max(fresh_values)),
+                    "rt/policy_latency_ms_true_mean": float(np.mean(policy_values)),
+                    "rt/policy_latency_ms_true_p95": _percentile(policy_values, 95),
+                    "rt/phase_shift_steps_true_abs_mean": float(np.mean(phase_values)),
+                    "rt/phase_shift_steps_true_abs_p95": _percentile(phase_values, 95),
+                    "rt/phase_shift_gt2_ratio": float(np.mean(np.asarray(phase_values) > 2.0)),
+                    "rt/command_overlap_true_mean": float(overlap_mean),
+                    "rt/command_overlap_true_min": float(np.min(overlap_values)) if overlap_values else 0.0,
+                    "rt/command_overlap_lt1_ratio": float(np.mean(np.asarray(overlap_values) < 1.0))
+                    if overlap_values
+                    else 0.0,
+                }
+                if args.enable_rt_metrics:
+                    _append_jsonl(rt_metrics_path, episode_rt_summary)
+                logging.info(
+                    "[rt_summary] task=%s ep=%s fresh_ms(mean/p95)=%.2f/%.2f policy_ms(mean/p95)=%.2f/%.2f "
+                    "phase_abs_p95=%.2f overlap_mean=%.2f",
+                    task_id,
+                    episode_idx,
+                    episode_rt_summary["rt/l_fresh_ms_true_mean"],
+                    episode_rt_summary["rt/l_fresh_ms_true_p95"] or 0.0,
+                    episode_rt_summary["rt/policy_latency_ms_true_mean"],
+                    episode_rt_summary["rt/policy_latency_ms_true_p95"] or 0.0,
+                    episode_rt_summary["rt/phase_shift_steps_true_abs_p95"] or 0.0,
+                    episode_rt_summary["rt/command_overlap_true_mean"],
+                )
             
             # print(pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_episode{episode_idx}_{suffix}.mp4")
             # Log current results
