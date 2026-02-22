@@ -6,6 +6,7 @@
 
 from dataclasses import dataclass, field
 import logging
+import time
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -310,6 +311,8 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         self._last_dit_layer_vars = []
         self._last_loss_breakdown = {}
         self._last_rrr = None
+        self._logged_task_token_num_mismatch = False
+        self.feedback_context_scale = float(_cfg_get(action_config, "feedback_context_scale", 1.0))
 
         self.world_hidden_dim = int(_cfg_get(action_config, "world_hidden_dim", 512))
         self.world_num_layers = int(_cfg_get(action_config, "world_num_layers", 4))
@@ -683,8 +686,45 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 f"`task_tokens` batch mismatch: got B={task_tokens.shape[0]}, expected B={batch_size}"
             )
         out = task_tokens.to(device=device, dtype=dtype)
-        if out.shape[1] > self.num_task_tokens:
-            out = out[:, : self.num_task_tokens]
+        # Keep task token count from VLM as-is (fixed-K query design), and only
+        # use config num_task_tokens as an informational target.
+        if (
+            out.shape[1] != self.num_task_tokens
+            and self._is_main_process()
+            and (not getattr(self, "_logged_task_token_num_mismatch", False))
+        ):
+            logger.info(
+                "Task token count mismatch (allowed): VLM_K=%d, action_cfg.num_task_tokens=%d",
+                int(out.shape[1]),
+                int(self.num_task_tokens),
+            )
+            self._logged_task_token_num_mismatch = True
+        return out
+
+    def _normalize_feedback_tokens(
+        self,
+        feedback_tokens: Optional[torch.Tensor],
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if not isinstance(feedback_tokens, torch.Tensor):
+            return None
+        if feedback_tokens.ndim == 2:
+            feedback_tokens = feedback_tokens.unsqueeze(1)
+        if feedback_tokens.ndim != 3:
+            raise ValueError(
+                f"`feedback_tokens` must be [B, Kf, D] or [B, D], got shape={tuple(feedback_tokens.shape)}"
+            )
+        if feedback_tokens.shape[0] != batch_size:
+            raise ValueError(
+                f"`feedback_tokens` batch mismatch: got B={feedback_tokens.shape[0]}, expected B={batch_size}"
+            )
+        out = feedback_tokens.to(device=device, dtype=dtype)
+        if out.shape[-1] != self.input_embedding_dim:
+            raise ValueError(
+                f"`feedback_tokens` hidden mismatch: got D={out.shape[-1]}, expected D={self.input_embedding_dim}"
+            )
         return out
 
     def _predict_next_task_tokens(
@@ -723,14 +763,19 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
     ) -> Dict[str, Optional[torch.Tensor]]:
         if task_tokens is None:
             zeros_b = action_sequence.new_zeros((action_sequence.shape[0], action_sequence.shape[1], self.action_dim))
+            zeros_scalar = action_sequence.new_zeros((action_sequence.shape[0],))
             return {
                 "drift": zeros_b,
                 "pred_next_task_tokens": None,
                 "loss_dyn": action_sequence.new_tensor(0.0),
                 "loss_geo": action_sequence.new_tensor(0.0),
                 "loss_reg": action_sequence.new_tensor(0.0),
-                "rrr": action_sequence.new_zeros((action_sequence.shape[0],)),
-                "expected_change": action_sequence.new_zeros((action_sequence.shape[0],)),
+                "rrr": zeros_scalar,
+                "expected_change": zeros_scalar,
+                "delta_z_norm": zeros_scalar,
+                "geo_energy": zeros_scalar,
+                "drift_action_cos": zeros_scalar,
+                "drift_l2": zeros_scalar,
             }
 
         action_context = action_sequence[:, 0, :]
@@ -741,14 +786,19 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         )
         if pred_next_task is None:
             zeros_b = action_sequence.new_zeros((action_sequence.shape[0], action_sequence.shape[1], self.action_dim))
+            zeros_scalar = action_sequence.new_zeros((action_sequence.shape[0],))
             return {
                 "drift": zeros_b,
                 "pred_next_task_tokens": None,
                 "loss_dyn": action_sequence.new_tensor(0.0),
                 "loss_geo": action_sequence.new_tensor(0.0),
                 "loss_reg": action_sequence.new_tensor(0.0),
-                "rrr": action_sequence.new_zeros((action_sequence.shape[0],)),
-                "expected_change": action_sequence.new_zeros((action_sequence.shape[0],)),
+                "rrr": zeros_scalar,
+                "expected_change": zeros_scalar,
+                "delta_z_norm": zeros_scalar,
+                "geo_energy": zeros_scalar,
+                "drift_action_cos": zeros_scalar,
+                "drift_l2": zeros_scalar,
             }
 
         if isinstance(observed_next_task_tokens, torch.Tensor):
@@ -773,10 +823,11 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         geo_per_sample = 0.5 * ((pooled_residual * geo_weight) * pooled_residual).sum(dim=-1)
         loss_dyn = self._masked_mean(dyn_per_sample, mask)
         loss_geo = self._masked_mean(geo_per_sample, mask)
+        residual_world = self.residual_proj(pooled_residual)
 
         drift_input = torch.cat(
             [
-                self.residual_proj(pooled_residual),
+                residual_world,
                 self.temb_proj(temb),
             ],
             dim=-1,
@@ -789,12 +840,26 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         loss_reg = self._masked_mean(reg_per_sample, mask)
 
         expected_change = (pred_next_task - task_tokens).norm(dim=-1).mean(dim=-1)
-        residual_norm = delta_z.norm(dim=-1).mean(dim=-1)
-        rrr = residual_norm / expected_change.clamp_min(self.rrr_eps)
+        delta_z_norm = delta_z.norm(dim=-1).mean(dim=-1)
+        rrr = delta_z_norm / expected_change.clamp_min(self.rrr_eps)
+        drift_action = drift.mean(dim=1)
+        drift_action_world = self.world_action_proj(drift_action)
+        drift_action_cos = F.cosine_similarity(
+            residual_world.float(),
+            drift_action_world.float(),
+            dim=-1,
+            eps=1e-6,
+        ).to(dtype=pred_next_task.dtype)
+        drift_l2 = drift.pow(2).mean(dim=(1, 2)).sqrt()
+        geo_energy = geo_per_sample
         if mask is not None:
             keep = mask > 0.5
             rrr = torch.where(keep, rrr, torch.zeros_like(rrr))
             expected_change = torch.where(keep, expected_change, torch.zeros_like(expected_change))
+            delta_z_norm = torch.where(keep, delta_z_norm, torch.zeros_like(delta_z_norm))
+            geo_energy = torch.where(keep, geo_energy, torch.zeros_like(geo_energy))
+            drift_action_cos = torch.where(keep, drift_action_cos, torch.zeros_like(drift_action_cos))
+            drift_l2 = torch.where(keep, drift_l2, torch.zeros_like(drift_l2))
 
         return {
             "drift": drift,
@@ -804,6 +869,10 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             "loss_reg": loss_reg,
             "rrr": rrr,
             "expected_change": expected_change,
+            "delta_z_norm": delta_z_norm,
+            "geo_energy": geo_energy,
+            "drift_action_cos": drift_action_cos,
+            "drift_l2": drift_l2,
         }
 
     def forward(
@@ -815,6 +884,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         task_tokens: Optional[torch.Tensor] = None,
         task_tokens_next: Optional[torch.Tensor] = None,
         valid_tk: Optional[torch.Tensor] = None,
+        feedback_tokens: Optional[torch.Tensor] = None,
         loss_weight_override: Optional[Dict[str, float]] = None,
     ):
         """
@@ -874,6 +944,21 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             device=device,
             dtype=sa_embs.dtype,
         )
+        feedback_tokens = self._normalize_feedback_tokens(
+            feedback_tokens=feedback_tokens,
+            batch_size=B,
+            device=device,
+            dtype=sa_embs.dtype,
+        )
+        context_task_tokens = task_tokens
+        if isinstance(feedback_tokens, torch.Tensor):
+            if self.feedback_context_scale != 1.0:
+                feedback_tokens = feedback_tokens * float(self.feedback_context_scale)
+            context_task_tokens = (
+                feedback_tokens
+                if context_task_tokens is None
+                else torch.cat((feedback_tokens, context_task_tokens), dim=1)
+            )
         valid_tk_mask = None
         if isinstance(valid_tk, torch.Tensor):
             valid_tk_mask = valid_tk.to(device=device, dtype=sa_embs.dtype).view(-1)
@@ -885,6 +970,8 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         self._record_health("forward/sa_embs", sa_embs)
         self._record_health("forward/task_tokens", task_tokens) if isinstance(task_tokens, torch.Tensor) else None
         self._record_health("forward/task_tokens_next", task_tokens_next) if isinstance(task_tokens_next, torch.Tensor) else None
+        self._record_health("forward/feedback_tokens", feedback_tokens) if isinstance(feedback_tokens, torch.Tensor) else None
+        self._record_health("forward/context_task_tokens", context_task_tokens) if isinstance(context_task_tokens, torch.Tensor) else None
         self._record_health("forward/valid_tk", valid_tk_mask) if isinstance(valid_tk_mask, torch.Tensor) else None
         temb = self.model.timestep_encoder(t_discretized)
         self._record_health("forward/temb", temb)
@@ -893,7 +980,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             vl_embs_list,
             temb,
             encoder_attention_mask=encoder_attention_mask,
-            task_tokens=task_tokens,
+            task_tokens=context_task_tokens,
             log_context="train",
         )
         self._record_health("forward/hidden_states", hidden_states)
@@ -928,6 +1015,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         self._last_loss_breakdown = {
             "loss_cfm": float(loss_cfm.detach().item()),
             "loss_dyn": float(loss_dyn.detach().item()),
+            "mse_dyn": float(loss_dyn.detach().item()),
             "loss_geo": float(loss_geo.detach().item()),
             "loss_reg": float(loss_reg.detach().item()),
             "loss_total": float(total_loss.detach().item()),
@@ -939,10 +1027,34 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         }
         if isinstance(valid_tk_mask, torch.Tensor):
             self._last_loss_breakdown["valid_tk_ratio"] = float((valid_tk_mask > 0.5).float().mean().item())
+        if isinstance(feedback_tokens, torch.Tensor):
+            self._last_loss_breakdown["feedback_token_num"] = float(feedback_tokens.shape[1])
+            self._last_loss_breakdown["feedback_token_norm_mean"] = float(
+                feedback_tokens.detach().norm(dim=-1).mean().item()
+            )
         rrr = world_guidance.get("rrr")
         if isinstance(rrr, torch.Tensor) and rrr.numel() > 0:
             self._last_rrr = float(rrr.detach().mean().item())
             self._last_loss_breakdown["rrr_mean"] = self._last_rrr
+        delta_z_norm = world_guidance.get("delta_z_norm")
+        if isinstance(delta_z_norm, torch.Tensor) and delta_z_norm.numel() > 0:
+            delta_z_norm_mean = self._masked_mean(delta_z_norm.view(-1), valid_tk_mask)
+            self._last_loss_breakdown["delta_z_norm_mean"] = float(delta_z_norm_mean.detach().item())
+            self._last_loss_breakdown["delta_z_norm_std"] = float(delta_z_norm.detach().float().std(unbiased=False).item())
+        drift_action_cos = world_guidance.get("drift_action_cos")
+        if isinstance(drift_action_cos, torch.Tensor) and drift_action_cos.numel() > 0:
+            rho_da = self._masked_mean(drift_action_cos.view(-1), valid_tk_mask)
+            self._last_loss_breakdown["rho_da"] = float(rho_da.detach().item())
+            self._last_loss_breakdown["drift_action_cos_mean"] = float(rho_da.detach().item())
+        geo_energy = world_guidance.get("geo_energy")
+        if isinstance(geo_energy, torch.Tensor) and geo_energy.numel() > 0:
+            geo_energy_mean = self._masked_mean(geo_energy.view(-1), valid_tk_mask)
+            self._last_loss_breakdown["geo_energy_mean"] = float(geo_energy_mean.detach().item())
+            self._last_loss_breakdown["E_geo"] = float(geo_energy_mean.detach().item())
+        drift_l2 = world_guidance.get("drift_l2")
+        if isinstance(drift_l2, torch.Tensor) and drift_l2.numel() > 0:
+            drift_l2_mean = self._masked_mean(drift_l2.view(-1), valid_tk_mask)
+            self._last_loss_breakdown["drift_l2_mean"] = float(drift_l2_mean.detach().item())
         self._record_health("forward/loss_total", total_loss.unsqueeze(0))
         return total_loss
 
@@ -954,6 +1066,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         noise_seed: int = None,
         encoder_attention_mask: torch.Tensor = None,
         task_tokens: Optional[torch.Tensor] = None,
+        feedback_tokens: Optional[torch.Tensor] = None,
         force_replan: bool = False,
         rrr_threshold: Optional[float] = None,
         return_info: bool = False,
@@ -964,6 +1077,19 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         # Set initial actions as the sampled noise.
         batch_size = vl_embs_list[0].shape[0]
         device = vl_embs_list[0].device
+        use_cuda_timing = bool(device.type == "cuda" and torch.cuda.is_available())
+        flow_start_event = flow_end_event = None
+        flow_start_cpu = None
+        per_step_events = []
+        per_step_cpu_ms = []
+        reflex_events = []
+        reflex_cpu_ms = []
+        if use_cuda_timing:
+            flow_start_event = torch.cuda.Event(enable_timing=True)
+            flow_end_event = torch.cuda.Event(enable_timing=True)
+            flow_start_event.record()
+        else:
+            flow_start_cpu = time.perf_counter()
         generator = None
         if noise_seed is not None:
             try:
@@ -998,12 +1124,37 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             device=device,
             dtype=vl_embs_list[0].dtype,
         )
+        feedback_tokens = self._normalize_feedback_tokens(
+            feedback_tokens=feedback_tokens,
+            batch_size=batch_size,
+            device=device,
+            dtype=vl_embs_list[0].dtype,
+        )
+        context_task_tokens = task_tokens
+        if isinstance(feedback_tokens, torch.Tensor):
+            if self.feedback_context_scale != 1.0:
+                feedback_tokens = feedback_tokens * float(self.feedback_context_scale)
+            context_task_tokens = (
+                feedback_tokens
+                if context_task_tokens is None
+                else torch.cat((feedback_tokens, context_task_tokens), dim=1)
+            )
         replans = 0
         t = 0
         predicted_task_tokens = None
         expected_change = None
         rrr_trace = []
+        delta_z_norm_trace = []
+        geo_energy_trace = []
+        drift_action_cos_trace = []
         while t < num_steps:
+            if use_cuda_timing:
+                step_start_event = torch.cuda.Event(enable_timing=True)
+                step_end_event = torch.cuda.Event(enable_timing=True)
+                step_start_event.record()
+            else:
+                step_start_cpu = time.perf_counter()
+
             t_cont = t / float(num_steps)
             t_discretized_int = int(t_cont * self.num_timestep_buckets)
             timesteps_tensor = torch.full(
@@ -1032,10 +1183,16 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 vl_embs_list,
                 temb,
                 encoder_attention_mask=encoder_attention_mask,
-                task_tokens=task_tokens,
+                task_tokens=context_task_tokens,
                 log_context="infer",
             )
             pred_velocity = self._process_output(hidden_states, temb, self.action_horizon)
+            if use_cuda_timing:
+                reflex_start_event = torch.cuda.Event(enable_timing=True)
+                reflex_end_event = torch.cuda.Event(enable_timing=True)
+                reflex_start_event.record()
+            else:
+                reflex_start_cpu = time.perf_counter()
             world_guidance = self._compute_world_guidance(
                 task_tokens=task_tokens,
                 action_sequence=actions,
@@ -1047,6 +1204,20 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             drift = world_guidance["drift"]
             if isinstance(drift, torch.Tensor):
                 pred_velocity = pred_velocity + drift
+            if use_cuda_timing:
+                reflex_end_event.record()
+                reflex_events.append((reflex_start_event, reflex_end_event))
+            else:
+                reflex_cpu_ms.append(float((time.perf_counter() - reflex_start_cpu) * 1000.0))
+            delta_z_norm = world_guidance.get("delta_z_norm")
+            if isinstance(delta_z_norm, torch.Tensor) and delta_z_norm.numel() > 0:
+                delta_z_norm_trace.append(float(delta_z_norm.detach().mean().item()))
+            geo_energy = world_guidance.get("geo_energy")
+            if isinstance(geo_energy, torch.Tensor) and geo_energy.numel() > 0:
+                geo_energy_trace.append(float(geo_energy.detach().mean().item()))
+            drift_action_cos = world_guidance.get("drift_action_cos")
+            if isinstance(drift_action_cos, torch.Tensor) and drift_action_cos.numel() > 0:
+                drift_action_cos_trace.append(float(drift_action_cos.detach().mean().item()))
             rrr = world_guidance.get("rrr")
             if isinstance(rrr, torch.Tensor) and rrr.numel() > 0:
                 rrr_mean = float(rrr.detach().mean().item())
@@ -1065,11 +1236,46 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                         )
                     t = 0
                     force_replan = False
+                    if use_cuda_timing:
+                        step_end_event.record()
+                        per_step_events.append((step_start_event, step_end_event))
+                    else:
+                        per_step_cpu_ms.append(float((time.perf_counter() - step_start_cpu) * 1000.0))
                     continue
             predicted_task_tokens = world_guidance.get("pred_next_task_tokens")
             expected_change = world_guidance.get("expected_change")
             actions = actions + dt * pred_velocity
             t += 1
+            if use_cuda_timing:
+                step_end_event.record()
+                per_step_events.append((step_start_event, step_end_event))
+            else:
+                per_step_cpu_ms.append(float((time.perf_counter() - step_start_cpu) * 1000.0))
+
+        if use_cuda_timing:
+            flow_end_event.record()
+            torch.cuda.synchronize(device=device)
+            flow_total_ms = float(flow_start_event.elapsed_time(flow_end_event))
+            step_ms_values = [float(s.elapsed_time(e)) for s, e in per_step_events]
+            reflex_ms_values = [float(s.elapsed_time(e)) for s, e in reflex_events]
+        else:
+            flow_total_ms = float((time.perf_counter() - flow_start_cpu) * 1000.0)
+            step_ms_values = per_step_cpu_ms
+            reflex_ms_values = reflex_cpu_ms
+
+        if len(step_ms_values) > 0:
+            flow_step_ms_mean = float(sum(step_ms_values) / len(step_ms_values))
+            flow_step_ms_max = float(max(step_ms_values))
+        else:
+            flow_step_ms_mean = 0.0
+            flow_step_ms_max = 0.0
+
+        reflex_total_ms = float(sum(reflex_ms_values)) if len(reflex_ms_values) > 0 else 0.0
+        reflex_step_ms_mean = float(reflex_total_ms / len(reflex_ms_values)) if len(reflex_ms_values) > 0 else 0.0
+        reflex_step_ms_max = float(max(reflex_ms_values)) if len(reflex_ms_values) > 0 else 0.0
+        reflex_share = float(reflex_total_ms / max(flow_total_ms, 1e-6))
+        drift_response_lag_ms = float(reflex_ms_values[0]) if len(reflex_ms_values) > 0 else 0.0
+        effective_control_hz = float(1000.0 * len(reflex_ms_values) / max(flow_total_ms, 1e-6))
 
         if not return_info:
             return actions
@@ -1080,6 +1286,32 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             "replan_count": int(replans),
             "predicted_task_tokens": predicted_task_tokens.detach() if isinstance(predicted_task_tokens, torch.Tensor) else None,
             "expected_change": expected_change.detach() if isinstance(expected_change, torch.Tensor) else None,
+            "timing/flow_total_ms": flow_total_ms,
+            "timing/flow_step_ms_mean": flow_step_ms_mean,
+            "timing/flow_step_ms_max": flow_step_ms_max,
+            "timing/flow_step_count": int(len(step_ms_values)),
+            "timing/reflex_total_ms": reflex_total_ms,
+            "timing/reflex_step_ms_mean": reflex_step_ms_mean,
+            "timing/reflex_step_ms_max": reflex_step_ms_max,
+            "timing/reflex_step_count": int(len(reflex_ms_values)),
+            "timing/reflex_share": reflex_share,
+            "timing/drift_response_lag_ms": drift_response_lag_ms,
+            "timing/effective_control_hz": effective_control_hz,
+            "geo/delta_z_norm_last": float(delta_z_norm_trace[-1]) if len(delta_z_norm_trace) > 0 else None,
+            "geo/delta_z_norm_mean": float(sum(delta_z_norm_trace) / len(delta_z_norm_trace)) if len(delta_z_norm_trace) > 0 else None,
+            "geo/energy_last": float(geo_energy_trace[-1]) if len(geo_energy_trace) > 0 else None,
+            "geo/energy_mean": float(sum(geo_energy_trace) / len(geo_energy_trace)) if len(geo_energy_trace) > 0 else None,
+            "geo/drift_action_cos_last": float(drift_action_cos_trace[-1]) if len(drift_action_cos_trace) > 0 else None,
+            "geo/drift_action_cos_mean": float(sum(drift_action_cos_trace) / len(drift_action_cos_trace)) if len(drift_action_cos_trace) > 0 else None,
+            "geo/delta_z_norm_trace": delta_z_norm_trace,
+            "geo/energy_trace": geo_energy_trace,
+            "geo/drift_action_cos_trace": drift_action_cos_trace,
+            "feedback/token_num": int(feedback_tokens.shape[1]) if isinstance(feedback_tokens, torch.Tensor) else 0,
+            "feedback/token_norm_mean": (
+                float(feedback_tokens.detach().norm(dim=-1).mean().item())
+                if isinstance(feedback_tokens, torch.Tensor)
+                else 0.0
+            ),
         }
         return actions, info
 

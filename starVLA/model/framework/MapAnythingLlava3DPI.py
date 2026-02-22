@@ -1,6 +1,8 @@
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
+import time
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
 import numpy as np
 from PIL import Image
 
@@ -43,6 +45,61 @@ class MapAnythingLlava3D_PI(baseframework):
         self.normalize_vl_hidden = bool(
             getattr(self.config.framework.mapanything_llava3d, "normalize_vl_hidden", False)
         )
+        action_cfg = self.config.framework.action_model
+        self.enable_causal_feedback_token = bool(
+            getattr(action_cfg, "enable_causal_feedback_token", False)
+        )
+        self.causal_feedback_token_num = max(
+            1, int(getattr(action_cfg, "causal_feedback_token_num", 1))
+        )
+        self.causal_feedback_detach_delta = bool(
+            getattr(action_cfg, "causal_feedback_detach_delta", True)
+        )
+        self.causal_feedback_detach_action = bool(
+            getattr(action_cfg, "causal_feedback_detach_action", True)
+        )
+        self.causal_feedback_use_valid_mask = bool(
+            getattr(action_cfg, "causal_feedback_use_valid_mask", True)
+        )
+        self.causal_feedback_scale = float(
+            getattr(action_cfg, "causal_feedback_scale", 1.0)
+        )
+        self.causal_feedback_dropout_p = float(
+            getattr(action_cfg, "causal_feedback_dropout", 0.0)
+        )
+        action_dim = int(getattr(action_cfg, "action_dim", 0) or 0)
+        self._causal_feedback_hidden_size = int(llm_hidden_size)
+        self._causal_feedback_ready = bool(
+            self.enable_causal_feedback_token
+            and action_dim > 0
+            and self._causal_feedback_hidden_size > 0
+        )
+        if self.enable_causal_feedback_token and not self._causal_feedback_ready:
+            logger.warning(
+                "[causal_feedback] disabled due to invalid dimensions: hidden=%s action_dim=%s",
+                self._causal_feedback_hidden_size,
+                action_dim,
+            )
+        if self._causal_feedback_ready:
+            self.causal_feedback_delta_norm = nn.LayerNorm(self._causal_feedback_hidden_size)
+            self.causal_feedback_action_proj = nn.Linear(action_dim, self._causal_feedback_hidden_size)
+            self.causal_feedback_action_norm = nn.LayerNorm(self._causal_feedback_hidden_size)
+            self.causal_feedback_fuse = nn.Sequential(
+                nn.LayerNorm(self._causal_feedback_hidden_size * 2),
+                nn.Linear(self._causal_feedback_hidden_size * 2, self._causal_feedback_hidden_size),
+                nn.GELU(),
+                nn.Linear(
+                    self._causal_feedback_hidden_size,
+                    self.causal_feedback_token_num * self._causal_feedback_hidden_size,
+                ),
+            )
+            self.causal_feedback_dropout = nn.Dropout(self.causal_feedback_dropout_p)
+        else:
+            self.causal_feedback_delta_norm = None
+            self.causal_feedback_action_proj = None
+            self.causal_feedback_action_norm = None
+            self.causal_feedback_fuse = None
+            self.causal_feedback_dropout = None
 
         self.action_model: LayerwiseFlowmatchingActionHead = get_action_model(config=self.config)
 
@@ -149,6 +206,198 @@ class MapAnythingLlava3D_PI(baseframework):
             return "unknown"
         return key[:64]
 
+    @staticmethod
+    def _synchronize_cuda_for_timing(reference: Optional[torch.Tensor] = None) -> None:
+        if not torch.cuda.is_available():
+            return
+        try:
+            if isinstance(reference, torch.Tensor) and reference.device.type == "cuda":
+                torch.cuda.synchronize(device=reference.device)
+            else:
+                torch.cuda.synchronize()
+        except Exception:
+            # Timing should never break runtime.
+            pass
+
+    def _start_step_timer(self, device: Optional[torch.device] = None) -> dict:
+        """Start a timing window with CUDA events when possible."""
+        use_cuda = bool(torch.cuda.is_available())
+        if use_cuda:
+            timer_device = None
+            if isinstance(device, torch.device) and device.type == "cuda":
+                timer_device = device
+            try:
+                if timer_device is not None:
+                    torch.cuda.synchronize(device=timer_device)
+                else:
+                    torch.cuda.synchronize()
+            except Exception:
+                pass
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            return {
+                "mode": "cuda",
+                "start_event": start_event,
+                "end_event": end_event,
+                "device": timer_device,
+            }
+        return {"mode": "cpu", "start_time": time.perf_counter()}
+
+    def _stop_step_timer(self, timer_ctx: dict, reference: Optional[torch.Tensor] = None) -> float:
+        """Finish timing window and return milliseconds."""
+        if not isinstance(timer_ctx, dict):
+            return 0.0
+        if timer_ctx.get("mode") == "cuda":
+            start_event = timer_ctx.get("start_event", None)
+            end_event = timer_ctx.get("end_event", None)
+            if start_event is None or end_event is None:
+                return 0.0
+            end_event.record()
+            try:
+                if isinstance(reference, torch.Tensor) and reference.device.type == "cuda":
+                    torch.cuda.synchronize(device=reference.device)
+                else:
+                    timer_device = timer_ctx.get("device", None)
+                    if isinstance(timer_device, torch.device) and timer_device.type == "cuda":
+                        torch.cuda.synchronize(device=timer_device)
+                    else:
+                        torch.cuda.synchronize()
+            except Exception:
+                pass
+            return float(start_event.elapsed_time(end_event))
+        if "start_time" not in timer_ctx:
+            return 0.0
+        return float((time.perf_counter() - float(timer_ctx["start_time"])) * 1000.0)
+
+    def _infer_control_hz(self) -> float:
+        action_cfg = getattr(getattr(self.config, "framework", None), "action_model", None)
+        candidates = (
+            "control_hz",
+            "control_frequency_hz",
+            "policy_hz",
+            "execution_hz",
+        )
+        for key in candidates:
+            try:
+                value = getattr(action_cfg, key, None)
+                if value is None:
+                    continue
+                value = float(value)
+                if value > 0:
+                    return value
+            except Exception:
+                continue
+        # Keep a conservative default aligned with LIBERO-style control loops.
+        return 20.0
+
+    def _build_causal_feedback_tokens(
+        self,
+        *,
+        task_tokens: Optional[torch.Tensor],
+        task_tokens_next: Optional[torch.Tensor],
+        action_chunk: Optional[torch.Tensor],
+        valid_tk_mask: Optional[torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
+        stats: Dict[str, float] = {
+            "debug/causal_feedback/enabled": float(self._causal_feedback_ready),
+            "debug/causal_feedback/applied": 0.0,
+        }
+        if not self._causal_feedback_ready:
+            return None, stats
+        if not isinstance(task_tokens, torch.Tensor):
+            return None, stats
+        if not isinstance(task_tokens_next, torch.Tensor):
+            stats["debug/causal_feedback/missing_next_tokens"] = 1.0
+            return None, stats
+        if not isinstance(action_chunk, torch.Tensor):
+            return None, stats
+        if task_tokens.shape != task_tokens_next.shape:
+            logger.warning(
+                "[causal_feedback] skip due to shape mismatch task=%s next=%s",
+                tuple(task_tokens.shape),
+                tuple(task_tokens_next.shape),
+            )
+            stats["debug/causal_feedback/shape_mismatch"] = 1.0
+            return None, stats
+        if task_tokens.ndim != 3:
+            logger.warning(
+                "[causal_feedback] skip due to invalid task token ndim=%s",
+                task_tokens.ndim,
+            )
+            stats["debug/causal_feedback/invalid_task_ndim"] = 1.0
+            return None, stats
+        batch_size, _, hidden = task_tokens.shape
+        if hidden != self._causal_feedback_hidden_size:
+            logger.warning(
+                "[causal_feedback] skip due to hidden mismatch hidden=%s expected=%s",
+                hidden,
+                self._causal_feedback_hidden_size,
+            )
+            stats["debug/causal_feedback/hidden_mismatch"] = 1.0
+            return None, stats
+        if action_chunk.ndim != 3 or action_chunk.shape[0] != batch_size:
+            logger.warning(
+                "[causal_feedback] skip due to invalid action chunk shape=%s batch=%s",
+                tuple(action_chunk.shape),
+                batch_size,
+            )
+            stats["debug/causal_feedback/invalid_action_shape"] = 1.0
+            return None, stats
+
+        z_before = task_tokens.mean(dim=1)
+        z_after = task_tokens_next.mean(dim=1)
+        delta_z = z_after - z_before
+        if self.causal_feedback_detach_delta:
+            delta_z = delta_z.detach()
+        delta_z = delta_z.to(dtype=task_tokens.dtype)
+        action_context = action_chunk.mean(dim=1).to(device=task_tokens.device, dtype=task_tokens.dtype)
+        if self.causal_feedback_detach_action:
+            action_context = action_context.detach()
+
+        delta_feat = self.causal_feedback_delta_norm(delta_z)
+        action_feat = self.causal_feedback_action_norm(self.causal_feedback_action_proj(action_context))
+        fused = torch.cat((delta_feat, action_feat), dim=-1)
+        feedback_flat = self.causal_feedback_fuse(fused)
+        feedback_flat = self.causal_feedback_dropout(feedback_flat)
+        feedback_tokens = feedback_flat.view(
+            batch_size,
+            self.causal_feedback_token_num,
+            self._causal_feedback_hidden_size,
+        )
+        if self.causal_feedback_scale != 1.0:
+            feedback_tokens = feedback_tokens * float(self.causal_feedback_scale)
+
+        if (
+            self.causal_feedback_use_valid_mask
+            and isinstance(valid_tk_mask, torch.Tensor)
+            and valid_tk_mask.numel() == batch_size
+        ):
+            valid = valid_tk_mask.to(device=feedback_tokens.device, dtype=feedback_tokens.dtype).view(-1, 1, 1)
+            valid = valid.clamp(0.0, 1.0)
+            feedback_tokens = feedback_tokens * valid
+            delta_z = delta_z * valid.view(batch_size, 1)
+            stats["debug/causal_feedback/valid_tk_ratio"] = float((valid > 0.5).float().mean().item())
+
+        with torch.no_grad():
+            stats.update(
+                {
+                    "debug/causal_feedback/applied": 1.0,
+                    "debug/causal_feedback/token_num": float(feedback_tokens.shape[1]),
+                    "debug/causal_feedback/token_hidden": float(feedback_tokens.shape[2]),
+                    "debug/causal_feedback/delta_z_norm_mean": float(
+                        delta_z.detach().norm(dim=-1).mean().item()
+                    ),
+                    "debug/causal_feedback/token_norm_mean": float(
+                        feedback_tokens.detach().norm(dim=-1).mean().item()
+                    ),
+                    "debug/causal_feedback/token_absmax": float(
+                        feedback_tokens.detach().abs().max().item()
+                    ),
+                }
+            )
+        return feedback_tokens, stats
+
     def forward(
         self,
         examples: List[dict] = None,
@@ -167,6 +416,20 @@ class MapAnythingLlava3D_PI(baseframework):
             state = None
         has_temporal_images = any("image_tk" in example for example in examples)
         valid_tk_values = [float(example.get("valid_tk", 1.0)) for example in examples]
+        configured_task_token_num = None
+        try:
+            ma_cfg = getattr(getattr(self.config, "framework", None), "mapanything_llava3d", None)
+            if ma_cfg is not None and hasattr(ma_cfg, "task_token_num"):
+                configured_task_token_num = int(getattr(ma_cfg, "task_token_num"))
+        except Exception:
+            configured_task_token_num = None
+        if configured_task_token_num is not None and configured_task_token_num < 1:
+            configured_task_token_num = None
+        vlm_t_ms = 0.0
+        vlm_tk_ms = 0.0
+        temporal_sync_ms = 0.0
+        action_head_ms = 0.0
+        forward_timer = self._start_step_timer()
 
         if not hasattr(self, "_debug_logged_instructions"):
             try:
@@ -185,6 +448,7 @@ class MapAnythingLlava3D_PI(baseframework):
             images=batch_images_t,
             instructions=instructions,
         )
+        vlm_t_timer = self._start_step_timer()
         task_tokens_next = None
         valid_tk_tensor = None
         with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -211,6 +475,15 @@ class MapAnythingLlava3D_PI(baseframework):
             task_tokens = getattr(vlm_outputs, "task_hidden_states", None)
             if isinstance(task_tokens, torch.Tensor):
                 task_tokens = task_tokens.to(device=base_hidden.device, dtype=base_hidden.dtype)
+                if task_tokens.ndim != 3:
+                    raise ValueError(
+                        f"`task_hidden_states` must be [B,K,H], got shape={tuple(task_tokens.shape)}"
+                    )
+                if configured_task_token_num is not None and task_tokens.shape[1] != configured_task_token_num:
+                    raise ValueError(
+                        f"`task_hidden_states` token count mismatch: got K={task_tokens.shape[1]}, "
+                        f"expected configured K={configured_task_token_num}"
+                    )
             attention_mask = vlm_inputs.get("attention_mask", None)
             if isinstance(attention_mask, torch.Tensor):
                 attention_mask = attention_mask.to(device=base_hidden.device)
@@ -219,6 +492,7 @@ class MapAnythingLlava3D_PI(baseframework):
                 device=base_hidden.device,
                 dtype=base_hidden.dtype,
             ).clamp(0.0, 1.0)
+            vlm_t_ms = self._stop_step_timer(vlm_t_timer, reference=base_hidden)
             debug_metrics = {}
             try:
                 try:
@@ -236,6 +510,10 @@ class MapAnythingLlava3D_PI(baseframework):
                     debug_metrics["debug/timing/geom_model_forward_ms"] = float(geom_model_forward_ms)
                 if isinstance(geom_feature_extract_ms, (int, float)):
                     debug_metrics["debug/timing/geom_feature_extract_ms"] = float(geom_feature_extract_ms)
+                if isinstance(geom_model_forward_ms, (int, float)) or isinstance(geom_feature_extract_ms, (int, float)):
+                    gmf = float(geom_model_forward_ms) if isinstance(geom_model_forward_ms, (int, float)) else 0.0
+                    gfe = float(geom_feature_extract_ms) if isinstance(geom_feature_extract_ms, (int, float)) else 0.0
+                    debug_metrics["debug/timing/perception_ms"] = float(gfe if gfe > 0.0 else gmf)
                 if isinstance(geom_stats, list) and geom_stats:
                     by_tag = {}
                     for record in reversed(geom_stats):
@@ -321,11 +599,13 @@ class MapAnythingLlava3D_PI(baseframework):
                 debug_metrics = debug_metrics
 
             if has_temporal_images:
+                sync_timer = self._start_step_timer(device=base_hidden.device)
                 try:
                     vlm_inputs_next = self.mapanythingllava3d_vlm_interface.build_mapanythingllava3d_inputs(
                         images=batch_images_tk,
                         instructions=instructions,
                     )
+                    vlm_tk_timer = self._start_step_timer(device=base_hidden.device)
                     with torch.no_grad():
                         vlm_outputs_next = self.mapanythingllava3d_vlm_interface(
                             **vlm_inputs_next,
@@ -334,28 +614,66 @@ class MapAnythingLlava3D_PI(baseframework):
                             output_hidden_states=False,
                             return_dict=True,
                         )
+                    vlm_tk_ms = self._stop_step_timer(vlm_tk_timer, reference=base_hidden)
                     task_tokens_next = getattr(vlm_outputs_next, "task_hidden_states", None)
                     if isinstance(task_tokens_next, torch.Tensor):
                         task_tokens_next = task_tokens_next.to(
                             device=base_hidden.device,
                             dtype=base_hidden.dtype,
                         )
+                        if task_tokens_next.ndim != 3:
+                            raise ValueError(
+                                f"`task_tokens_next` must be [B,K,H], got shape={tuple(task_tokens_next.shape)}"
+                            )
                         if isinstance(task_tokens, torch.Tensor) and task_tokens_next.shape[0] != task_tokens.shape[0]:
                             logger.warning(
                                 f"[temporal_supervision] batch mismatch for task_tokens_next: "
                                 f"{tuple(task_tokens_next.shape)} vs {tuple(task_tokens.shape)}; drop next tokens."
                             )
                             task_tokens_next = None
+                        if (
+                            isinstance(task_tokens, torch.Tensor)
+                            and isinstance(task_tokens_next, torch.Tensor)
+                            and (
+                                task_tokens_next.shape[1] != task_tokens.shape[1]
+                                or task_tokens_next.shape[2] != task_tokens.shape[2]
+                            )
+                        ):
+                            logger.warning(
+                                "[temporal_supervision] task token shape mismatch t vs t+k: %s vs %s; drop next tokens.",
+                                tuple(task_tokens.shape),
+                                tuple(task_tokens_next.shape),
+                            )
+                            task_tokens_next = None
                 except Exception as exc:
                     logger.warning(f"[temporal_supervision] failed to build next-step task tokens: {exc}")
                     task_tokens_next = None
+                temporal_sync_ms = self._stop_step_timer(sync_timer, reference=base_hidden)
 
             debug_metrics["debug/temporal/has_image_tk"] = float(has_temporal_images)
             debug_metrics["debug/temporal/valid_tk_ratio"] = float(valid_tk_tensor.mean().item())
             debug_metrics["debug/temporal/task_tokens_next_available"] = float(
                 isinstance(task_tokens_next, torch.Tensor)
             )
+            if isinstance(task_tokens, torch.Tensor):
+                debug_metrics["debug/temporal/task_token_num"] = float(task_tokens.shape[1])
+                debug_metrics["debug/temporal/task_token_hidden_size"] = float(task_tokens.shape[2])
+            if configured_task_token_num is not None:
+                debug_metrics["debug/temporal/task_token_num_config"] = float(configured_task_token_num)
+            try:
+                control_hz = float(self._infer_control_hz())
+                action_horizon = int(getattr(self.config.framework.action_model, "action_horizon", self.future_action_window_size + 1))
+                chunk_execution_ms = float(1000.0 * float(action_horizon) / max(control_hz, 1e-6))
+                debug_metrics["debug/timing/control_hz"] = float(control_hz)
+                debug_metrics["debug/timing/chunk_execution_ms"] = float(chunk_execution_ms)
+                if "debug/timing/perception_ms" in debug_metrics:
+                    debug_metrics["debug/timing/perception_over_chunk"] = float(
+                        float(debug_metrics["debug/timing/perception_ms"]) / max(chunk_execution_ms, 1e-6)
+                    )
+            except Exception:
+                pass
 
+        action_head_timer = self._start_step_timer(device=base_hidden.device)
         with torch.autocast("cuda", dtype=torch.float32):
             actions = torch.tensor(
                 np.array(actions), device=base_hidden.device, dtype=base_hidden.dtype
@@ -401,6 +719,16 @@ class MapAnythingLlava3D_PI(baseframework):
                     task_tokens_next_repeated,
                     task_tokens_repeated.detach(),
                 )
+            feedback_tokens_repeated = None
+            feedback_stats = {}
+            if self._causal_feedback_ready:
+                feedback_tokens_repeated, feedback_stats = self._build_causal_feedback_tokens(
+                    task_tokens=task_tokens_repeated,
+                    task_tokens_next=task_tokens_next_repeated,
+                    action_chunk=actions_target_repeated,
+                    valid_tk_mask=valid_tk_repeated,
+                )
+                debug_metrics.update(feedback_stats)
 
             state_repeated = None
             if state is not None:
@@ -417,6 +745,7 @@ class MapAnythingLlava3D_PI(baseframework):
                 task_tokens=task_tokens_repeated,
                 task_tokens_next=task_tokens_next_repeated,
                 valid_tk=valid_tk_repeated,
+                feedback_tokens=feedback_tokens_repeated,
             )
             try:
                 layer_means = getattr(self.action_model, "_last_dit_layer_means", None)
@@ -478,6 +807,24 @@ class MapAnythingLlava3D_PI(baseframework):
                             debug_metrics[f"{prefix}_absmax"] = float(rec["absmax"])
             except Exception:
                 debug_metrics = debug_metrics
+        action_head_ms = self._stop_step_timer(action_head_timer, reference=base_hidden)
+        forward_total_ms = self._stop_step_timer(forward_timer, reference=base_hidden)
+        vlm_total_ms = float(vlm_t_ms + vlm_tk_ms)
+        debug_metrics["debug/timing/train_vlm_t_ms"] = float(vlm_t_ms)
+        debug_metrics["debug/timing/train_vlm_tk_ms"] = float(vlm_tk_ms)
+        debug_metrics["debug/timing/train_vlm_total_ms"] = float(vlm_total_ms)
+        debug_metrics["debug/timing/train_temporal_sync_ms"] = float(temporal_sync_ms)
+        debug_metrics["debug/timing/train_action_head_ms"] = float(action_head_ms)
+        debug_metrics["debug/timing/train_forward_total_ms"] = float(forward_total_ms)
+        debug_metrics["debug/timing/vlm_forward_ratio"] = float(vlm_total_ms / max(forward_total_ms, 1e-6))
+        debug_metrics["debug/timing/temporal_sync_ratio"] = float(
+            temporal_sync_ms / max(forward_total_ms, 1e-6)
+        )
+        debug_metrics["debug/timing/vlm_tk_over_vlm_t"] = float(vlm_tk_ms / max(vlm_t_ms, 1e-6))
+        if "debug/timing/perception_ms" in debug_metrics:
+            debug_metrics["debug/timing/geometric_latency_ms"] = float(
+                debug_metrics["debug/timing/perception_ms"]
+            )
 
         return {"action_loss": action_loss, "debug_metrics": debug_metrics}
 
@@ -507,6 +854,10 @@ class MapAnythingLlava3D_PI(baseframework):
 
         vlm_inputs = self.mapanythingllava3d_vlm_interface.build_mapanythingllava3d_inputs(images=batch_images, instructions=instructions)
         debug_info = None
+        self._synchronize_cuda_for_timing()
+        brain_t0 = time.perf_counter()
+        self._synchronize_cuda_for_timing()
+        vlm_t0 = time.perf_counter()
         with torch.autocast("cuda", dtype=torch.bfloat16):
             vlm_outputs = self.mapanythingllava3d_vlm_interface(
                 **vlm_inputs,
@@ -1016,12 +1367,35 @@ class MapAnythingLlava3D_PI(baseframework):
                 debug_info["vl_layer_rms"] = vl_layer_rms
                 debug_info["lang_layer_rms"] = lang_layer_rms
                 debug_info["image_layer_rms"] = image_layer_rms
+        self._synchronize_cuda_for_timing(base_hidden)
+        vlm_forward_ms = float((time.perf_counter() - vlm_t0) * 1000.0)
 
         state_tensor = torch.from_numpy(np.array(state)).to(base_hidden.device, dtype=base_hidden.dtype) if state is not None else None
+        feedback_tokens = kwargs.get("feedback_tokens", None)
+        if feedback_tokens is not None:
+            if not isinstance(feedback_tokens, torch.Tensor):
+                feedback_tokens = torch.tensor(np.array(feedback_tokens), device=base_hidden.device, dtype=base_hidden.dtype)
+            else:
+                feedback_tokens = feedback_tokens.to(device=base_hidden.device, dtype=base_hidden.dtype)
+            if feedback_tokens.ndim == 2:
+                feedback_tokens = feedback_tokens.unsqueeze(1)
+            if feedback_tokens.ndim != 3:
+                raise ValueError(
+                    f"`feedback_tokens` must be [B, Kf, H] or [B, H], got shape={tuple(feedback_tokens.shape)}"
+                )
+            if feedback_tokens.shape[0] != base_hidden.shape[0]:
+                if feedback_tokens.shape[0] == 1:
+                    feedback_tokens = feedback_tokens.expand(base_hidden.shape[0], -1, -1)
+                else:
+                    raise ValueError(
+                        f"`feedback_tokens` batch mismatch: got {feedback_tokens.shape[0]}, expected {base_hidden.shape[0]}"
+                    )
         attention_mask = vlm_inputs.get("attention_mask", None)
         if isinstance(attention_mask, torch.Tensor):
             attention_mask = attention_mask.to(device=base_hidden.device)
 
+        self._synchronize_cuda_for_timing(base_hidden)
+        action_t0 = time.perf_counter()
         with torch.autocast("cuda", dtype=torch.float32):
             pred_action_output = self.action_model.predict_action(
                 vl_embs_list,
@@ -1029,6 +1403,7 @@ class MapAnythingLlava3D_PI(baseframework):
                 noise_seed=deterministic_seed,
                 encoder_attention_mask=attention_mask,
                 task_tokens=task_tokens,
+                feedback_tokens=feedback_tokens,
                 force_replan=force_replan,
                 rrr_threshold=self.rrr_replan_threshold,
                 return_info=True,
@@ -1038,6 +1413,10 @@ class MapAnythingLlava3D_PI(baseframework):
             else:
                 pred_actions = pred_action_output
                 planning_info = {}
+        self._synchronize_cuda_for_timing(pred_actions if isinstance(pred_actions, torch.Tensor) else base_hidden)
+        action_head_wall_ms = float((time.perf_counter() - action_t0) * 1000.0)
+        self._synchronize_cuda_for_timing(pred_actions if isinstance(pred_actions, torch.Tensor) else base_hidden)
+        brain_total_ms = float((time.perf_counter() - brain_t0) * 1000.0)
 
         if isinstance(task_tokens, torch.Tensor):
             self._rrr_prev_observed_task_tokens = task_tokens.detach()
@@ -1049,6 +1428,51 @@ class MapAnythingLlava3D_PI(baseframework):
             self._rrr_prev_expected_change = expected_change.detach()
 
         normalized_actions = pred_actions.detach().cpu().numpy()
+        flow_total_ms = 0.0
+        flow_step_ms_mean = 0.0
+        flow_step_ms_max = 0.0
+        flow_step_count = 0
+        reflex_total_ms = 0.0
+        reflex_step_ms_mean = 0.0
+        reflex_step_ms_max = 0.0
+        reflex_step_count = 0
+        reflex_share = 0.0
+        if isinstance(planning_info, dict):
+            try:
+                flow_total_ms = float(planning_info.get("timing/flow_total_ms", flow_total_ms))
+                flow_step_ms_mean = float(planning_info.get("timing/flow_step_ms_mean", flow_step_ms_mean))
+                flow_step_ms_max = float(planning_info.get("timing/flow_step_ms_max", flow_step_ms_max))
+                flow_step_count = int(planning_info.get("timing/flow_step_count", flow_step_count))
+                reflex_total_ms = float(planning_info.get("timing/reflex_total_ms", reflex_total_ms))
+                reflex_step_ms_mean = float(planning_info.get("timing/reflex_step_ms_mean", reflex_step_ms_mean))
+                reflex_step_ms_max = float(planning_info.get("timing/reflex_step_ms_max", reflex_step_ms_max))
+                reflex_step_count = int(planning_info.get("timing/reflex_step_count", reflex_step_count))
+                reflex_share = float(planning_info.get("timing/reflex_share", reflex_share))
+            except Exception:
+                pass
+
+        vlm_core = getattr(self.mapanythingllava3d_vlm_interface, "model", None)
+        geom_model_forward_ms = getattr(vlm_core, "debug_last_geom_model_forward_ms", None)
+        geom_feature_extract_ms = getattr(vlm_core, "debug_last_geom_feature_extract_ms", None)
+        geom_model_forward_ms = float(geom_model_forward_ms) if isinstance(geom_model_forward_ms, (int, float)) else 0.0
+        geom_feature_extract_ms = float(geom_feature_extract_ms) if isinstance(geom_feature_extract_ms, (int, float)) else 0.0
+        perception_ms = geom_feature_extract_ms if geom_feature_extract_ms > 0.0 else geom_model_forward_ms
+
+        action_cfg = getattr(getattr(self.config, "framework", None), "action_model", None)
+        try:
+            action_horizon = int(getattr(action_cfg, "action_horizon", int(normalized_actions.shape[1])))
+        except Exception:
+            action_horizon = int(normalized_actions.shape[1]) if normalized_actions.ndim >= 2 else 1
+        control_hz = float(self._infer_control_hz())
+        chunk_execution_ms = float(1000.0 * float(action_horizon) / max(control_hz, 1e-6))
+        control_cycle_ms = float(1000.0 / max(control_hz, 1e-6))
+
+        brain_from_parts_ms = float(vlm_forward_ms + (flow_total_ms if flow_total_ms > 0.0 else action_head_wall_ms))
+        perception_over_chunk = float(perception_ms / max(chunk_execution_ms, 1e-6))
+        brain_over_chunk = float(brain_total_ms / max(chunk_execution_ms, 1e-6))
+        reflex_over_chunk = float(reflex_total_ms / max(chunk_execution_ms, 1e-6))
+        reflex_step_over_cycle = float(reflex_step_ms_mean / max(control_cycle_ms, 1e-6))
+
         output = {"normalized_actions": normalized_actions}
         if return_debug_info:
             if debug_info is None:
@@ -1069,6 +1493,74 @@ class MapAnythingLlava3D_PI(baseframework):
                 debug_info["rrr_max"] = planning_info.get("rrr_max")
                 debug_info["rrr_trace"] = planning_info.get("rrr_trace")
                 debug_info["rrr_replan_count"] = planning_info.get("replan_count")
+                for k, v in planning_info.items():
+                    if isinstance(k, str) and k.startswith("timing/") and isinstance(v, (int, float)):
+                        debug_info[k] = float(v)
+                    elif isinstance(k, str) and k.startswith("geo/"):
+                        if isinstance(v, (int, float)):
+                            debug_info[k] = float(v)
+                        elif isinstance(v, list):
+                            try:
+                                debug_info[k] = [float(x) for x in v]
+                            except Exception:
+                                debug_info[k] = v
+            debug_info["timing/vlm_forward_ms"] = float(vlm_forward_ms)
+            debug_info["timing/action_head_wall_ms"] = float(action_head_wall_ms)
+            debug_info["timing/brain_total_ms"] = float(brain_total_ms)
+            debug_info["timing/brain_from_parts_ms"] = float(brain_from_parts_ms)
+            debug_info["timing/perception_ms"] = float(perception_ms)
+            debug_info["timing/perception_geom_model_forward_ms"] = float(geom_model_forward_ms)
+            debug_info["timing/perception_geom_feature_extract_ms"] = float(geom_feature_extract_ms)
+            debug_info["timing/chunk_execution_ms"] = float(chunk_execution_ms)
+            debug_info["timing/control_cycle_ms"] = float(control_cycle_ms)
+            debug_info["timing/action_horizon"] = int(action_horizon)
+            debug_info["timing/control_hz"] = float(control_hz)
+            debug_info["timing/perception_over_chunk"] = float(perception_over_chunk)
+            debug_info["timing/brain_over_chunk"] = float(brain_over_chunk)
+            debug_info["timing/reflex_over_chunk"] = float(reflex_over_chunk)
+            debug_info["timing/reflex_step_over_cycle"] = float(reflex_step_over_cycle)
+            debug_info["timing/perception_fits_chunk"] = float(perception_ms <= chunk_execution_ms)
+            debug_info["timing/brain_fits_chunk"] = float(brain_total_ms <= chunk_execution_ms)
+            debug_info["timing/reflex_step_fits_cycle"] = float(reflex_step_ms_mean <= control_cycle_ms)
+            # Derived from action-head timing, exposed here for single-place monitoring.
+            debug_info["timing/flow_total_ms_agg"] = float(flow_total_ms)
+            debug_info["timing/flow_step_ms_mean_agg"] = float(flow_step_ms_mean)
+            debug_info["timing/flow_step_ms_max_agg"] = float(flow_step_ms_max)
+            debug_info["timing/flow_step_count_agg"] = int(flow_step_count)
+            debug_info["timing/reflex_total_ms_agg"] = float(reflex_total_ms)
+            debug_info["timing/reflex_step_ms_mean_agg"] = float(reflex_step_ms_mean)
+            debug_info["timing/reflex_step_ms_max_agg"] = float(reflex_step_ms_max)
+            debug_info["timing/reflex_step_count_agg"] = int(reflex_step_count)
+            debug_info["timing/reflex_share_agg"] = float(reflex_share)
+
+            # Closed-loop delay proxies (estimates). These are useful before
+            # wiring true controller-side timestamps/indices.
+            drift_response_lag_ms = float(
+                debug_info.get("timing/drift_response_lag_ms", reflex_step_ms_mean)
+            )
+            drift_freshness_ms_est = float(perception_ms + drift_response_lag_ms)
+            command_overlap_ratio_est = float(
+                float(debug_info.get("timing/effective_control_hz", 0.0))
+                * (chunk_execution_ms / 1000.0)
+            )
+            phase_shift_steps_est = float(
+                drift_freshness_ms_est / max(control_cycle_ms, 1e-6)
+            )
+            debug_info["timing/drift_freshness_ms_est"] = drift_freshness_ms_est
+            debug_info["timing/command_overlap_ratio_est"] = command_overlap_ratio_est
+            debug_info["timing/phase_shift_steps_est"] = phase_shift_steps_est
+            debug_info["timing/phase_shift_steps_est_rounded"] = float(
+                round(phase_shift_steps_est)
+            )
+            debug_info["timing/drift_freshness_risky_est"] = float(
+                drift_freshness_ms_est > 150.0
+            )
+            debug_info["timing/phase_shift_risky_est"] = float(
+                phase_shift_steps_est > 2.0
+            )
+            debug_info["timing/command_overlap_insufficient_est"] = float(
+                command_overlap_ratio_est < 1.0
+            )
             output["debug_info"] = debug_info
         return output
 

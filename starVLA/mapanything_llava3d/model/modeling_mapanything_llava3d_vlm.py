@@ -113,6 +113,30 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
             dropout=0.0,
             batch_first=True,
         )
+        # Fixed-K task token construction (stable across time): learned queries
+        # attend over geometry/vision streams, instead of per-frame top-k gather.
+        self.task_token_num = int(getattr(config, "task_token_num", 32))
+        if self.task_token_num < 1:
+            self.task_token_num = 1
+        self.task_queries = nn.Parameter(torch.randn(self.task_token_num, self.hidden_size) * 0.02)
+        self.task_query_to_geo_attn = nn.MultiheadAttention(
+            embed_dim=self.hidden_size,
+            num_heads=self.semantic_num_heads,
+            dropout=0.0,
+            batch_first=True,
+        )
+        self.task_query_to_vis_attn = nn.MultiheadAttention(
+            embed_dim=self.hidden_size,
+            num_heads=self.semantic_num_heads,
+            dropout=0.0,
+            batch_first=True,
+        )
+        self.task_fuse_mlp = nn.Sequential(
+            nn.Linear(self.hidden_size * 3, self.hidden_size),
+            nn.GELU(),
+            nn.Linear(self.hidden_size, self.hidden_size),
+        )
+        self.task_fuse_norm = nn.LayerNorm(self.hidden_size)
 
         if config.use_spatial_token:
             self.spatial_embed_tokens = nn.Embedding(config.spatial_token_num, self.hidden_size)
@@ -401,8 +425,13 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
             self.debug_last_geom_feature_extract_ms = 0.0
             self._last_image_features = vision_feats
             if isinstance(vision_feats, torch.Tensor):
-                token_num = min(max(1, self.semantic_topk_tokens), vision_feats.shape[1])
-                self._last_task_tokens = vision_feats[:, :token_num].contiguous()
+                task_tokens = self._build_fixed_task_tokens(
+                    geometric_features=None,
+                    vision_features=vision_feats,
+                    language_queries=language_queries,
+                    language_query_mask=language_query_mask,
+                )
+                self._last_task_tokens = task_tokens
             else:
                 self._last_task_tokens = None
             self._record_health("image_features_output_vision_only", vision_feats)
@@ -452,6 +481,73 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
         self._last_task_tokens = task_tokens
         return final_features
 
+    def _build_fixed_task_tokens(
+        self,
+        geometric_features: Optional[torch.Tensor],
+        vision_features: torch.Tensor,
+        language_queries: Optional[torch.Tensor] = None,
+        language_query_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if not isinstance(vision_features, torch.Tensor) or vision_features.ndim != 3:
+            raise ValueError(
+                f"`vision_features` must be [B, Nv, H], got type={type(vision_features)} shape="
+                f"{None if not isinstance(vision_features, torch.Tensor) else tuple(vision_features.shape)}"
+            )
+        bsz, _, hidden = vision_features.shape
+        if hidden != self.hidden_size:
+            raise ValueError(
+                f"`vision_features` hidden dim mismatch: got {hidden}, expected {self.hidden_size}"
+            )
+        query = self.task_queries.to(device=vision_features.device, dtype=vision_features.dtype)
+        query = query.unsqueeze(0).expand(bsz, -1, -1)  # [B, K, H], K fixed by config
+
+        if isinstance(geometric_features, torch.Tensor):
+            if geometric_features.ndim != 3:
+                raise ValueError(f"`geometric_features` must be [B, Ng, H], got {tuple(geometric_features.shape)}")
+            if geometric_features.shape[0] != bsz or geometric_features.shape[-1] != self.hidden_size:
+                raise ValueError(
+                    f"`geometric_features` shape mismatch: got {tuple(geometric_features.shape)}, "
+                    f"expected [B={bsz}, Ng, H={self.hidden_size}]"
+                )
+            geo_context, _ = self.task_query_to_geo_attn(
+                query=query,
+                key=geometric_features,
+                value=geometric_features,
+                need_weights=False,
+            )
+        else:
+            geo_context = torch.zeros_like(query)
+
+        vis_context, _ = self.task_query_to_vis_attn(
+            query=query,
+            key=vision_features,
+            value=vision_features,
+            need_weights=False,
+        )
+
+        if isinstance(language_queries, torch.Tensor) and language_queries.ndim == 3:
+            lang_q = language_queries.to(device=vision_features.device, dtype=vision_features.dtype)
+            if isinstance(language_query_mask, torch.Tensor):
+                mask = language_query_mask.to(device=vision_features.device, dtype=torch.bool)
+                if mask.ndim == 2 and mask.shape[0] == bsz and mask.shape[1] == lang_q.shape[1]:
+                    weight = mask.unsqueeze(-1).to(dtype=lang_q.dtype)
+                    denom = weight.sum(dim=1).clamp_min(1.0)
+                    lang_summary = (lang_q * weight).sum(dim=1) / denom
+                else:
+                    lang_summary = lang_q.mean(dim=1)
+            else:
+                lang_summary = lang_q.mean(dim=1)
+        else:
+            # Fallback summary keeps interface stable even without language query extraction.
+            lang_summary = vision_features.mean(dim=1)
+        lang_summary = lang_summary.unsqueeze(1).expand(-1, self.task_token_num, -1)
+
+        fuse_in = torch.cat([geo_context, vis_context, lang_summary], dim=-1)
+        task_tokens = self.task_fuse_mlp(fuse_in)
+        task_tokens = self.task_fuse_norm(task_tokens + 0.5 * (geo_context + vis_context))
+        self._record_health("fusion/task_tokens_fixed_k", task_tokens)
+        return task_tokens
+
     def fusion_module(
         self,
         geometric_features,
@@ -461,42 +557,12 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
     ):
         geometric_features = self.geometric_projector(geometric_features).to(vision_features.dtype)
         self._record_health("fusion/geometric_projected", geometric_features)
-        if language_queries is None:
-            query_len = min(max(1, self.semantic_query_max_tokens), vision_features.shape[1])
-            semantic_query = vision_features[:, :query_len]
-            semantic_query_mask = None
-        else:
-            semantic_query = language_queries.to(device=vision_features.device, dtype=vision_features.dtype)
-            semantic_query_mask = language_query_mask
-            if isinstance(semantic_query_mask, torch.Tensor):
-                semantic_query_mask = semantic_query_mask.to(device=vision_features.device, dtype=torch.bool)
-                semantic_query = semantic_query * semantic_query_mask.unsqueeze(-1).to(dtype=semantic_query.dtype)
-
-        semantic_attn_out, semantic_attn_weights = self.semantic_anchor_attention(
-            query=semantic_query,
-            key=geometric_features,
-            value=geometric_features,
-            need_weights=True,
-            average_attn_weights=False,
+        task_tokens = self._build_fixed_task_tokens(
+            geometric_features=geometric_features,
+            vision_features=vision_features,
+            language_queries=language_queries,
+            language_query_mask=language_query_mask,
         )
-        self._record_health("fusion/semantic_attn_out", semantic_attn_out)
-        self._record_health("fusion/semantic_attn_weights", semantic_attn_weights)
-        semantic_attn_out = self.semantic_anchor_norm(semantic_attn_out + semantic_query)
-        self._record_health("fusion/semantic_attn_out_post_norm", semantic_attn_out)
-        if semantic_attn_weights.dim() == 4:
-            # [B, H, Nq, Ng] -> [B, Ng]
-            token_scores = semantic_attn_weights.mean(dim=(1, 2))
-        else:
-            # [B, Nq, Ng] -> [B, Ng]
-            token_scores = semantic_attn_weights.mean(dim=1)
-        self._record_health("fusion/token_scores", token_scores)
-        topk_num = min(max(1, self.semantic_topk_tokens), geometric_features.shape[1])
-        topk_indices = torch.topk(token_scores, k=topk_num, dim=-1).indices
-        gather_idx = topk_indices.unsqueeze(-1).expand(-1, -1, geometric_features.shape[-1])
-        task_tokens = torch.gather(geometric_features, dim=1, index=gather_idx)
-        semantic_summary = semantic_attn_out.mean(dim=1, keepdim=True)
-        task_tokens = task_tokens + semantic_summary
-        self._record_health("fusion/task_tokens", task_tokens)
 
         vision_context, _ = self.vision_semantic_attention(
             query=vision_features,
@@ -576,6 +642,16 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
                 language_query_mask=language_query_mask,
             )
             task_tokens = getattr(self, "_last_task_tokens", None)
+            if isinstance(task_tokens, torch.Tensor):
+                if task_tokens.ndim != 3:
+                    raise ValueError(
+                        f"`task_hidden_states` must be 3D [B, K, H], got shape={tuple(task_tokens.shape)}"
+                    )
+                if task_tokens.shape[1] != int(self.task_token_num):
+                    raise ValueError(
+                        f"`task_hidden_states` token_num mismatch: got K={task_tokens.shape[1]}, "
+                        f"expected fixed K={self.task_token_num}"
+                    )
             self._record_health("forward/image_features", image_features)
 
             if spatial_img_id is not None:

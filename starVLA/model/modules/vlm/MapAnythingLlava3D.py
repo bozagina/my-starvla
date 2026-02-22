@@ -77,6 +77,7 @@ class _MapAnythingLlava3D_Interface(nn.Module):
         normalize_instruction_whitespace = False
         strip_instruction = True
         instruction_log_interval = 0
+        task_token_num = 32
         base_vlm_path = None
         vision_model_name_or_path = _DEFAULT_VISION_MODEL
         language_model_name_or_path = _DEFAULT_LANGUAGE_MODEL
@@ -99,6 +100,14 @@ class _MapAnythingLlava3D_Interface(nn.Module):
                     strip_instruction = bool(getattr(ma_cfg, "strip_instruction"))
                 if hasattr(ma_cfg, "instruction_log_interval"):
                     instruction_log_interval = int(getattr(ma_cfg, "instruction_log_interval"))
+                if hasattr(ma_cfg, "task_token_num"):
+                    task_token_num = int(getattr(ma_cfg, "task_token_num"))
+                elif hasattr(ma_cfg, "num_task_tokens"):
+                    task_token_num = int(getattr(ma_cfg, "num_task_tokens"))
+                else:
+                    am_cfg = getattr(fw_cfg, "action_model", None) if fw_cfg is not None else None
+                    if am_cfg is not None and hasattr(am_cfg, "num_task_tokens"):
+                        task_token_num = int(getattr(am_cfg, "num_task_tokens"))
         except Exception:
             prefix_image_dropout_prob = 0.0
             prefix_lang_dropout_prob = 0.0
@@ -107,8 +116,12 @@ class _MapAnythingLlava3D_Interface(nn.Module):
             normalize_instruction_whitespace = False
             strip_instruction = True
             instruction_log_interval = 0
+            task_token_num = 32
+        if task_token_num < 1:
+            task_token_num = 1
         print(f"prefix_image_dropout_prob: {prefix_image_dropout_prob}")
         print(f"prefix_lang_dropout_prob: {prefix_lang_dropout_prob}")
+        print(f"task_token_num: {task_token_num}")
 
         model = None
         mapanything_cfg = None
@@ -128,6 +141,7 @@ class _MapAnythingLlava3D_Interface(nn.Module):
                 mapanything_cfg.prefix_image_dropout_prob = prefix_image_dropout_prob
                 mapanything_cfg.prefix_lang_dropout_prob = prefix_lang_dropout_prob
                 setattr(mapanything_cfg, "use_geometric_branch", use_geom)
+                setattr(mapanything_cfg, "task_token_num", int(task_token_num))
                 cfg_vision = getattr(mapanything_cfg, "vision_model_name_or_path", None)
                 cfg_language = getattr(mapanything_cfg, "language_model_name_or_path", None)
                 if isinstance(cfg_vision, str) and cfg_vision:
@@ -151,6 +165,7 @@ class _MapAnythingLlava3D_Interface(nn.Module):
                 use_geom=use_geom,
                 prefix_image_dropout_prob=prefix_image_dropout_prob,
                 prefix_lang_dropout_prob=prefix_lang_dropout_prob,
+                task_token_num=int(task_token_num),
             )
             model = MapAnythingLlava3DForConditionalGeneration(mapanything_cfg)
         image_processor = AutoImageProcessor.from_pretrained(vision_model_name_or_path, trust_remote_code=True)

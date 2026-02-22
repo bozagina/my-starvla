@@ -1020,6 +1020,24 @@ class VLATrainer(TrainerUtils):
                 g_rms = (grad_sq / grad_count)**0.5 if grad_count > 0 else None
             return w_l2, w_rms, g_l2, g_rms
 
+        def grad_l2_from_objects(objects):
+            grad_sq = 0.0
+            for obj in objects:
+                if obj is None:
+                    continue
+                if isinstance(obj, torch.nn.Parameter):
+                    params = [obj]
+                elif isinstance(obj, torch.nn.Module):
+                    params = list(obj.parameters())
+                else:
+                    continue
+                for p in params:
+                    if p is None or (not p.requires_grad) or p.grad is None:
+                        continue
+                    g = p.grad.detach().float()
+                    grad_sq += torch.sum(g * g).item()
+            return float(grad_sq**0.5) if grad_sq > 0.0 else 0.0
+
         try:
             base_model = self.accelerator.unwrap_model(self.model)
             action_model = getattr(base_model, "action_model", None)
@@ -1050,6 +1068,33 @@ class VLATrainer(TrainerUtils):
                 metrics["debug/param_norm/vlm_language"] = vlm_param
             if vlm_grad is not None:
                 metrics["debug/grad_norm/vlm_language"] = vlm_grad
+
+            if action_model is not None:
+                geo_group = [
+                    getattr(action_model, "world_task_proj", None),
+                    getattr(action_model, "world_action_proj", None),
+                    getattr(action_model, "world_state_proj", None),
+                    getattr(action_model, "world_predictor", None),
+                    getattr(action_model, "world_delta_head", None),
+                    getattr(action_model, "residual_proj", None),
+                    getattr(action_model, "temb_proj", None),
+                    getattr(action_model, "drift_head", None),
+                    getattr(action_model, "geo_weight_diag", None),
+                ]
+                cfm_group = [
+                    getattr(action_model, "model", None),
+                    getattr(action_model, "action_encoder", None),
+                    getattr(action_model, "action_decoder", None),
+                    getattr(action_model, "future_tokens", None),
+                    getattr(action_model, "position_embedding", None),
+                ]
+                geo_grad_l2 = grad_l2_from_objects(geo_group)
+                cfm_grad_l2 = grad_l2_from_objects(cfm_group)
+                metrics["debug/grad_norm/geo_group_l2"] = float(geo_grad_l2)
+                metrics["debug/grad_norm/cfm_group_l2"] = float(cfm_grad_l2)
+                metrics["debug/grad_norm/geo_over_cfm_ratio_proxy"] = float(
+                    geo_grad_l2 / max(cfm_grad_l2, 1e-12)
+                )
 
             if vlm_model is not None:
                 geom_modules = [
