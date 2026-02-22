@@ -354,6 +354,13 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         self.loss_w_dyn = float(_cfg_get(action_config, "loss_w_dyn", 0.2))
         self.loss_w_geo = float(_cfg_get(action_config, "loss_w_geo", 0.1))
         self.loss_w_reg = float(_cfg_get(action_config, "loss_w_reg", 1e-3))
+        # Lightweight directional-alignment term:
+        #   loss_align = 1 - cos(residual_world, drift_action_world)
+        # This term is merged into loss_geo using `geo_align_weight`.
+        self.geo_align_weight = float(_cfg_get(action_config, "geo_align_weight", 0.2))
+        self.align_cos_eps = float(_cfg_get(action_config, "align_cos_eps", 1e-6))
+        # Health check tolerance to avoid float-ratio false positives near 1.0.
+        self.health_finite_ratio_tol = float(_cfg_get(action_config, "health_finite_ratio_tol", 1e-6))
         self.base_loss_w_fm = float(self.loss_w_fm)
         self.base_loss_w_dyn = float(self.loss_w_dyn)
         self.base_loss_w_geo = float(self.loss_w_geo)
@@ -505,16 +512,21 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         except Exception as e:
             record["error"] = str(e)
         self._last_health_trace.append(record)
+        nan_count = float(record.get("nan_count", 0.0))
+        inf_count = float(record.get("inf_count", 0.0))
+        finite_ratio = float(record.get("finite_ratio", 1.0))
+        has_nan_inf = (nan_count > 0.0) or (inf_count > 0.0)
+        has_low_finite = finite_ratio < (1.0 - self.health_finite_ratio_tol)
         if (
             self._first_nonfinite_stage is None
-            and float(record.get("finite_ratio", 1.0)) < 1.0
+            and (has_nan_inf or has_low_finite)
         ):
             self._first_nonfinite_stage = str(stage)
             self._first_nonfinite_record = {
                 "stage": str(stage),
-                "finite_ratio": float(record.get("finite_ratio", 1.0)),
-                "nan_count": float(record.get("nan_count", 0.0)),
-                "inf_count": float(record.get("inf_count", 0.0)),
+                "finite_ratio": finite_ratio,
+                "nan_count": nan_count,
+                "inf_count": inf_count,
                 "absmax": float(record.get("absmax", 0.0)),
             }
 
@@ -769,6 +781,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 "pred_next_task_tokens": None,
                 "loss_dyn": action_sequence.new_tensor(0.0),
                 "loss_geo": action_sequence.new_tensor(0.0),
+                "loss_align": action_sequence.new_tensor(0.0),
                 "loss_reg": action_sequence.new_tensor(0.0),
                 "rrr": zeros_scalar,
                 "expected_change": zeros_scalar,
@@ -792,6 +805,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 "pred_next_task_tokens": None,
                 "loss_dyn": action_sequence.new_tensor(0.0),
                 "loss_geo": action_sequence.new_tensor(0.0),
+                "loss_align": action_sequence.new_tensor(0.0),
                 "loss_reg": action_sequence.new_tensor(0.0),
                 "rrr": zeros_scalar,
                 "expected_change": zeros_scalar,
@@ -848,8 +862,13 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             residual_world.float(),
             drift_action_world.float(),
             dim=-1,
-            eps=1e-6,
+            eps=self.align_cos_eps,
         ).to(dtype=pred_next_task.dtype)
+        drift_action_cos = drift_action_cos.clamp(-1.0, 1.0)
+        align_per_sample = 1.0 - drift_action_cos
+        loss_align = self._masked_mean(align_per_sample, mask)
+        if self.geo_align_weight != 0.0:
+            loss_geo = loss_geo + float(self.geo_align_weight) * loss_align
         drift_l2 = drift.pow(2).mean(dim=(1, 2)).sqrt()
         geo_energy = geo_per_sample
         if mask is not None:
@@ -866,6 +885,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             "pred_next_task_tokens": pred_next_task,
             "loss_dyn": loss_dyn,
             "loss_geo": loss_geo,
+            "loss_align": loss_align,
             "loss_reg": loss_reg,
             "rrr": rrr,
             "expected_change": expected_change,
@@ -1004,6 +1024,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         loss_cfm = ((pred_velocity - velocity) ** 2).mean()
         loss_dyn = world_guidance["loss_dyn"]
         loss_geo = world_guidance["loss_geo"]
+        loss_align = world_guidance.get("loss_align", loss_cfm.new_tensor(0.0))
         loss_reg = world_guidance["loss_reg"]
         loss_weights = self._resolve_loss_weights(loss_weight_override=loss_weight_override)
         total_loss = (
@@ -1017,6 +1038,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             "loss_dyn": float(loss_dyn.detach().item()),
             "mse_dyn": float(loss_dyn.detach().item()),
             "loss_geo": float(loss_geo.detach().item()),
+            "loss_align": float(loss_align.detach().item()),
             "loss_reg": float(loss_reg.detach().item()),
             "loss_total": float(total_loss.detach().item()),
             "world_predictor_params": float(self.world_predictor_param_count),
@@ -1024,6 +1046,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             "weight_dyn": float(loss_weights["loss_w_dyn"]),
             "weight_geo": float(loss_weights["loss_w_geo"]),
             "weight_reg": float(loss_weights["loss_w_reg"]),
+            "geo_align_weight": float(self.geo_align_weight),
         }
         if isinstance(valid_tk_mask, torch.Tensor):
             self._last_loss_breakdown["valid_tk_ratio"] = float((valid_tk_mask > 0.5).float().mean().item())
