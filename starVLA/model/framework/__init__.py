@@ -18,6 +18,7 @@ from starVLA.model.tools import FRAMEWORK_REGISTRY
 from starVLA.training.trainer_utils import initialize_overwatch
 
 logger = initialize_overwatch(__name__)
+_AUTO_IMPORT_ERRORS = {}
 
 try:
     pkg_path = __path__
@@ -30,6 +31,7 @@ if pkg_path is not None:
         try:
             importlib.import_module(f"{__name__}.{module_name}")
         except Exception as e:
+            _AUTO_IMPORT_ERRORS[module_name] = str(e)
             logger.warning(f"Failed to auto-import framework submodule {module_name}: {e}")
         
 def build_framework(cfg):
@@ -55,7 +57,27 @@ def build_framework(cfg):
     # auto detect from registry
     framework_id = cfg.framework.name
     if framework_id not in FRAMEWORK_REGISTRY._registry:
-        raise NotImplementedError(f"Framework {cfg.framework.name} is not implemented. Plz, python yourframework_py to specify framework module.")
+        # Try lazy import by module name == framework id (e.g. MapAnythingLlava3DPI).
+        try:
+            importlib.import_module(f"{__name__}.{framework_id}")
+        except Exception as e:
+            lazy_err = str(e)
+        else:
+            lazy_err = None
+        if framework_id in FRAMEWORK_REGISTRY._registry:
+            MODLE_CLASS = FRAMEWORK_REGISTRY[framework_id]
+            return MODLE_CLASS(cfg)
+        detail = ""
+        if framework_id in _AUTO_IMPORT_ERRORS:
+            detail = f" auto_import_error={_AUTO_IMPORT_ERRORS[framework_id]!r}"
+        elif lazy_err is not None:
+            detail = f" lazy_import_error={lazy_err!r}"
+        registered = sorted(list(FRAMEWORK_REGISTRY._registry.keys()))
+        raise NotImplementedError(
+            f"Framework {cfg.framework.name} is not implemented. "
+            f"Registered={registered}.{detail} "
+            f"Plz, python yourframework_py to specify framework module."
+        )
     
     MODLE_CLASS = FRAMEWORK_REGISTRY[framework_id]
     return MODLE_CLASS(cfg)

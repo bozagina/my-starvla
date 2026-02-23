@@ -15,7 +15,27 @@ from starVLA.model.modules.action_model.LayerwiseFM_ActionHeader import (
     LayerwiseFlowmatchingActionHead,
 )
 from starVLA.training.trainer_utils.trainer_tools import resize_images
-from deployment.model_server.tools.image_tools import to_pil_preserve
+try:
+    from deployment.model_server.tools.image_tools import to_pil_preserve
+except Exception:  # pragma: no cover - fallback for training-only envs without deployment package
+    def to_pil_preserve(x):
+        """Best-effort PIL conversion used when deployment helpers are unavailable."""
+        if isinstance(x, Image.Image):
+            return x
+        if isinstance(x, np.ndarray):
+            arr = x
+            if arr.dtype != np.uint8:
+                arr = np.clip(arr, 0, 255).astype(np.uint8)
+            return Image.fromarray(arr)
+        if torch.is_tensor(x):
+            t = x.detach().cpu()
+            if t.ndim == 3 and t.shape[0] in (1, 3):
+                t = t.permute(1, 2, 0)
+            arr = t.numpy()
+            if arr.dtype != np.uint8:
+                arr = np.clip(arr, 0, 255).astype(np.uint8)
+            return Image.fromarray(arr)
+        raise TypeError(f"Unsupported input type for to_pil_preserve fallback: {type(x)}")
 
 
 logger = initialize_overwatch(__name__)
