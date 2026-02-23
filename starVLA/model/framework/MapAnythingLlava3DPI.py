@@ -345,13 +345,23 @@ class MapAnythingLlava3D_PI(baseframework):
             stats["debug/causal_feedback/invalid_action_shape"] = 1.0
             return None, stats
 
-        z_before = task_tokens.mean(dim=1)
-        z_after = task_tokens_next.mean(dim=1)
+        if hasattr(self.action_model, "pool_task_tokens"):
+            z_before = self.action_model.pool_task_tokens(task_tokens)
+            z_after = self.action_model.pool_task_tokens(task_tokens_next)
+            stats["debug/causal_feedback/uses_action_slot_pooling"] = 1.0
+        else:
+            z_before = task_tokens.mean(dim=1)
+            z_after = task_tokens_next.mean(dim=1)
+            stats["debug/causal_feedback/uses_action_slot_pooling"] = 0.0
         delta_z = z_after - z_before
         if self.causal_feedback_detach_delta:
             delta_z = delta_z.detach()
         delta_z = delta_z.to(dtype=task_tokens.dtype)
-        action_context = action_chunk.mean(dim=1).to(device=task_tokens.device, dtype=task_tokens.dtype)
+        if hasattr(self.action_model, "build_world_action_context"):
+            action_context = self.action_model.build_world_action_context(action_chunk)
+        else:
+            action_context = action_chunk.mean(dim=1)
+        action_context = action_context.to(device=task_tokens.device, dtype=task_tokens.dtype)
         if self.causal_feedback_detach_action:
             action_context = action_context.detach()
 
@@ -600,6 +610,7 @@ class MapAnythingLlava3D_PI(baseframework):
 
             if has_temporal_images:
                 sync_timer = self._start_step_timer(device=base_hidden.device)
+                tk_fastpath_used = 0.0
                 try:
                     vlm_inputs_next = self.mapanythingllava3d_vlm_interface.build_mapanythingllava3d_inputs(
                         images=batch_images_tk,
@@ -607,13 +618,33 @@ class MapAnythingLlava3D_PI(baseframework):
                     )
                     vlm_tk_timer = self._start_step_timer(device=base_hidden.device)
                     with torch.no_grad():
-                        vlm_outputs_next = self.mapanythingllava3d_vlm_interface(
-                            **vlm_inputs_next,
-                            use_cache=self.vlm_use_cache,
-                            output_attentions=False,
-                            output_hidden_states=False,
-                            return_dict=True,
-                        )
+                        if hasattr(self.mapanythingllava3d_vlm_interface, "extract_task_tokens"):
+                            try:
+                                vlm_outputs_next = self.mapanythingllava3d_vlm_interface.extract_task_tokens(
+                                    **vlm_inputs_next,
+                                    return_dict=True,
+                                )
+                                tk_fastpath_used = 1.0
+                            except Exception as fast_exc:
+                                logger.warning(
+                                    "[temporal_supervision] fast tk path failed (%s), fallback to full forward.",
+                                    fast_exc,
+                                )
+                                vlm_outputs_next = self.mapanythingllava3d_vlm_interface(
+                                    **vlm_inputs_next,
+                                    use_cache=self.vlm_use_cache,
+                                    output_attentions=False,
+                                    output_hidden_states=False,
+                                    return_dict=True,
+                                )
+                        else:
+                            vlm_outputs_next = self.mapanythingllava3d_vlm_interface(
+                                **vlm_inputs_next,
+                                use_cache=self.vlm_use_cache,
+                                output_attentions=False,
+                                output_hidden_states=False,
+                                return_dict=True,
+                            )
                     vlm_tk_ms = self._stop_step_timer(vlm_tk_timer, reference=base_hidden)
                     task_tokens_next = getattr(vlm_outputs_next, "task_hidden_states", None)
                     if isinstance(task_tokens_next, torch.Tensor):
@@ -649,6 +680,7 @@ class MapAnythingLlava3D_PI(baseframework):
                     logger.warning(f"[temporal_supervision] failed to build next-step task tokens: {exc}")
                     task_tokens_next = None
                 temporal_sync_ms = self._stop_step_timer(sync_timer, reference=base_hidden)
+                debug_metrics["debug/timing/tk_fastpath_used"] = float(tk_fastpath_used)
 
             debug_metrics["debug/temporal/has_image_tk"] = float(has_temporal_images)
             debug_metrics["debug/temporal/valid_tk_ratio"] = float(valid_tk_tensor.mean().item())

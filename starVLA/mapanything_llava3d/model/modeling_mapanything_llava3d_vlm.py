@@ -153,6 +153,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
         self.prefix_image_dropout_prob = getattr(config, "prefix_image_dropout_prob", 0.0)
         self.debug_health_trace_enabled = bool(getattr(config, "debug_health_trace_enabled", True))
         self.debug_health_trace_max_len = int(getattr(config, "debug_health_trace_max_len", 128))
+        self.health_finite_ratio_tol = float(getattr(config, "health_finite_ratio_tol", 1e-6))
         self.debug_health_trace: List[Dict[str, Any]] = []
         self.debug_first_nonfinite_stage: Optional[str] = None
         self.debug_first_nonfinite_record: Optional[Dict[str, float]] = None
@@ -312,16 +313,21 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
         self.debug_health_trace.append(record)
         if len(self.debug_health_trace) > self.debug_health_trace_max_len:
             self.debug_health_trace = self.debug_health_trace[-self.debug_health_trace_max_len :]
+        nan_count = float(record.get("nan_count", 0.0))
+        inf_count = float(record.get("inf_count", 0.0))
+        finite_ratio = float(record.get("finite_ratio", 1.0))
+        has_nan_inf = (nan_count > 0.0) or (inf_count > 0.0)
+        has_low_finite = finite_ratio < (1.0 - self.health_finite_ratio_tol)
         if (
             self.debug_first_nonfinite_stage is None
-            and float(record.get("finite_ratio", 1.0)) < 1.0
+            and (has_nan_inf or has_low_finite)
         ):
             self.debug_first_nonfinite_stage = str(stage)
             self.debug_first_nonfinite_record = {
                 "stage": str(stage),
-                "finite_ratio": float(record.get("finite_ratio", 1.0)),
-                "nan_count": float(record.get("nan_count", 0.0)),
-                "inf_count": float(record.get("inf_count", 0.0)),
+                "finite_ratio": finite_ratio,
+                "nan_count": nan_count,
+                "inf_count": inf_count,
                 "absmax": float(record.get("absmax", 0.0)),
             }
 
@@ -575,6 +581,89 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
         final_features = self.fusion_projector(fused_features_pre)
         self._record_health("fusion/final_features", final_features)
         return final_features, task_tokens
+
+    def extract_task_tokens(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        pixel_values: Optional[torch.FloatTensor] = None,
+        intrinsic: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        return_dict: Optional[bool] = None,
+        image_token_index: Optional[int] = None,
+        image_token_id: Optional[int] = None,
+        **kwargs,
+    ) -> Union[Tuple, MapAnythingLlava3DOutput]:
+        """Fast path used by temporal supervision: build task tokens without LM decoder forward."""
+        self._reset_health_trace()
+        return_dict = self.config.use_return_dict if return_dict is None else return_dict
+
+        embed = self.get_input_embeddings()
+        vocab_size = embed.weight.shape[0]
+        if inputs_embeds is None:
+            if input_ids is None:
+                raise ValueError("Either input_ids or inputs_embeds must be provided.")
+            input_ids = input_ids.clamp(max=vocab_size - 1)
+            inputs_embeds = embed(input_ids)
+        self._record_health("extract/inputs_embeds_init", inputs_embeds)
+
+        image_features = None
+        task_tokens = None
+        if pixel_values is not None:
+            spatial_img_id = None
+            if image_token_id is not None:
+                image_token_id = int(image_token_id)
+                if image_token_id > vocab_size - 1:
+                    image_token_id = vocab_size - 1
+            if image_token_index is not None:
+                image_token_index = int(image_token_index)
+                if image_token_index > vocab_size - 1:
+                    image_token_index = vocab_size - 1
+            if image_token_id is not None:
+                spatial_img_id = int(image_token_id)
+            elif image_token_index is not None:
+                spatial_img_id = int(image_token_index)
+            else:
+                spatial_img_id = getattr(self.config, "image_token_index", None)
+
+            language_queries, language_query_mask = self._build_language_queries(
+                inputs_embeds=inputs_embeds,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                image_token_index=spatial_img_id,
+            )
+            image_features = self.get_image_features(
+                pixel_values,
+                intrinsic,
+                language_queries=language_queries,
+                language_query_mask=language_query_mask,
+            )
+            task_tokens = getattr(self, "_last_task_tokens", None)
+            if isinstance(task_tokens, torch.Tensor):
+                if task_tokens.ndim != 3:
+                    raise ValueError(
+                        f"`task_hidden_states` must be 3D [B, K, H], got shape={tuple(task_tokens.shape)}"
+                    )
+                if task_tokens.shape[1] != int(self.task_token_num):
+                    raise ValueError(
+                        f"`task_hidden_states` token_num mismatch: got K={task_tokens.shape[1]}, "
+                        f"expected fixed K={self.task_token_num}"
+                    )
+            self._record_health("extract/image_features", image_features)
+            self._record_health("extract/task_tokens", task_tokens)
+
+        if not return_dict:
+            return image_features, task_tokens
+
+        return MapAnythingLlava3DOutput(
+            loss=None,
+            logits=None,
+            past_key_values=None,
+            hidden_states=None,
+            attentions=None,
+            image_hidden_states=image_features if pixel_values is not None else None,
+            task_hidden_states=task_tokens if pixel_values is not None else None,
+        )
 
         
     def forward(

@@ -209,6 +209,19 @@ class _MapAnythingLlava3D_Interface(nn.Module):
             generation_output = self.model.generate(**kwargs)
         return generation_output
 
+    def extract_task_tokens(self, **kwargs):
+        """Fast temporal path: return task tokens without full LM decoder when available."""
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            if hasattr(self.model, "extract_task_tokens"):
+                return self.model.extract_task_tokens(**kwargs)
+            # Backward-compatible fallback.
+            return self.model(
+                **kwargs,
+                output_attentions=False,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+
     def build_mapanythingllava3d_inputs(self, images: List[List], instructions: List[str], unnorm_key: Optional[str] = None) -> Dict[str, torch.Tensor]:
         assert len(images) == len(instructions)
         cot_prompt = None

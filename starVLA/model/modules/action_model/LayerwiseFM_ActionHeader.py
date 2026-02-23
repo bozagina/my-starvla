@@ -371,6 +371,46 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         self.rrr_eps = float(_cfg_get(action_config, "rrr_eps", 1e-4))
         self.rrr_max_replans = int(_cfg_get(action_config, "rrr_max_replans", 1))
         self.world_action_source = str(_cfg_get(action_config, "world_action_source", "teacher")).lower()
+        self.world_action_context_mode = str(
+            _cfg_get(action_config, "world_action_context_mode", "mean")
+        ).lower()
+        self.world_action_prefix_len = int(
+            _cfg_get(action_config, "world_action_prefix_len", 4)
+        )
+        if self.world_action_prefix_len < 1:
+            self.world_action_prefix_len = 1
+        if self.world_action_context_mode not in ("first", "mean", "prefix_mean", "mlp"):
+            logger.warning(
+                "Invalid world_action_context_mode=%s, fallback to `mean`.",
+                self.world_action_context_mode,
+            )
+            self.world_action_context_mode = "mean"
+
+        self.residual_pooling_mode = str(
+            _cfg_get(action_config, "residual_pooling_mode", "slot_weighted")
+        ).lower()
+        self.residual_slot_temp = float(_cfg_get(action_config, "residual_slot_temp", 1.0))
+        if self.residual_slot_temp <= 0.0:
+            self.residual_slot_temp = 1.0
+        if self.residual_pooling_mode not in ("mean", "slot_weighted"):
+            logger.warning(
+                "Invalid residual_pooling_mode=%s, fallback to `slot_weighted`.",
+                self.residual_pooling_mode,
+            )
+            self.residual_pooling_mode = "slot_weighted"
+        self.residual_slot_logits = nn.Parameter(torch.zeros(self.num_task_tokens))
+        self.residual_slot_entropy_weight = float(
+            _cfg_get(action_config, "residual_slot_entropy_weight", 0.0)
+        )
+
+        self.world_action_context_mlp = None
+        if self.world_action_context_mode == "mlp":
+            self.world_action_context_mlp = nn.Sequential(
+                nn.LayerNorm(self.action_dim),
+                nn.Linear(self.action_dim, self.action_dim),
+                nn.GELU(),
+                nn.Linear(self.action_dim, self.action_dim),
+            )
         if self.world_action_source not in ("teacher", "noisy"):
             logger.warning(
                 "Invalid world_action_source=%s, fallback to `teacher`.",
@@ -401,12 +441,16 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         self._first_nonfinite_stage = None
         self._first_nonfinite_record = None
         logger.info(
-            "LayerwiseFMActionHead initialized: use_concat_cross_context=%s, cross_attention_assert_inputs=%s, cross_attention_debug_log_interval=%d, world_params=%d, world_action_source=%s",
+            "LayerwiseFMActionHead initialized: use_concat_cross_context=%s, cross_attention_assert_inputs=%s, "
+            "cross_attention_debug_log_interval=%d, world_params=%d, world_action_source=%s, "
+            "world_action_context_mode=%s, residual_pooling_mode=%s",
             self.use_concat_cross_context,
             self.cross_attention_assert_inputs,
             self.cross_attention_debug_log_interval,
             self.world_predictor_param_count,
             self.world_action_source,
+            self.world_action_context_mode,
+            self.residual_pooling_mode,
         )
 
     def sample_time(self, batch_size, device, dtype):
@@ -550,6 +594,94 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         if float(denom.item()) <= 0.0:
             return values.new_tensor(0.0)
         return torch.sum(values * mask) / denom
+
+    @staticmethod
+    def _masked_percentiles(
+        values: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        quantiles: Tuple[float, ...] = (0.5, 0.95),
+    ) -> List[Optional[float]]:
+        if values.ndim != 1:
+            values = values.view(-1)
+        v = values.detach().float()
+        if mask is not None:
+            m = mask.view(-1).to(device=v.device, dtype=torch.bool)
+            if m.shape[0] != v.shape[0]:
+                raise ValueError(
+                    f"Mask batch mismatch for percentiles: values.shape[0]={v.shape[0]}, mask.shape[0]={m.shape[0]}"
+                )
+            v = v[m]
+        if v.numel() == 0:
+            return [None for _ in quantiles]
+        v = v[torch.isfinite(v)]
+        if v.numel() == 0:
+            return [None for _ in quantiles]
+        out = []
+        for q in quantiles:
+            q = float(min(max(q, 0.0), 1.0))
+            out.append(float(torch.quantile(v, q).item()))
+        return out
+
+    def _compute_slot_weights(
+        self,
+        *,
+        num_slots: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if num_slots < 1:
+            raise ValueError(f"`num_slots` must be >=1, got {num_slots}")
+        logits = self.residual_slot_logits
+        if logits.numel() < num_slots:
+            pad = logits.new_zeros((num_slots - logits.numel(),))
+            logits = torch.cat((logits, pad), dim=0)
+        else:
+            logits = logits[:num_slots]
+        weights = torch.softmax(logits / max(self.residual_slot_temp, 1e-6), dim=0)
+        return weights.to(device=device, dtype=dtype)
+
+    def pool_task_tokens(
+        self,
+        task_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        if not isinstance(task_tokens, torch.Tensor) or task_tokens.ndim != 3:
+            raise ValueError(
+                f"`task_tokens` must be tensor [B,K,H], got type={type(task_tokens)} "
+                f"shape={None if not isinstance(task_tokens, torch.Tensor) else tuple(task_tokens.shape)}"
+            )
+        if task_tokens.shape[1] == 1:
+            return task_tokens[:, 0, :]
+        if self.residual_pooling_mode == "slot_weighted":
+            weights = self._compute_slot_weights(
+                num_slots=int(task_tokens.shape[1]),
+                device=task_tokens.device,
+                dtype=task_tokens.dtype,
+            )
+            return torch.sum(task_tokens * weights.view(1, -1, 1), dim=1)
+        return task_tokens.mean(dim=1)
+
+    def build_world_action_context(
+        self,
+        action_sequence: torch.Tensor,
+    ) -> torch.Tensor:
+        if not isinstance(action_sequence, torch.Tensor) or action_sequence.ndim != 3:
+            raise ValueError(
+                f"`action_sequence` must be tensor [B,T,A], got type={type(action_sequence)} "
+                f"shape={None if not isinstance(action_sequence, torch.Tensor) else tuple(action_sequence.shape)}"
+            )
+        if action_sequence.shape[1] < 1:
+            raise ValueError(f"`action_sequence` has invalid horizon={action_sequence.shape[1]}")
+        mode = self.world_action_context_mode
+        if mode == "first":
+            context = action_sequence[:, 0, :]
+        elif mode == "prefix_mean":
+            prefix_len = min(int(action_sequence.shape[1]), int(self.world_action_prefix_len))
+            context = action_sequence[:, :prefix_len, :].mean(dim=1)
+        else:
+            context = action_sequence.mean(dim=1)
+        if mode == "mlp" and self.world_action_context_mlp is not None:
+            context = self.world_action_context_mlp(context)
+        return context
 
     def set_loss_weight_override(
         self,
@@ -791,7 +923,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 "drift_l2": zeros_scalar,
             }
 
-        action_context = action_sequence[:, 0, :]
+        action_context = self.build_world_action_context(action_sequence)
         pred_next_task, _ = self._predict_next_task_tokens(
             task_tokens=task_tokens,
             action_context=action_context,
@@ -831,12 +963,20 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             mask = mask.clamp(0.0, 1.0)
 
         delta_z = target_next - pred_next_task
-        pooled_residual = delta_z.mean(dim=1)
+        pooled_residual = self.pool_task_tokens(delta_z)
         geo_weight = F.softplus(self.geo_weight_diag).to(device=pooled_residual.device, dtype=pooled_residual.dtype)
         dyn_per_sample = (pred_next_task - target_next).pow(2).mean(dim=(1, 2))
         geo_per_sample = 0.5 * ((pooled_residual * geo_weight) * pooled_residual).sum(dim=-1)
         loss_dyn = self._masked_mean(dyn_per_sample, mask)
         loss_geo = self._masked_mean(geo_per_sample, mask)
+        if self.residual_pooling_mode == "slot_weighted" and self.residual_slot_entropy_weight > 0.0:
+            slot_w = self._compute_slot_weights(
+                num_slots=int(delta_z.shape[1]),
+                device=delta_z.device,
+                dtype=delta_z.dtype,
+            )
+            slot_entropy = -(slot_w * torch.log(slot_w.clamp_min(1e-8))).sum()
+            loss_geo = loss_geo - float(self.residual_slot_entropy_weight) * slot_entropy
         residual_world = self.residual_proj(pooled_residual)
 
         drift_input = torch.cat(
@@ -853,8 +993,9 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         reg_per_sample = drift.pow(2).mean(dim=(1, 2))
         loss_reg = self._masked_mean(reg_per_sample, mask)
 
-        expected_change = (pred_next_task - task_tokens).norm(dim=-1).mean(dim=-1)
-        delta_z_norm = delta_z.norm(dim=-1).mean(dim=-1)
+        pooled_expected_change = self.pool_task_tokens(pred_next_task - task_tokens)
+        expected_change = pooled_expected_change.norm(dim=-1)
+        delta_z_norm = pooled_residual.norm(dim=-1)
         rrr = delta_z_norm / expected_change.clamp_min(self.rrr_eps)
         drift_action = drift.mean(dim=1)
         drift_action_world = self.world_action_proj(drift_action)
@@ -1064,6 +1205,11 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             delta_z_norm_mean = self._masked_mean(delta_z_norm.view(-1), valid_tk_mask)
             self._last_loss_breakdown["delta_z_norm_mean"] = float(delta_z_norm_mean.detach().item())
             self._last_loss_breakdown["delta_z_norm_std"] = float(delta_z_norm.detach().float().std(unbiased=False).item())
+            p50, p95 = self._masked_percentiles(delta_z_norm.view(-1), valid_tk_mask, quantiles=(0.5, 0.95))
+            if p50 is not None:
+                self._last_loss_breakdown["delta_z_norm_p50"] = float(p50)
+            if p95 is not None:
+                self._last_loss_breakdown["delta_z_norm_p95"] = float(p95)
         drift_action_cos = world_guidance.get("drift_action_cos")
         if isinstance(drift_action_cos, torch.Tensor) and drift_action_cos.numel() > 0:
             rho_da = self._masked_mean(drift_action_cos.view(-1), valid_tk_mask)
@@ -1078,6 +1224,12 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         if isinstance(drift_l2, torch.Tensor) and drift_l2.numel() > 0:
             drift_l2_mean = self._masked_mean(drift_l2.view(-1), valid_tk_mask)
             self._last_loss_breakdown["drift_l2_mean"] = float(drift_l2_mean.detach().item())
+            drift_p50, drift_p95 = self._masked_percentiles(drift_l2.view(-1), valid_tk_mask, quantiles=(0.5, 0.95))
+            if drift_p50 is not None:
+                self._last_loss_breakdown["drift_l2_p50"] = float(drift_p50)
+            if drift_p95 is not None:
+                self._last_loss_breakdown["drift_l2_p95"] = float(drift_p95)
+                self._last_loss_breakdown["drift_norm_p95"] = float(drift_p95)
         self._record_health("forward/loss_total", total_loss.unsqueeze(0))
         return total_loss
 
