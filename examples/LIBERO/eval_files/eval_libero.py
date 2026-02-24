@@ -377,6 +377,25 @@ def eval_libero(args: Args) -> None:
                     rt_row["rt/policy_debug_timing/effective_control_hz"] = _safe_float(
                         policy_debug_info.get("timing/effective_control_hz")
                     )
+                    rt_row["rt/policy_debug_path_a/enabled"] = _safe_float(
+                        policy_debug_info.get("path_a_feedback/enabled")
+                    )
+                    rt_row["rt/policy_debug_path_a/applied"] = _safe_float(
+                        policy_debug_info.get("path_a_feedback/applied")
+                    )
+                    rt_row["rt/policy_debug_path_a/token_num"] = _safe_float(
+                        policy_debug_info.get("path_a_feedback/token_num")
+                    )
+                    rt_row["rt/policy_debug_path_a/delta_z_norm_mean"] = _safe_float(
+                        policy_debug_info.get("path_a_feedback/delta_z_norm_mean")
+                    )
+                    rt_row["rt/policy_debug_path_a/token_norm_mean"] = _safe_float(
+                        policy_debug_info.get("path_a_feedback/token_norm_mean")
+                    )
+                    path_a_source = policy_debug_info.get("path_a_feedback/source")
+                    rt_row["rt/policy_debug_path_a/source"] = (
+                        None if path_a_source is None else str(path_a_source)
+                    )
                 step_metric_rows.append(rt_row)
                 if args.enable_rt_metrics:
                     _append_jsonl(rt_metrics_path, rt_row)
