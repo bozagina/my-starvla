@@ -16,8 +16,10 @@ def main(args) -> None:
     # server = WebsocketPolicyServer(policy, host="localhost", port=10091)
     # server.serve_forever()
 
+    ckpt_path = os.path.abspath(os.path.expanduser(args.ckpt_path))
+    logging.info("Loading policy checkpoint from: %s", ckpt_path)
     vla = baseframework.from_pretrained( # TODO should auto detect framework from model path
-        args.ckpt_path,
+        ckpt_path,
     )
 
     if args.use_bf16: # False
