@@ -131,10 +131,30 @@ class MapAnythingLlava3D_PI(baseframework):
             getattr(self.config.framework.action_model, "rrr_replan_threshold", 2.5)
         )
         self.rrr_eps = float(getattr(self.config.framework.action_model, "rrr_eps", 1e-4))
+        self.enable_causal_feedback_inference = bool(
+            getattr(action_cfg, "enable_causal_feedback_inference", True)
+        )
         self._rrr_prev_observed_task_tokens = None
         self._rrr_prev_predicted_task_tokens = None
         self._rrr_prev_expected_change = None
+        self._patha_prev_task_tokens = None
+        self._patha_prev_action_chunk = None
+        self.reset_inference_state()
         self._configure_memory_optimizations()
+
+    def reset_inference_state(self, **kwargs) -> None:
+        """
+        Reset per-session inference memories.
+
+        This clears:
+        - RRR-related rolling tensors.
+        - Path-A rolling context used for causal feedback token construction.
+        """
+        self._rrr_prev_observed_task_tokens = None
+        self._rrr_prev_predicted_task_tokens = None
+        self._rrr_prev_expected_change = None
+        self._patha_prev_task_tokens = None
+        self._patha_prev_action_chunk = None
 
     @staticmethod
     def _set_module_use_cache(module, use_cache: bool, module_name: str):
@@ -894,6 +914,9 @@ class MapAnythingLlava3D_PI(baseframework):
         state = [example["state"] for example in examples] if "state" in examples[0] else None
         deterministic_seed = kwargs.get("deterministic_seed", None)
         return_debug_info = self._parse_bool_flag(kwargs.get("return_debug_info", False), default=False)
+        request_reset_state = self._parse_bool_flag(kwargs.get("reset_inference_state", False), default=False)
+        if request_reset_state:
+            self.reset_inference_state()
         if deterministic_seed is not None:
             try:
                 deterministic_seed = int(deterministic_seed)
@@ -1442,6 +1465,51 @@ class MapAnythingLlava3D_PI(baseframework):
                     raise ValueError(
                         f"`feedback_tokens` batch mismatch: got {feedback_tokens.shape[0]}, expected {base_hidden.shape[0]}"
                     )
+        feedback_source = "external" if isinstance(feedback_tokens, torch.Tensor) else "none"
+        patha_auto_stats: Dict[str, float] = {}
+        if (
+            feedback_tokens is None
+            and self._causal_feedback_ready
+            and self.enable_causal_feedback_inference
+            and isinstance(task_tokens, torch.Tensor)
+            and isinstance(self._patha_prev_task_tokens, torch.Tensor)
+            and isinstance(self._patha_prev_action_chunk, torch.Tensor)
+        ):
+            prev_task = self._patha_prev_task_tokens.to(
+                device=task_tokens.device,
+                dtype=task_tokens.dtype,
+            )
+            prev_actions = self._patha_prev_action_chunk.to(
+                device=task_tokens.device,
+                dtype=task_tokens.dtype,
+            )
+            if prev_task.shape[0] != task_tokens.shape[0]:
+                if prev_task.shape[0] == 1:
+                    prev_task = prev_task.expand(task_tokens.shape[0], -1, -1)
+                else:
+                    prev_task = None
+            if isinstance(prev_task, torch.Tensor) and prev_actions.shape[0] != task_tokens.shape[0]:
+                if prev_actions.shape[0] == 1:
+                    prev_actions = prev_actions.expand(task_tokens.shape[0], -1, -1)
+                else:
+                    prev_task = None
+            if isinstance(prev_task, torch.Tensor):
+                token_n = min(task_tokens.shape[1], prev_task.shape[1])
+                if token_n > 0:
+                    valid_mask = torch.ones(
+                        (task_tokens.shape[0],),
+                        device=task_tokens.device,
+                        dtype=task_tokens.dtype,
+                    )
+                    feedback_tokens, patha_auto_stats = self._build_causal_feedback_tokens(
+                        task_tokens=prev_task[:, :token_n, :],
+                        task_tokens_next=task_tokens[:, :token_n, :],
+                        action_chunk=prev_actions,
+                        valid_tk_mask=valid_mask,
+                    )
+                    if isinstance(feedback_tokens, torch.Tensor):
+                        feedback_source = "auto_path_a"
+
         attention_mask = vlm_inputs.get("attention_mask", None)
         if isinstance(attention_mask, torch.Tensor):
             attention_mask = attention_mask.to(device=base_hidden.device)
@@ -1472,12 +1540,15 @@ class MapAnythingLlava3D_PI(baseframework):
 
         if isinstance(task_tokens, torch.Tensor):
             self._rrr_prev_observed_task_tokens = task_tokens.detach()
+            self._patha_prev_task_tokens = task_tokens.detach()
         pred_task_tokens = planning_info.get("predicted_task_tokens", None) if isinstance(planning_info, dict) else None
         if isinstance(pred_task_tokens, torch.Tensor):
             self._rrr_prev_predicted_task_tokens = pred_task_tokens.detach()
         expected_change = planning_info.get("expected_change", None) if isinstance(planning_info, dict) else None
         if isinstance(expected_change, torch.Tensor):
             self._rrr_prev_expected_change = expected_change.detach()
+        if isinstance(pred_actions, torch.Tensor):
+            self._patha_prev_action_chunk = pred_actions.detach()
 
         normalized_actions = pred_actions.detach().cpu().numpy()
         flow_total_ms = 0.0
@@ -1574,6 +1645,21 @@ class MapAnythingLlava3D_PI(baseframework):
             debug_info["timing/perception_fits_chunk"] = float(perception_ms <= chunk_execution_ms)
             debug_info["timing/brain_fits_chunk"] = float(brain_total_ms <= chunk_execution_ms)
             debug_info["timing/reflex_step_fits_cycle"] = float(reflex_step_ms_mean <= control_cycle_ms)
+            debug_info["path_a_feedback/source"] = str(feedback_source)
+            debug_info["path_a_feedback/enabled"] = float(
+                self._causal_feedback_ready and self.enable_causal_feedback_inference
+            )
+            if isinstance(feedback_tokens, torch.Tensor):
+                debug_info["path_a_feedback/token_num"] = int(feedback_tokens.shape[1])
+                debug_info["path_a_feedback/token_norm_mean"] = float(
+                    feedback_tokens.detach().norm(dim=-1).mean().item()
+                )
+            else:
+                debug_info["path_a_feedback/token_num"] = 0
+            if isinstance(patha_auto_stats, dict):
+                for k, v in patha_auto_stats.items():
+                    if isinstance(k, str) and k.startswith("debug/causal_feedback/") and isinstance(v, (int, float)):
+                        debug_info[f"path_a_feedback/{k.split('debug/causal_feedback/', 1)[-1]}"] = float(v)
             # Derived from action-head timing, exposed here for single-place monitoring.
             debug_info["timing/flow_total_ms_agg"] = float(flow_total_ms)
             debug_info["timing/flow_step_ms_mean_agg"] = float(flow_step_ms_mean)

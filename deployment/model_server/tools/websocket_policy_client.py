@@ -73,5 +73,20 @@ class WebsocketClientPolicy:
             raise RuntimeError(f"Error in inference server:\n{response}")
         return msgpack_numpy.unpackb(response)
 
+    def reset(self, payload: Optional[Dict] = None) -> Dict:
+        req = {
+            "type": "reset",
+            "request_id": f"reset-{int(time.time() * 1000)}",
+            "payload": payload if isinstance(payload, dict) else {},
+        }
+        data = self._packer.pack(req)
+        self._ws.send(data)
+        response = self._ws.recv()
+        if isinstance(response, str):
+            raise RuntimeError(f"Error in inference server reset:\n{response}")
+        parsed = msgpack_numpy.unpackb(response)
+        if isinstance(parsed, dict) and not bool(parsed.get("ok", True)):
+            raise RuntimeError(f"Reset rejected by server: {parsed}")
+        return parsed
 
 

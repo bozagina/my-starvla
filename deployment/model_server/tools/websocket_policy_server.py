@@ -102,6 +102,34 @@ class WebsocketPolicyServer:
         if mtype == "ping":
             return {"status": "ok", "ok": True, "type": "ping", "request_id": req_id}
 
+        # reset --> clear policy-side session memory (e.g., Path-A / RRR history)
+        elif mtype == "reset":
+            payload = msg.get("payload", {})
+            if not isinstance(payload, dict):
+                payload = {}
+            try:
+                if hasattr(self._policy, "reset_inference_state"):
+                    self._policy.reset_inference_state(**payload)
+                elif hasattr(self._policy, "reset"):
+                    self._policy.reset(**payload)
+                return {
+                    "status": "ok",
+                    "ok": True,
+                    "type": "reset_result",
+                    "request_id": req_id,
+                }
+            except Exception as e:
+                logging.exception("Policy reset error (request_id=%s)", req_id)
+                return {
+                    "status": "error",
+                    "ok": False,
+                    "type": "reset_result",
+                    "request_id": req_id,
+                    "error": {
+                        "message": str(e),
+                    },
+                }
+
         # infer --> framework.predict_action
         elif mtype == "infer" or mtype == "predict_action":
             # Basic payload sanity

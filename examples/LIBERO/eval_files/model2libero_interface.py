@@ -83,6 +83,12 @@ class ModelClient:
         self.gripper_action_repeat = 0
         self.sticky_gripper_action = 0.0
         self.previous_gripper_action = None
+        self.last_policy_debug_info = None
+        try:
+            # Clear policy-side rolling memories (Path-A / RRR caches) per episode.
+            self.client.reset({"task_description": str(task_description)})
+        except Exception as e:
+            print(f"[warn] policy server reset failed: {e}")
 
 
     def step(
