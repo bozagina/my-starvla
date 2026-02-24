@@ -1,5 +1,6 @@
 from typing import Optional, List, Tuple, Dict
 import time
+from contextlib import nullcontext
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
@@ -1514,9 +1515,28 @@ class MapAnythingLlava3D_PI(baseframework):
         if isinstance(attention_mask, torch.Tensor):
             attention_mask = attention_mask.to(device=base_hidden.device)
 
+        # Keep inference inputs dtype-aligned with action head parameters to avoid
+        # Float/BFloat16 mismatches under mixed precision server settings.
+        action_device = self.action_model.device
+        action_dtype = self.action_model.dtype
+        vl_embs_list = [h.to(device=action_device, dtype=action_dtype) for h in vl_embs_list]
+        if isinstance(task_tokens, torch.Tensor):
+            task_tokens = task_tokens.to(device=action_device, dtype=action_dtype)
+        if isinstance(feedback_tokens, torch.Tensor):
+            feedback_tokens = feedback_tokens.to(device=action_device, dtype=action_dtype)
+        if isinstance(state_tensor, torch.Tensor):
+            state_tensor = state_tensor.to(device=action_device, dtype=action_dtype)
+        if isinstance(attention_mask, torch.Tensor):
+            attention_mask = attention_mask.to(device=action_device)
+
+        if action_device.type == "cuda" and action_dtype in (torch.float16, torch.bfloat16):
+            action_autocast_ctx = torch.autocast("cuda", dtype=action_dtype)
+        else:
+            action_autocast_ctx = nullcontext()
+
         self._synchronize_cuda_for_timing(base_hidden)
         action_t0 = time.perf_counter()
-        with torch.autocast("cuda", dtype=torch.float32):
+        with action_autocast_ctx:
             pred_action_output = self.action_model.predict_action(
                 vl_embs_list,
                 state_tensor,
