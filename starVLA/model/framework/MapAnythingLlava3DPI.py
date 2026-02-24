@@ -397,12 +397,21 @@ class MapAnythingLlava3D_PI(baseframework):
         delta_z = z_after - z_before
         if self.causal_feedback_detach_delta:
             delta_z = delta_z.detach()
-        delta_z = delta_z.to(dtype=task_tokens.dtype)
+        # Feedback submodules may stay in fp32 while task tokens can be bf16/fp16
+        # during inference eval. Run this branch in module parameter dtype to avoid
+        # Float/BFloat16 mismatches (e.g., LayerNorm expected Float).
+        module_dtype = task_tokens.dtype
+        try:
+            if self.causal_feedback_delta_norm is not None:
+                module_dtype = self.causal_feedback_delta_norm.weight.dtype
+        except Exception:
+            module_dtype = task_tokens.dtype
+        delta_z = delta_z.to(dtype=module_dtype)
         if hasattr(self.action_model, "build_world_action_context"):
             action_context = self.action_model.build_world_action_context(action_chunk)
         else:
             action_context = action_chunk.mean(dim=1)
-        action_context = action_context.to(device=task_tokens.device, dtype=task_tokens.dtype)
+        action_context = action_context.to(device=task_tokens.device, dtype=module_dtype)
         if self.causal_feedback_detach_action:
             action_context = action_context.detach()
 
@@ -429,6 +438,9 @@ class MapAnythingLlava3D_PI(baseframework):
             feedback_tokens = feedback_tokens * valid
             delta_z = delta_z * valid.view(batch_size, 1)
             stats["debug/causal_feedback/valid_tk_ratio"] = float((valid > 0.5).float().mean().item())
+
+        # Keep external contract: downstream branches expect feedback aligned to task token dtype.
+        feedback_tokens = feedback_tokens.to(dtype=task_tokens.dtype)
 
         with torch.no_grad():
             stats.update(
