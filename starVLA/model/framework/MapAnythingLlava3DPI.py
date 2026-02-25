@@ -88,6 +88,14 @@ class MapAnythingLlava3D_PI(baseframework):
         self.causal_feedback_dropout_p = float(
             getattr(action_cfg, "causal_feedback_dropout", 0.0)
         )
+        # Optional auxiliary supervision for Path-A feedback tokens.
+        # Default is disabled to preserve old behavior.
+        self.causal_feedback_aux_weight = float(
+            getattr(action_cfg, "causal_feedback_aux_weight", 0.0)
+        )
+        self.causal_feedback_aux_detach_target = bool(
+            getattr(action_cfg, "causal_feedback_aux_detach_target", True)
+        )
         action_dim = int(getattr(action_cfg, "action_dim", 0) or 0)
         self._causal_feedback_hidden_size = int(llm_hidden_size)
         self._causal_feedback_ready = bool(
@@ -115,12 +123,19 @@ class MapAnythingLlava3D_PI(baseframework):
                 ),
             )
             self.causal_feedback_dropout = nn.Dropout(self.causal_feedback_dropout_p)
+            self.causal_feedback_recon_head = nn.Sequential(
+                nn.LayerNorm(self._causal_feedback_hidden_size),
+                nn.Linear(self._causal_feedback_hidden_size, self._causal_feedback_hidden_size),
+                nn.GELU(),
+                nn.Linear(self._causal_feedback_hidden_size, self._causal_feedback_hidden_size),
+            )
         else:
             self.causal_feedback_delta_norm = None
             self.causal_feedback_action_proj = None
             self.causal_feedback_action_norm = None
             self.causal_feedback_fuse = None
             self.causal_feedback_dropout = None
+            self.causal_feedback_recon_head = None
 
         self.action_model: LayerwiseFlowmatchingActionHead = get_action_model(config=self.config)
 
@@ -246,6 +261,22 @@ class MapAnythingLlava3D_PI(baseframework):
         if not key:
             return "unknown"
         return key[:64]
+
+    @staticmethod
+    def _masked_mean(values: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+        if values.ndim != 1:
+            values = values.view(-1)
+        if mask is None:
+            return values.mean()
+        m = mask.view(-1).to(device=values.device, dtype=values.dtype).clamp(0.0, 1.0)
+        if m.shape[0] != values.shape[0]:
+            raise ValueError(
+                f"Mask batch mismatch: values.shape[0]={values.shape[0]}, mask.shape[0]={m.shape[0]}"
+            )
+        denom = m.sum()
+        if float(denom.item()) <= 0.0:
+            return values.new_tensor(0.0)
+        return torch.sum(values * m) / denom
 
     @staticmethod
     def _synchronize_cuda_for_timing(reference: Optional[torch.Tensor] = None) -> None:
@@ -460,6 +491,86 @@ class MapAnythingLlava3D_PI(baseframework):
                 }
             )
         return feedback_tokens, stats
+
+    def _compute_causal_feedback_aux_loss(
+        self,
+        *,
+        feedback_tokens: Optional[torch.Tensor],
+        task_tokens: Optional[torch.Tensor],
+        task_tokens_next: Optional[torch.Tensor],
+        valid_tk_mask: Optional[torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
+        stats: Dict[str, float] = {
+            "debug/causal_feedback/loss_fb_enabled": float(
+                self._causal_feedback_ready and self.causal_feedback_aux_weight > 0.0
+            ),
+            "debug/causal_feedback/loss_fb_active": 0.0,
+            "debug/causal_feedback/loss_fb_weight": float(self.causal_feedback_aux_weight),
+        }
+        if (
+            not self._causal_feedback_ready
+            or self.causal_feedback_recon_head is None
+            or self.causal_feedback_aux_weight <= 0.0
+        ):
+            return None, stats
+        if not (
+            isinstance(feedback_tokens, torch.Tensor)
+            and isinstance(task_tokens, torch.Tensor)
+            and isinstance(task_tokens_next, torch.Tensor)
+        ):
+            stats["debug/causal_feedback/loss_fb_missing_inputs"] = 1.0
+            return None, stats
+        if task_tokens.shape != task_tokens_next.shape:
+            stats["debug/causal_feedback/loss_fb_shape_mismatch"] = 1.0
+            return None, stats
+        if feedback_tokens.ndim == 2:
+            feedback_tokens = feedback_tokens.unsqueeze(1)
+        if feedback_tokens.ndim != 3 or task_tokens.ndim != 3:
+            stats["debug/causal_feedback/loss_fb_invalid_ndim"] = 1.0
+            return None, stats
+        if feedback_tokens.shape[0] != task_tokens.shape[0]:
+            stats["debug/causal_feedback/loss_fb_batch_mismatch"] = 1.0
+            return None, stats
+
+        if hasattr(self.action_model, "pool_task_tokens"):
+            z_before = self.action_model.pool_task_tokens(task_tokens)
+            z_after = self.action_model.pool_task_tokens(task_tokens_next)
+        else:
+            z_before = task_tokens.mean(dim=1)
+            z_after = task_tokens_next.mean(dim=1)
+        delta_z_target = z_after - z_before
+        if self.causal_feedback_aux_detach_target:
+            delta_z_target = delta_z_target.detach()
+
+        feedback_summary = feedback_tokens.mean(dim=1)
+        recon_dtype = feedback_summary.dtype
+        try:
+            recon_dtype = next(self.causal_feedback_recon_head.parameters()).dtype
+        except Exception:
+            recon_dtype = feedback_summary.dtype
+        pred_delta = self.causal_feedback_recon_head(feedback_summary.to(dtype=recon_dtype))
+        target_delta = delta_z_target.to(device=pred_delta.device, dtype=pred_delta.dtype)
+        per_sample_mse = (pred_delta - target_delta).pow(2).mean(dim=-1)
+
+        mask = None
+        if isinstance(valid_tk_mask, torch.Tensor):
+            mask = valid_tk_mask.view(-1).to(device=pred_delta.device, dtype=pred_delta.dtype)
+        loss_fb = self._masked_mean(per_sample_mse, mask)
+
+        with torch.no_grad():
+            stats.update(
+                {
+                    "debug/causal_feedback/loss_fb_active": 1.0,
+                    "debug/causal_feedback/loss_fb": float(loss_fb.detach().item()),
+                    "debug/causal_feedback/delta_hat_norm_mean": float(
+                        pred_delta.detach().norm(dim=-1).mean().item()
+                    ),
+                    "debug/causal_feedback/delta_target_norm_mean": float(
+                        target_delta.detach().norm(dim=-1).mean().item()
+                    ),
+                }
+            )
+        return loss_fb, stats
 
     def forward(
         self,
@@ -806,6 +917,8 @@ class MapAnythingLlava3D_PI(baseframework):
                 )
             feedback_tokens_repeated = None
             feedback_stats = {}
+            feedback_aux_loss = None
+            feedback_aux_stats = {}
             if self._causal_feedback_ready:
                 feedback_tokens_repeated, feedback_stats = self._build_causal_feedback_tokens(
                     task_tokens=task_tokens_repeated,
@@ -814,6 +927,13 @@ class MapAnythingLlava3D_PI(baseframework):
                     valid_tk_mask=valid_tk_repeated,
                 )
                 debug_metrics.update(feedback_stats)
+                feedback_aux_loss, feedback_aux_stats = self._compute_causal_feedback_aux_loss(
+                    feedback_tokens=feedback_tokens_repeated,
+                    task_tokens=task_tokens_repeated,
+                    task_tokens_next=task_tokens_next_repeated,
+                    valid_tk_mask=valid_tk_repeated,
+                )
+                debug_metrics.update(feedback_aux_stats)
 
             state_repeated = None
             if state is not None:
@@ -832,6 +952,13 @@ class MapAnythingLlava3D_PI(baseframework):
                 valid_tk=valid_tk_repeated,
                 feedback_tokens=feedback_tokens_repeated,
             )
+            if isinstance(feedback_aux_loss, torch.Tensor) and self.causal_feedback_aux_weight > 0.0:
+                debug_metrics["debug/causal_feedback/loss_fb_weighted"] = float(
+                    (float(self.causal_feedback_aux_weight) * feedback_aux_loss.detach()).item()
+                )
+                debug_metrics["debug/causal_feedback/action_loss_base"] = float(action_loss.detach().item())
+                action_loss = action_loss + float(self.causal_feedback_aux_weight) * feedback_aux_loss
+                debug_metrics["debug/causal_feedback/action_loss_total"] = float(action_loss.detach().item())
             try:
                 layer_means = getattr(self.action_model, "_last_dit_layer_means", None)
                 layer_vars = getattr(self.action_model, "_last_dit_layer_vars", None)
