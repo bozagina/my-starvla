@@ -14,6 +14,7 @@ Conventions:
 # Standard Library
 import argparse
 import contextlib
+import copy
 import inspect
 import json
 import math
@@ -199,6 +200,7 @@ class VLATrainer(TrainerUtils):
         if backend is None:
             backend = "wandb"
         self.logger_backend = backend
+        self.eval_examples_cache = None
 
     def _maybe_apply_sagr_loss_schedule(self):
         """Apply optional two-phase SA-GR loss schedule on action head."""
@@ -698,6 +700,24 @@ class VLATrainer(TrainerUtils):
         self.vla_iter = iter(self.vla_train_dataloader)
         # self.vlm_iter = iter(self.vlm_train_dataloader)
 
+    def _init_fixed_eval_batch(self):
+        """Cache a fixed eval batch to keep evaluation data stationary across steps."""
+        if self.eval_examples_cache is not None:
+            return
+
+        try:
+            eval_iter = iter(self.vla_train_dataloader)
+            eval_examples = next(eval_iter)
+            self.eval_examples_cache = copy.deepcopy(eval_examples)
+            if self.accelerator.is_main_process:
+                logger.info(f"Initialized fixed eval batch with {len(self.eval_examples_cache)} samples")
+        except StopIteration:
+            self.eval_examples_cache = None
+            logger.warning("Failed to initialize fixed eval batch: dataloader is empty")
+        except Exception as e:
+            self.eval_examples_cache = None
+            logger.warning(f"Failed to initialize fixed eval batch: {e}")
+
     def _get_next_batch(self):
         """get next batch (automatically handle data loop)"""
         try:
@@ -719,6 +739,7 @@ class VLATrainer(TrainerUtils):
 
         # prepare data iterators
         self._create_data_iterators()
+        self._init_fixed_eval_batch()
         self.optimizer.zero_grad()
 
         # create progress bar
@@ -801,27 +822,48 @@ class VLATrainer(TrainerUtils):
         :return: Average metric score across the evaluation dataset.
         """
 
-        examples = self._get_next_batch()
-        score = 0.0
-        num_samples = len(examples)
-        actions = [example["action"] for example in examples]  # label
-        # Predict actions using the model
-        output_dict = self.model.predict_action(
-            examples=examples, use_ddim=True, num_ddim_steps=20
-        )
+        if step_metrics is None:
+            step_metrics = {}
 
-        if self.accelerator.is_main_process:
-            normalized_actions = output_dict["normalized_actions"]  # B, T, D
-            actions = np.array(actions)  # convert actions to numpy.ndarray
-            # B, Chunk, dim = actions.shape
-            num_pots = np.prod(actions.shape)
-            # Compute the metric score
-            score = TrainerUtils.euclidean_distance(normalized_actions, actions)
-            average_score = score / num_pots
-            step_metrics["mse_score"] = average_score
+        if self.eval_examples_cache is None:
+            self._init_fixed_eval_batch()
+
+        if self.eval_examples_cache is None:
+            if dist.is_initialized():
+                dist.barrier()
+            return step_metrics
+
+        examples = copy.deepcopy(self.eval_examples_cache)
+        actions = np.asarray([example["action"] for example in examples], dtype=np.float32)
+
+        was_training = bool(getattr(self.model, "training", False))
+        self.model.eval()
+        try:
+            # Predict actions with reset inference state to avoid temporal leakage
+            output_dict = self.model.predict_action(
+                examples=examples,
+                use_ddim=True,
+                num_ddim_steps=20,
+                reset_inference_state=True,
+            )
+
+            if self.accelerator.is_main_process:
+                normalized_actions = np.asarray(output_dict["normalized_actions"], dtype=np.float32)  # B, T, D
+                if normalized_actions.shape != actions.shape:
+                    raise ValueError(
+                        "Shape mismatch in eval_action_model: "
+                        f"pred={normalized_actions.shape}, gt={actions.shape}"
+                    )
+                # True MSE over all elements
+                mse_score = float(np.mean((normalized_actions - actions) ** 2))
+                step_metrics["mse_score"] = mse_score
+        finally:
+            if was_training:
+                self.model.train()
 
         del examples
-        dist.barrier()  # ensure all processes are synchronized
+        if dist.is_initialized():
+            dist.barrier()  # ensure all processes are synchronized
         return step_metrics
 
     def _log_training_config(self):
