@@ -1,4 +1,5 @@
 from typing import Optional, List, Tuple, Dict
+import math
 import time
 from contextlib import nullcontext
 import torch
@@ -278,6 +279,72 @@ class MapAnythingLlava3D_PI(baseframework):
             return values.new_tensor(0.0)
         return torch.sum(values * m) / denom
 
+    def _pool_task_tokens_with_action_context(
+        self,
+        *,
+        task_tokens: torch.Tensor,
+        action_context: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], bool]:
+        """
+        Pool task tokens into [B, H] for Path-A feedback.
+
+        Priority:
+        1) Action-conditioned pooling (dynamic slot weights from action context).
+        2) Action head slot/mean pooling (if available).
+        3) Plain mean pooling fallback.
+        """
+        if not isinstance(task_tokens, torch.Tensor) or task_tokens.ndim != 3:
+            raise ValueError(
+                f"`task_tokens` must be tensor [B, K, H], got type={type(task_tokens)} "
+                f"shape={None if not isinstance(task_tokens, torch.Tensor) else tuple(task_tokens.shape)}"
+            )
+
+        # Base fallback pooling to preserve behavior under any failure.
+        if hasattr(self.action_model, "pool_task_tokens"):
+            pooled_base = self.action_model.pool_task_tokens(task_tokens)
+        else:
+            pooled_base = task_tokens.mean(dim=1)
+
+        if task_tokens.shape[1] == 1:
+            one_w = task_tokens.new_ones((task_tokens.shape[0], 1))
+            return pooled_base, one_w, False
+        if (
+            not self._causal_feedback_ready
+            or self.causal_feedback_action_proj is None
+            or not isinstance(action_context, torch.Tensor)
+        ):
+            return pooled_base, None, False
+
+        try:
+            proj_dtype = self.causal_feedback_action_proj.weight.dtype
+            tokens_for_pool = task_tokens.to(dtype=proj_dtype)
+            action_ctx = action_context.to(device=tokens_for_pool.device, dtype=proj_dtype)
+            action_cond = self.causal_feedback_action_proj(action_ctx)  # [B, H]
+            if action_cond.ndim != 2 or action_cond.shape[0] != tokens_for_pool.shape[0]:
+                return pooled_base, None, False
+            if action_cond.shape[1] != tokens_for_pool.shape[2]:
+                return pooled_base, None, False
+
+            # Dynamic slot weights conditioned on current action context.
+            logits = torch.sum(tokens_for_pool * action_cond.unsqueeze(1), dim=-1)
+            logits = logits / max(math.sqrt(float(tokens_for_pool.shape[-1])), 1.0)
+
+            # If action head has static slot priors, use them as a stabilizing prior.
+            if hasattr(self.action_model, "_compute_slot_weights"):
+                static_w = self.action_model._compute_slot_weights(
+                    num_slots=int(tokens_for_pool.shape[1]),
+                    device=tokens_for_pool.device,
+                    dtype=tokens_for_pool.dtype,
+                )
+                if isinstance(static_w, torch.Tensor) and static_w.numel() == tokens_for_pool.shape[1]:
+                    logits = logits + torch.log(static_w.view(1, -1).clamp_min(1e-6))
+
+            slot_w = torch.softmax(logits, dim=1)
+            pooled = torch.sum(tokens_for_pool * slot_w.unsqueeze(-1), dim=1)
+            return pooled.to(dtype=task_tokens.dtype), slot_w.to(dtype=task_tokens.dtype), True
+        except Exception:
+            return pooled_base, None, False
+
     @staticmethod
     def _synchronize_cuda_for_timing(reference: Optional[torch.Tensor] = None) -> None:
         if not torch.cuda.is_available():
@@ -417,27 +484,13 @@ class MapAnythingLlava3D_PI(baseframework):
             stats["debug/causal_feedback/invalid_action_shape"] = 1.0
             return None, stats
 
-        if hasattr(self.action_model, "pool_task_tokens"):
-            z_before = self.action_model.pool_task_tokens(task_tokens)
-            z_after = self.action_model.pool_task_tokens(task_tokens_next)
-            stats["debug/causal_feedback/uses_action_slot_pooling"] = 1.0
-        else:
-            z_before = task_tokens.mean(dim=1)
-            z_after = task_tokens_next.mean(dim=1)
-            stats["debug/causal_feedback/uses_action_slot_pooling"] = 0.0
-        delta_z = z_after - z_before
-        if self.causal_feedback_detach_delta:
-            delta_z = delta_z.detach()
-        # Feedback submodules may stay in fp32 while task tokens can be bf16/fp16
-        # during inference eval. Run this branch in module parameter dtype to avoid
-        # Float/BFloat16 mismatches (e.g., LayerNorm expected Float).
         module_dtype = task_tokens.dtype
         try:
             if self.causal_feedback_delta_norm is not None:
                 module_dtype = self.causal_feedback_delta_norm.weight.dtype
         except Exception:
             module_dtype = task_tokens.dtype
-        delta_z = delta_z.to(dtype=module_dtype)
+
         if hasattr(self.action_model, "build_world_action_context"):
             action_context = self.action_model.build_world_action_context(action_chunk)
         else:
@@ -445,6 +498,37 @@ class MapAnythingLlava3D_PI(baseframework):
         action_context = action_context.to(device=task_tokens.device, dtype=module_dtype)
         if self.causal_feedback_detach_action:
             action_context = action_context.detach()
+
+        z_before, slot_w_before, used_cond_before = self._pool_task_tokens_with_action_context(
+            task_tokens=task_tokens,
+            action_context=action_context,
+        )
+        z_after, slot_w_after, used_cond_after = self._pool_task_tokens_with_action_context(
+            task_tokens=task_tokens_next,
+            action_context=action_context,
+        )
+        used_action_cond_pool = bool(used_cond_before and used_cond_after)
+        stats["debug/causal_feedback/uses_action_slot_pooling"] = float(
+            hasattr(self.action_model, "pool_task_tokens")
+        )
+        stats["debug/causal_feedback/action_conditioned_pooling"] = 1.0 if used_action_cond_pool else 0.0
+
+        if isinstance(slot_w_before, torch.Tensor):
+            with torch.no_grad():
+                entropy = -torch.sum(slot_w_before * torch.log(slot_w_before.clamp_min(1e-9)), dim=1)
+                stats["debug/causal_feedback/slot_entropy_before"] = float(entropy.mean().item())
+        if isinstance(slot_w_after, torch.Tensor):
+            with torch.no_grad():
+                entropy = -torch.sum(slot_w_after * torch.log(slot_w_after.clamp_min(1e-9)), dim=1)
+                stats["debug/causal_feedback/slot_entropy_after"] = float(entropy.mean().item())
+
+        delta_z = z_after - z_before
+        if self.causal_feedback_detach_delta:
+            delta_z = delta_z.detach()
+        # Feedback submodules may stay in fp32 while task tokens can be bf16/fp16
+        # during inference eval. Run this branch in module parameter dtype to avoid
+        # Float/BFloat16 mismatches (e.g., LayerNorm expected Float).
+        delta_z = delta_z.to(dtype=module_dtype)
 
         delta_feat = self.causal_feedback_delta_norm(delta_z)
         action_feat = self.causal_feedback_action_norm(self.causal_feedback_action_proj(action_context))
@@ -499,6 +583,7 @@ class MapAnythingLlava3D_PI(baseframework):
         task_tokens: Optional[torch.Tensor],
         task_tokens_next: Optional[torch.Tensor],
         valid_tk_mask: Optional[torch.Tensor],
+        action_chunk: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
         stats: Dict[str, float] = {
             "debug/causal_feedback/loss_fb_enabled": float(
@@ -532,12 +617,33 @@ class MapAnythingLlava3D_PI(baseframework):
             stats["debug/causal_feedback/loss_fb_batch_mismatch"] = 1.0
             return None, stats
 
-        if hasattr(self.action_model, "pool_task_tokens"):
-            z_before = self.action_model.pool_task_tokens(task_tokens)
-            z_after = self.action_model.pool_task_tokens(task_tokens_next)
-        else:
-            z_before = task_tokens.mean(dim=1)
-            z_after = task_tokens_next.mean(dim=1)
+        action_context = None
+        if isinstance(action_chunk, torch.Tensor):
+            try:
+                if action_chunk.ndim == 3 and action_chunk.shape[0] == task_tokens.shape[0]:
+                    if hasattr(self.action_model, "build_world_action_context"):
+                        action_context = self.action_model.build_world_action_context(action_chunk)
+                    else:
+                        action_context = action_chunk.mean(dim=1)
+                    if self.causal_feedback_detach_action and isinstance(action_context, torch.Tensor):
+                        action_context = action_context.detach()
+                else:
+                    stats["debug/causal_feedback/loss_fb_action_shape_mismatch"] = 1.0
+            except Exception:
+                stats["debug/causal_feedback/loss_fb_action_context_error"] = 1.0
+                action_context = None
+
+        z_before, _, used_cond_before = self._pool_task_tokens_with_action_context(
+            task_tokens=task_tokens,
+            action_context=action_context,
+        )
+        z_after, _, used_cond_after = self._pool_task_tokens_with_action_context(
+            task_tokens=task_tokens_next,
+            action_context=action_context,
+        )
+        stats["debug/causal_feedback/loss_fb_action_conditioned_pooling"] = float(
+            used_cond_before and used_cond_after
+        )
         delta_z_target = z_after - z_before
         if self.causal_feedback_aux_detach_target:
             delta_z_target = delta_z_target.detach()
@@ -932,6 +1038,7 @@ class MapAnythingLlava3D_PI(baseframework):
                     task_tokens=task_tokens_repeated,
                     task_tokens_next=task_tokens_next_repeated,
                     valid_tk_mask=valid_tk_repeated,
+                    action_chunk=actions_target_repeated,
                 )
                 debug_metrics.update(feedback_aux_stats)
 

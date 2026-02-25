@@ -372,7 +372,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         self.rrr_max_replans = int(_cfg_get(action_config, "rrr_max_replans", 1))
         self.world_action_source = str(_cfg_get(action_config, "world_action_source", "teacher")).lower()
         self.world_action_context_mode = str(
-            _cfg_get(action_config, "world_action_context_mode", "mean")
+            _cfg_get(action_config, "world_action_context_mode", "prefix_mean")
         ).lower()
         self.world_action_prefix_len = int(
             _cfg_get(action_config, "world_action_prefix_len", 4)
@@ -381,10 +381,10 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             self.world_action_prefix_len = 1
         if self.world_action_context_mode not in ("first", "mean", "prefix_mean", "mlp"):
             logger.warning(
-                "Invalid world_action_context_mode=%s, fallback to `mean`.",
+                "Invalid world_action_context_mode=%s, fallback to `prefix_mean`.",
                 self.world_action_context_mode,
             )
-            self.world_action_context_mode = "mean"
+            self.world_action_context_mode = "prefix_mean"
 
         self.residual_pooling_mode = str(
             _cfg_get(action_config, "residual_pooling_mode", "slot_weighted")
