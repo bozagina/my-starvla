@@ -97,6 +97,14 @@ class MapAnythingLlava3D_PI(baseframework):
         self.causal_feedback_aux_detach_target = bool(
             getattr(action_cfg, "causal_feedback_aux_detach_target", True)
         )
+        # Optional directional term for auxiliary supervision:
+        #   loss_fb = mse(pred_delta, target_delta) + dir_w * (1 - cos(pred_delta, target_delta))
+        self.causal_feedback_aux_dir_weight = float(
+            getattr(action_cfg, "causal_feedback_aux_dir_weight", 0.0)
+        )
+        self.causal_feedback_aux_dir_eps = float(
+            getattr(action_cfg, "causal_feedback_aux_dir_eps", 1e-6)
+        )
         action_dim = int(getattr(action_cfg, "action_dim", 0) or 0)
         self._causal_feedback_hidden_size = int(llm_hidden_size)
         self._causal_feedback_ready = bool(
@@ -591,6 +599,7 @@ class MapAnythingLlava3D_PI(baseframework):
             ),
             "debug/causal_feedback/loss_fb_active": 0.0,
             "debug/causal_feedback/loss_fb_weight": float(self.causal_feedback_aux_weight),
+            "debug/causal_feedback/loss_fb_dir_weight": float(self.causal_feedback_aux_dir_weight),
         }
         if (
             not self._causal_feedback_ready
@@ -657,17 +666,27 @@ class MapAnythingLlava3D_PI(baseframework):
         pred_delta = self.causal_feedback_recon_head(feedback_summary.to(dtype=recon_dtype))
         target_delta = delta_z_target.to(device=pred_delta.device, dtype=pred_delta.dtype)
         per_sample_mse = (pred_delta - target_delta).pow(2).mean(dim=-1)
+        eps = max(float(self.causal_feedback_aux_dir_eps), 1e-12)
+        pred_unit = F.normalize(pred_delta, dim=-1, eps=eps)
+        target_unit = F.normalize(target_delta, dim=-1, eps=eps)
+        per_sample_cos = torch.sum(pred_unit * target_unit, dim=-1).clamp(-1.0, 1.0)
+        per_sample_dir = 1.0 - per_sample_cos
 
         mask = None
         if isinstance(valid_tk_mask, torch.Tensor):
             mask = valid_tk_mask.view(-1).to(device=pred_delta.device, dtype=pred_delta.dtype)
-        loss_fb = self._masked_mean(per_sample_mse, mask)
+        loss_fb_mse = self._masked_mean(per_sample_mse, mask)
+        loss_fb_dir = self._masked_mean(per_sample_dir, mask)
+        loss_fb = loss_fb_mse + float(self.causal_feedback_aux_dir_weight) * loss_fb_dir
 
         with torch.no_grad():
             stats.update(
                 {
                     "debug/causal_feedback/loss_fb_active": 1.0,
+                    "debug/causal_feedback/loss_fb_mse": float(loss_fb_mse.detach().item()),
+                    "debug/causal_feedback/loss_fb_dir": float(loss_fb_dir.detach().item()),
                     "debug/causal_feedback/loss_fb": float(loss_fb.detach().item()),
+                    "debug/causal_feedback/cos_delta_mean": float(per_sample_cos.detach().mean().item()),
                     "debug/causal_feedback/delta_hat_norm_mean": float(
                         pred_delta.detach().norm(dim=-1).mean().item()
                     ),
