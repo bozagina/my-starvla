@@ -128,7 +128,20 @@ def eval_libero(args: Args) -> None:
         rt_metrics_path.parent.mkdir(parents=True, exist_ok=True)
         if rt_metrics_path.exists():
             rt_metrics_path.unlink()
-        logging.info(f"[rt_metrics] writing runtime metrics to {rt_metrics_path}")
+        # Create file early so path is observable even if eval exits before first step.
+        _append_jsonl(
+            rt_metrics_path,
+            {
+                "record_type": "meta",
+                "timestamp": dt.datetime.now().isoformat(),
+                "task_suite_name": str(args.task_suite_name),
+                "num_trials_per_task": int(args.num_trials_per_task),
+                "request_policy_debug_info": bool(args.request_policy_debug_info),
+                "rotate_180": bool(args.rotate_180),
+                "action_chunk_size_override": int(args.action_chunk_size_override),
+            },
+        )
+        logging.info(f"[rt_metrics] writing runtime metrics to {rt_metrics_path.resolve()}")
 
     if args.task_suite_name == "libero_spatial":
         max_steps = 220  # longest training demo has 193 steps

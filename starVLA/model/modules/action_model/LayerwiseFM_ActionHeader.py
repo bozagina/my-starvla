@@ -224,6 +224,38 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         default=0,
         metadata={"help": "If >0, log layerwise hidden-state stats every N calls."},
     )
+    feedback_context_only: bool = field(
+        default=False,
+        metadata={"help": "If true, use only feedback tokens as task-token context (drop base task_tokens from context)."},
+    )
+    feedback_context_norm_type: str = field(
+        default="none",
+        metadata={"help": "Optional feedback token normalization before cross-attn context. One of: none|layernorm|rmsnorm."},
+    )
+    feedback_context_norm_eps: float = field(
+        default=1e-6,
+        metadata={"help": "Epsilon for feedback token normalization."},
+    )
+    feedback_context_alpha_mode: str = field(
+        default="fixed",
+        metadata={"help": "Feedback context scaling alpha mode. One of: fixed|learnable|schedule."},
+    )
+    feedback_context_alpha_init: float = field(
+        default=1.0,
+        metadata={"help": "Initial alpha for feedback token scaling."},
+    )
+    feedback_context_alpha_target: float = field(
+        default=1.0,
+        metadata={"help": "Target alpha for schedule mode."},
+    )
+    feedback_context_alpha_warmup_steps: int = field(
+        default=0,
+        metadata={"help": "Hold alpha at init for this many train forwards before schedule ramp."},
+    )
+    feedback_context_alpha_ramp_steps: int = field(
+        default=1000,
+        metadata={"help": "Linear ramp steps from alpha_init to alpha_target for schedule mode."},
+    )
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -313,6 +345,67 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         self._last_rrr = None
         self._logged_task_token_num_mismatch = False
         self.feedback_context_scale = float(_cfg_get(action_config, "feedback_context_scale", 1.0))
+        self.feedback_context_only = bool(_cfg_get(action_config, "feedback_context_only", False))
+        self.feedback_context_norm_type = str(
+            _cfg_get(action_config, "feedback_context_norm_type", "none")
+        ).lower()
+        self.feedback_context_norm_eps = float(_cfg_get(action_config, "feedback_context_norm_eps", 1e-6))
+        self.feedback_context_norm = None
+        self._feedback_context_manual_rmsnorm = False
+        if self.feedback_context_norm_type not in ("none", "layernorm", "rmsnorm"):
+            logger.warning(
+                "Invalid feedback_context_norm_type=%s, fallback to `none`.",
+                self.feedback_context_norm_type,
+            )
+            self.feedback_context_norm_type = "none"
+        if self.feedback_context_norm_type == "layernorm":
+            self.feedback_context_norm = nn.LayerNorm(
+                self.input_embedding_dim,
+                eps=self.feedback_context_norm_eps,
+                elementwise_affine=False,
+            )
+        elif self.feedback_context_norm_type == "rmsnorm":
+            if hasattr(nn, "RMSNorm"):
+                self.feedback_context_norm = nn.RMSNorm(
+                    self.input_embedding_dim,
+                    eps=self.feedback_context_norm_eps,
+                    elementwise_affine=False,
+                )
+            else:
+                self._feedback_context_manual_rmsnorm = True
+        self.feedback_context_alpha_mode = str(
+            _cfg_get(action_config, "feedback_context_alpha_mode", "fixed")
+        ).lower()
+        self.feedback_context_alpha_init = float(_cfg_get(action_config, "feedback_context_alpha_init", 1.0))
+        self.feedback_context_alpha_target = float(_cfg_get(action_config, "feedback_context_alpha_target", 1.0))
+        self.feedback_context_alpha_warmup_steps = int(
+            _cfg_get(action_config, "feedback_context_alpha_warmup_steps", 0)
+        )
+        self.feedback_context_alpha_ramp_steps = int(
+            _cfg_get(action_config, "feedback_context_alpha_ramp_steps", 1000)
+        )
+        if self.feedback_context_alpha_warmup_steps < 0:
+            self.feedback_context_alpha_warmup_steps = 0
+        if self.feedback_context_alpha_ramp_steps < 1:
+            self.feedback_context_alpha_ramp_steps = 1
+        if self.feedback_context_alpha_mode not in ("fixed", "learnable", "schedule"):
+            logger.warning(
+                "Invalid feedback_context_alpha_mode=%s, fallback to `fixed`.",
+                self.feedback_context_alpha_mode,
+            )
+            self.feedback_context_alpha_mode = "fixed"
+        if self.feedback_context_alpha_mode == "learnable":
+            self.feedback_context_alpha_param = nn.Parameter(
+                torch.tensor(self.feedback_context_alpha_init, dtype=torch.float32)
+            )
+        else:
+            self.feedback_context_alpha_param = None
+        self.register_buffer(
+            "_feedback_context_schedule_step",
+            torch.zeros((), dtype=torch.long),
+            persistent=False,
+        )
+        self._last_feedback_alpha_value = float(self.feedback_context_alpha_init)
 
         self.world_hidden_dim = int(_cfg_get(action_config, "world_hidden_dim", 512))
         self.world_num_layers = int(_cfg_get(action_config, "world_num_layers", 4))
@@ -443,7 +536,8 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         logger.info(
             "LayerwiseFMActionHead initialized: use_concat_cross_context=%s, cross_attention_assert_inputs=%s, "
             "cross_attention_debug_log_interval=%d, world_params=%d, world_action_source=%s, "
-            "world_action_context_mode=%s, residual_pooling_mode=%s",
+            "world_action_context_mode=%s, residual_pooling_mode=%s, feedback_context_only=%s, "
+            "feedback_context_norm_type=%s, feedback_context_alpha_mode=%s",
             self.use_concat_cross_context,
             self.cross_attention_assert_inputs,
             self.cross_attention_debug_log_interval,
@@ -451,6 +545,9 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             self.world_action_source,
             self.world_action_context_mode,
             self.residual_pooling_mode,
+            self.feedback_context_only,
+            self.feedback_context_norm_type,
+            self.feedback_context_alpha_mode,
         )
 
     def sample_time(self, batch_size, device, dtype):
@@ -871,6 +968,70 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             )
         return out
 
+    def _apply_feedback_context_norm(
+        self,
+        feedback_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.feedback_context_norm_type == "none":
+            return feedback_tokens
+        if self.feedback_context_norm is not None:
+            return self.feedback_context_norm(feedback_tokens)
+        if self._feedback_context_manual_rmsnorm:
+            denom = feedback_tokens.pow(2).mean(dim=-1, keepdim=True).add(self.feedback_context_norm_eps).rsqrt()
+            return feedback_tokens * denom
+        return feedback_tokens
+
+    def _compute_feedback_alpha(
+        self,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, float]:
+        mode = self.feedback_context_alpha_mode
+        if mode == "learnable" and isinstance(self.feedback_context_alpha_param, torch.Tensor):
+            alpha_tensor = self.feedback_context_alpha_param
+            if alpha_tensor.device != device or alpha_tensor.dtype != dtype:
+                alpha_tensor = alpha_tensor.to(device=device, dtype=dtype)
+            alpha_value = float(self.feedback_context_alpha_param.detach().float().cpu().item())
+            self._last_feedback_alpha_value = alpha_value
+            return alpha_tensor, alpha_value
+        if mode == "schedule":
+            step = int(self._feedback_context_schedule_step.item())
+            warmup = int(max(self.feedback_context_alpha_warmup_steps, 0))
+            ramp = int(max(self.feedback_context_alpha_ramp_steps, 1))
+            alpha_init = float(self.feedback_context_alpha_init)
+            alpha_target = float(self.feedback_context_alpha_target)
+            if step <= warmup:
+                alpha_value = alpha_init
+            else:
+                progress = min(max((step - warmup) / float(ramp), 0.0), 1.0)
+                alpha_value = alpha_init + (alpha_target - alpha_init) * progress
+            self._last_feedback_alpha_value = alpha_value
+            return torch.tensor(alpha_value, device=device, dtype=dtype), alpha_value
+        alpha_value = float(self.feedback_context_alpha_init)
+        self._last_feedback_alpha_value = alpha_value
+        return torch.tensor(alpha_value, device=device, dtype=dtype), alpha_value
+
+    def _maybe_advance_feedback_alpha_schedule(self):
+        if self.training and self.feedback_context_alpha_mode == "schedule":
+            self._feedback_context_schedule_step.add_(1)
+
+    def _prepare_feedback_tokens_for_context(
+        self,
+        feedback_tokens: Optional[torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], Optional[float]]:
+        if not isinstance(feedback_tokens, torch.Tensor):
+            return None, None
+        context_feedback_tokens = self._apply_feedback_context_norm(feedback_tokens)
+        alpha_tensor, alpha_value = self._compute_feedback_alpha(
+            device=context_feedback_tokens.device,
+            dtype=context_feedback_tokens.dtype,
+        )
+        context_feedback_tokens = context_feedback_tokens * alpha_tensor
+        if self.feedback_context_scale != 1.0:
+            context_feedback_tokens = context_feedback_tokens * float(self.feedback_context_scale)
+        return context_feedback_tokens, alpha_value
+
     def _predict_next_task_tokens(
         self,
         task_tokens: Optional[torch.Tensor],
@@ -1111,14 +1272,17 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             device=device,
             dtype=sa_embs.dtype,
         )
+        feedback_tokens_for_context, feedback_alpha_value = self._prepare_feedback_tokens_for_context(
+            feedback_tokens=feedback_tokens,
+        )
         context_task_tokens = task_tokens
-        if isinstance(feedback_tokens, torch.Tensor):
-            if self.feedback_context_scale != 1.0:
-                feedback_tokens = feedback_tokens * float(self.feedback_context_scale)
+        if self.feedback_context_only:
+            context_task_tokens = feedback_tokens_for_context
+        elif isinstance(feedback_tokens_for_context, torch.Tensor):
             context_task_tokens = (
-                feedback_tokens
+                feedback_tokens_for_context
                 if context_task_tokens is None
-                else torch.cat((feedback_tokens, context_task_tokens), dim=1)
+                else torch.cat((feedback_tokens_for_context, context_task_tokens), dim=1)
             )
         valid_tk_mask = None
         if isinstance(valid_tk, torch.Tensor):
@@ -1132,6 +1296,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         self._record_health("forward/task_tokens", task_tokens) if isinstance(task_tokens, torch.Tensor) else None
         self._record_health("forward/task_tokens_next", task_tokens_next) if isinstance(task_tokens_next, torch.Tensor) else None
         self._record_health("forward/feedback_tokens", feedback_tokens) if isinstance(feedback_tokens, torch.Tensor) else None
+        self._record_health("forward/feedback_tokens_for_context", feedback_tokens_for_context) if isinstance(feedback_tokens_for_context, torch.Tensor) else None
         self._record_health("forward/context_task_tokens", context_task_tokens) if isinstance(context_task_tokens, torch.Tensor) else None
         self._record_health("forward/valid_tk", valid_tk_mask) if isinstance(valid_tk_mask, torch.Tensor) else None
         temb = self.model.timestep_encoder(t_discretized)
@@ -1196,6 +1361,21 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             self._last_loss_breakdown["feedback_token_norm_mean"] = float(
                 feedback_tokens.detach().norm(dim=-1).mean().item()
             )
+        if isinstance(feedback_tokens_for_context, torch.Tensor):
+            self._last_loss_breakdown["feedback_context_token_num"] = float(feedback_tokens_for_context.shape[1])
+            self._last_loss_breakdown["feedback_context_token_norm_mean"] = float(
+                feedback_tokens_for_context.detach().norm(dim=-1).mean().item()
+            )
+        if feedback_alpha_value is not None:
+            self._last_loss_breakdown["feedback_alpha"] = float(feedback_alpha_value)
+        self._last_loss_breakdown["feedback_context_only"] = 1.0 if self.feedback_context_only else 0.0
+        self._last_loss_breakdown["feedback_context_norm_enabled"] = 0.0 if self.feedback_context_norm_type == "none" else 1.0
+        self._last_loss_breakdown["feedback_context_alpha_mode_fixed"] = 1.0 if self.feedback_context_alpha_mode == "fixed" else 0.0
+        self._last_loss_breakdown["feedback_context_alpha_mode_learnable"] = 1.0 if self.feedback_context_alpha_mode == "learnable" else 0.0
+        self._last_loss_breakdown["feedback_context_alpha_mode_schedule"] = 1.0 if self.feedback_context_alpha_mode == "schedule" else 0.0
+        self._last_loss_breakdown["feedback_context_alpha_schedule_step"] = float(
+            int(self._feedback_context_schedule_step.item())
+        )
         rrr = world_guidance.get("rrr")
         if isinstance(rrr, torch.Tensor) and rrr.numel() > 0:
             self._last_rrr = float(rrr.detach().mean().item())
@@ -1230,6 +1410,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             if drift_p95 is not None:
                 self._last_loss_breakdown["drift_l2_p95"] = float(drift_p95)
                 self._last_loss_breakdown["drift_norm_p95"] = float(drift_p95)
+        self._maybe_advance_feedback_alpha_schedule()
         self._record_health("forward/loss_total", total_loss.unsqueeze(0))
         return total_loss
 
@@ -1305,14 +1486,17 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             device=device,
             dtype=vl_embs_list[0].dtype,
         )
+        feedback_tokens_for_context, feedback_alpha_value = self._prepare_feedback_tokens_for_context(
+            feedback_tokens=feedback_tokens,
+        )
         context_task_tokens = task_tokens
-        if isinstance(feedback_tokens, torch.Tensor):
-            if self.feedback_context_scale != 1.0:
-                feedback_tokens = feedback_tokens * float(self.feedback_context_scale)
+        if self.feedback_context_only:
+            context_task_tokens = feedback_tokens_for_context
+        elif isinstance(feedback_tokens_for_context, torch.Tensor):
             context_task_tokens = (
-                feedback_tokens
+                feedback_tokens_for_context
                 if context_task_tokens is None
-                else torch.cat((feedback_tokens, context_task_tokens), dim=1)
+                else torch.cat((feedback_tokens_for_context, context_task_tokens), dim=1)
             )
         replans = 0
         t = 0
@@ -1487,6 +1671,21 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 if isinstance(feedback_tokens, torch.Tensor)
                 else 0.0
             ),
+            "feedback/context_token_num": (
+                int(feedback_tokens_for_context.shape[1])
+                if isinstance(feedback_tokens_for_context, torch.Tensor)
+                else 0
+            ),
+            "feedback/context_token_norm_mean": (
+                float(feedback_tokens_for_context.detach().norm(dim=-1).mean().item())
+                if isinstance(feedback_tokens_for_context, torch.Tensor)
+                else 0.0
+            ),
+            "feedback/context_only": bool(self.feedback_context_only),
+            "feedback/context_norm_type": str(self.feedback_context_norm_type),
+            "feedback/alpha_mode": str(self.feedback_context_alpha_mode),
+            "feedback/alpha": float(feedback_alpha_value) if feedback_alpha_value is not None else None,
+            "feedback/alpha_schedule_step": int(self._feedback_context_schedule_step.item()),
         }
         return actions, info
 
