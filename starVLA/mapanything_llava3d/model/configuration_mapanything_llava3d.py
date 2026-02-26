@@ -41,6 +41,9 @@ class MapAnythingLlava3DConfig(PretrainedConfig):
         spatial_token_num=259,
         use_spatial_token=False,
         use_geometric_branch=True,
+        algorithm_version="v3",
+        task_token_pipeline_version=None,
+        fusion_version=None,
         image_seq_length=None,
         action_expert_config=None,
         action_dim=14,
@@ -134,6 +137,13 @@ class MapAnythingLlava3DConfig(PretrainedConfig):
         self.spatial_token_num = spatial_token_num
         self.use_spatial_token = use_spatial_token
         self.use_geometric_branch = use_geometric_branch
+        if task_token_pipeline_version is None:
+            task_token_pipeline_version = algorithm_version
+        if fusion_version is None:
+            fusion_version = algorithm_version
+        self.algorithm_version = str(algorithm_version).lower()
+        self.task_token_pipeline_version = str(task_token_pipeline_version).lower()
+        self.fusion_version = str(fusion_version).lower()
         self.image_seq_length = image_seq_length
         self.action_expert_config = action_expert_config
         self.action_dim = action_dim

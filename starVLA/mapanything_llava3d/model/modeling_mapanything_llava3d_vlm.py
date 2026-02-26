@@ -163,6 +163,28 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
         self.debug_timing_cuda_sync = bool(getattr(config, "debug_timing_cuda_sync", True))
         self.debug_last_geom_model_forward_ms: float = 0.0
         self.debug_last_geom_feature_extract_ms: float = 0.0
+        algo_version = str(
+            getattr(
+                config,
+                "algorithm_version",
+                getattr(config, "task_token_pipeline_version", "v3"),
+            )
+        ).lower()
+        if algo_version not in ("v3", "v4"):
+            logger.warning("Invalid algorithm_version=%s, fallback to v3.", algo_version)
+            algo_version = "v3"
+        fusion_version = str(
+            getattr(config, "fusion_version", algo_version)
+        ).lower()
+        if fusion_version not in ("v3", "v4"):
+            logger.warning("Invalid fusion_version=%s, fallback to %s.", fusion_version, algo_version)
+            fusion_version = algo_version
+        self.algorithm_version = algo_version
+        self.task_token_pipeline_version = algo_version
+        self.fusion_version = fusion_version
+        self._last_geometric_projected: Optional[torch.Tensor] = None
+        self._last_vision_features: Optional[torch.Tensor] = None
+        self._last_fused_features: Optional[torch.Tensor] = None
 
     def _infer_geom_dim(self) -> int:
         mam = getattr(self.geometric_model, "map_anything_model", None)
@@ -266,6 +288,71 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
             queries[bid, :take_n] = token_query
             query_mask[bid, :take_n] = True
         return queries, query_mask
+
+    def _summarize_language_queries(
+        self,
+        language_queries: Optional[torch.Tensor],
+        language_query_mask: Optional[torch.Tensor],
+        fallback_features: torch.Tensor,
+    ) -> torch.Tensor:
+        if isinstance(language_queries, torch.Tensor) and language_queries.ndim == 3:
+            lang_q = language_queries.to(device=fallback_features.device, dtype=fallback_features.dtype)
+            if isinstance(language_query_mask, torch.Tensor):
+                mask = language_query_mask.to(device=fallback_features.device, dtype=torch.bool)
+                if mask.ndim == 2 and mask.shape[0] == lang_q.shape[0] and mask.shape[1] == lang_q.shape[1]:
+                    weight = mask.unsqueeze(-1).to(dtype=lang_q.dtype)
+                    denom = weight.sum(dim=1).clamp_min(1.0)
+                    return (lang_q * weight).sum(dim=1) / denom
+            return lang_q.mean(dim=1)
+        return fallback_features.mean(dim=1)
+
+    def _validate_task_tokens(
+        self,
+        task_tokens: Optional[torch.Tensor],
+        *,
+        context: str,
+    ) -> Optional[torch.Tensor]:
+        if not isinstance(task_tokens, torch.Tensor):
+            return None
+        if task_tokens.ndim != 3:
+            raise ValueError(
+                f"`task_hidden_states` must be 3D [B, K, H], got shape={tuple(task_tokens.shape)} ({context})"
+            )
+        if task_tokens.shape[1] != int(self.task_token_num):
+            raise ValueError(
+                f"`task_hidden_states` token_num mismatch: got K={task_tokens.shape[1]}, "
+                f"expected fixed K={self.task_token_num} ({context})"
+            )
+        return task_tokens
+
+    def _build_post_lm_task_tokens(
+        self,
+        *,
+        lm_hidden_states: Optional[torch.Tensor],
+        input_ids: Optional[torch.LongTensor],
+        attention_mask: Optional[torch.Tensor],
+        image_token_index: Optional[int],
+    ) -> Optional[torch.Tensor]:
+        if not isinstance(lm_hidden_states, torch.Tensor):
+            return None
+        vision_features = self._last_fused_features
+        if not isinstance(vision_features, torch.Tensor):
+            vision_features = self._last_image_features
+        if not isinstance(vision_features, torch.Tensor):
+            return None
+        language_queries, language_query_mask = self._build_language_queries(
+            inputs_embeds=lm_hidden_states,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            image_token_index=image_token_index,
+        )
+        task_tokens = self._build_fixed_task_tokens(
+            geometric_features=self._last_geometric_projected,
+            vision_features=vision_features,
+            language_queries=language_queries,
+            language_query_mask=language_query_mask,
+        )
+        return task_tokens
 
     @staticmethod
     def _tensor_health(tensor: torch.Tensor) -> Dict[str, Any]:
@@ -412,6 +499,9 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
         if multi_view and vision_feats is not None:
             vision_feats = vision_feats.view(b, v * vision_feats.shape[1], vision_feats.shape[2])
         self._maybe_log_tensor_shape("vision_feats", vision_feats)
+        self._last_vision_features = vision_feats
+        self._last_geometric_projected = None
+        self._last_fused_features = None
 
         if self.training:
             p_img = getattr(self, "prefix_image_dropout_prob", 0.0)
@@ -430,7 +520,9 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
             self.debug_last_geom_model_forward_ms = 0.0
             self.debug_last_geom_feature_extract_ms = 0.0
             self._last_image_features = vision_feats
-            if isinstance(vision_feats, torch.Tensor):
+            self._last_fused_features = vision_feats if isinstance(vision_feats, torch.Tensor) else None
+            build_task_tokens_pre_lm = self.task_token_pipeline_version != "v4"
+            if build_task_tokens_pre_lm and isinstance(vision_feats, torch.Tensor):
                 task_tokens = self._build_fixed_task_tokens(
                     geometric_features=None,
                     vision_features=vision_feats,
@@ -475,15 +567,19 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
         self._record_health("geometric_features", geometric_features)
         self._maybe_log_tensor_shape("geom_seq", geometric_features)
 
-        final_features, task_tokens = self.fusion_module(
+        build_task_tokens_pre_lm = self.task_token_pipeline_version != "v4"
+        final_features, task_tokens, geometric_projected = self.fusion_module(
             geometric_features,
             vision_feats,
             language_queries=language_queries,
             language_query_mask=language_query_mask,
+            build_task_tokens=build_task_tokens_pre_lm,
         )
         self._record_health("image_features_output_fused", final_features)
 
         self._last_image_features = final_features
+        self._last_fused_features = final_features
+        self._last_geometric_projected = geometric_projected
         self._last_task_tokens = task_tokens
         return final_features
 
@@ -531,21 +627,11 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
             need_weights=False,
         )
 
-        if isinstance(language_queries, torch.Tensor) and language_queries.ndim == 3:
-            lang_q = language_queries.to(device=vision_features.device, dtype=vision_features.dtype)
-            if isinstance(language_query_mask, torch.Tensor):
-                mask = language_query_mask.to(device=vision_features.device, dtype=torch.bool)
-                if mask.ndim == 2 and mask.shape[0] == bsz and mask.shape[1] == lang_q.shape[1]:
-                    weight = mask.unsqueeze(-1).to(dtype=lang_q.dtype)
-                    denom = weight.sum(dim=1).clamp_min(1.0)
-                    lang_summary = (lang_q * weight).sum(dim=1) / denom
-                else:
-                    lang_summary = lang_q.mean(dim=1)
-            else:
-                lang_summary = lang_q.mean(dim=1)
-        else:
-            # Fallback summary keeps interface stable even without language query extraction.
-            lang_summary = vision_features.mean(dim=1)
+        lang_summary = self._summarize_language_queries(
+            language_queries=language_queries,
+            language_query_mask=language_query_mask,
+            fallback_features=vision_features,
+        )
         lang_summary = lang_summary.unsqueeze(1).expand(-1, self.task_token_num, -1)
 
         fuse_in = torch.cat([geo_context, vis_context, lang_summary], dim=-1)
@@ -560,27 +646,53 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
         vision_features,
         language_queries: Optional[torch.Tensor] = None,
         language_query_mask: Optional[torch.Tensor] = None,
+        build_task_tokens: bool = True,
     ):
-        geometric_features = self.geometric_projector(geometric_features).to(vision_features.dtype)
-        self._record_health("fusion/geometric_projected", geometric_features)
-        task_tokens = self._build_fixed_task_tokens(
-            geometric_features=geometric_features,
-            vision_features=vision_features,
-            language_queries=language_queries,
-            language_query_mask=language_query_mask,
-        )
+        geometric_projected = self.geometric_projector(geometric_features).to(vision_features.dtype)
+        self._record_health("fusion/geometric_projected", geometric_projected)
+        task_tokens = None
 
-        vision_context, _ = self.vision_semantic_attention(
-            query=vision_features,
-            key=task_tokens,
-            value=task_tokens,
-            need_weights=False,
-        )
-        fused_features_pre = torch.cat([vision_features, vision_context], dim=-1)
+        if self.fusion_version == "v4":
+            # v4: use image features as Q, geometric features as K/V.
+            vision_context, _ = self.vision_semantic_attention(
+                query=vision_features,
+                key=geometric_projected,
+                value=geometric_projected,
+                need_weights=False,
+            )
+            fused_vision = self.semantic_anchor_norm(vision_features + vision_context)
+            lang_summary = self._summarize_language_queries(
+                language_queries=language_queries,
+                language_query_mask=language_query_mask,
+                fallback_features=fused_vision,
+            )
+            lang_expand = lang_summary.unsqueeze(1).expand(-1, fused_vision.shape[1], -1)
+            fused_features_pre = torch.cat([fused_vision, lang_expand], dim=-1)
+            if build_task_tokens:
+                task_tokens = self._build_fixed_task_tokens(
+                    geometric_features=geometric_projected,
+                    vision_features=fused_vision,
+                    language_queries=language_queries,
+                    language_query_mask=language_query_mask,
+                )
+        else:
+            task_tokens = self._build_fixed_task_tokens(
+                geometric_features=geometric_projected,
+                vision_features=vision_features,
+                language_queries=language_queries,
+                language_query_mask=language_query_mask,
+            )
+            vision_context, _ = self.vision_semantic_attention(
+                query=vision_features,
+                key=task_tokens,
+                value=task_tokens,
+                need_weights=False,
+            )
+            fused_features_pre = torch.cat([vision_features, vision_context], dim=-1)
         self._record_health("fusion/fused_features_pre", fused_features_pre)
         final_features = self.fusion_projector(fused_features_pre)
         self._record_health("fusion/final_features", final_features)
-        return final_features, task_tokens
+        return final_features, task_tokens, geometric_projected
 
     def extract_task_tokens(
         self,
@@ -597,6 +709,34 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
         """Fast path used by temporal supervision: build task tokens without LM decoder forward."""
         self._reset_health_trace()
         return_dict = self.config.use_return_dict if return_dict is None else return_dict
+        if self.task_token_pipeline_version == "v4":
+            # v4 requires LM-post hidden states for task token extraction.
+            outputs = self.forward(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                intrinsic=intrinsic,
+                attention_mask=attention_mask,
+                inputs_embeds=inputs_embeds,
+                labels=None,
+                use_cache=False,
+                output_attentions=False,
+                output_hidden_states=True,
+                return_dict=True,
+                image_token_index=image_token_index,
+                image_token_id=image_token_id,
+                **kwargs,
+            )
+            if not return_dict:
+                return outputs.image_hidden_states, outputs.task_hidden_states
+            return MapAnythingLlava3DOutput(
+                loss=None,
+                logits=None,
+                past_key_values=None,
+                hidden_states=None,
+                attentions=None,
+                image_hidden_states=outputs.image_hidden_states,
+                task_hidden_states=outputs.task_hidden_states,
+            )
 
         embed = self.get_input_embeddings()
         vocab_size = embed.weight.shape[0]
@@ -639,16 +779,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
                 language_query_mask=language_query_mask,
             )
             task_tokens = getattr(self, "_last_task_tokens", None)
-            if isinstance(task_tokens, torch.Tensor):
-                if task_tokens.ndim != 3:
-                    raise ValueError(
-                        f"`task_hidden_states` must be 3D [B, K, H], got shape={tuple(task_tokens.shape)}"
-                    )
-                if task_tokens.shape[1] != int(self.task_token_num):
-                    raise ValueError(
-                        f"`task_hidden_states` token_num mismatch: got K={task_tokens.shape[1]}, "
-                        f"expected fixed K={self.task_token_num}"
-                    )
+            task_tokens = self._validate_task_tokens(task_tokens, context="extract")
             self._record_health("extract/image_features", image_features)
             self._record_health("extract/task_tokens", task_tokens)
 
@@ -687,7 +818,10 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
     ) -> Union[Tuple, MapAnythingLlava3DOutput]:
         self._reset_health_trace()
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        requested_output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        output_hidden_states = requested_output_hidden_states
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         embed = self.get_input_embeddings()
@@ -731,16 +865,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
                 language_query_mask=language_query_mask,
             )
             task_tokens = getattr(self, "_last_task_tokens", None)
-            if isinstance(task_tokens, torch.Tensor):
-                if task_tokens.ndim != 3:
-                    raise ValueError(
-                        f"`task_hidden_states` must be 3D [B, K, H], got shape={tuple(task_tokens.shape)}"
-                    )
-                if task_tokens.shape[1] != int(self.task_token_num):
-                    raise ValueError(
-                        f"`task_hidden_states` token_num mismatch: got K={task_tokens.shape[1]}, "
-                        f"expected fixed K={self.task_token_num}"
-                    )
+            task_tokens = self._validate_task_tokens(task_tokens, context="forward-prelm")
             self._record_health("forward/image_features", image_features)
 
             if spatial_img_id is not None:
@@ -815,6 +940,8 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
                     self._record_health("forward/inputs_embeds_after_lang_dropout", inputs_embeds)
 
         self._record_health("forward/inputs_embeds_before_language_model", inputs_embeds)
+        if pixel_values is not None and self.task_token_pipeline_version == "v4":
+            output_hidden_states = True
 
         outputs = self.language_model(
             attention_mask=attention_mask,
@@ -833,18 +960,35 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
                 self._record_health("forward/lm_hidden_last", outputs.hidden_states[-1])
         except Exception:
             pass
+        if (
+            pixel_values is not None
+            and self.task_token_pipeline_version == "v4"
+            and not isinstance(task_tokens, torch.Tensor)
+        ):
+            lm_last_hidden = None
+            if outputs.hidden_states is not None and len(outputs.hidden_states) > 0:
+                lm_last_hidden = outputs.hidden_states[-1]
+            task_tokens = self._build_post_lm_task_tokens(
+                lm_hidden_states=lm_last_hidden,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                image_token_index=spatial_img_id if "spatial_img_id" in locals() else None,
+            )
+            task_tokens = self._validate_task_tokens(task_tokens, context="forward-postlm")
+            self._record_health("forward/task_tokens_post_lm", task_tokens)
 
         loss = outputs.loss
 
         if not return_dict:
             output = (outputs.logits,) + outputs[2:]
             return ((loss,) + output) if loss is not None else output
+        hidden_states_out = outputs.hidden_states if requested_output_hidden_states else None
 
         return MapAnythingLlava3DOutput(
             loss=loss,
             logits=outputs.logits,
             past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
+            hidden_states=hidden_states_out,
             attentions=outputs.attentions,
             image_hidden_states=image_features if pixel_values is not None else None,
             task_hidden_states=task_tokens if pixel_values is not None else None,

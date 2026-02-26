@@ -78,6 +78,8 @@ class _MapAnythingLlava3D_Interface(nn.Module):
         strip_instruction = True
         instruction_log_interval = 0
         task_token_num = 32
+        algorithm_version = "v3"
+        fusion_version = None
         base_vlm_path = None
         vision_model_name_or_path = _DEFAULT_VISION_MODEL
         language_model_name_or_path = _DEFAULT_LANGUAGE_MODEL
@@ -108,6 +110,12 @@ class _MapAnythingLlava3D_Interface(nn.Module):
                     am_cfg = getattr(fw_cfg, "action_model", None) if fw_cfg is not None else None
                     if am_cfg is not None and hasattr(am_cfg, "num_task_tokens"):
                         task_token_num = int(getattr(am_cfg, "num_task_tokens"))
+                if hasattr(ma_cfg, "algorithm_version"):
+                    algorithm_version = str(getattr(ma_cfg, "algorithm_version"))
+                elif hasattr(ma_cfg, "task_token_pipeline_version"):
+                    algorithm_version = str(getattr(ma_cfg, "task_token_pipeline_version"))
+                if hasattr(ma_cfg, "fusion_version"):
+                    fusion_version = str(getattr(ma_cfg, "fusion_version"))
         except Exception:
             prefix_image_dropout_prob = 0.0
             prefix_lang_dropout_prob = 0.0
@@ -117,11 +125,23 @@ class _MapAnythingLlava3D_Interface(nn.Module):
             strip_instruction = True
             instruction_log_interval = 0
             task_token_num = 32
+            algorithm_version = "v3"
+            fusion_version = None
         if task_token_num < 1:
             task_token_num = 1
+        algorithm_version = str(algorithm_version).lower()
+        if algorithm_version not in ("v3", "v4"):
+            algorithm_version = "v3"
+        if fusion_version is None:
+            fusion_version = algorithm_version
+        fusion_version = str(fusion_version).lower()
+        if fusion_version not in ("v3", "v4"):
+            fusion_version = algorithm_version
         print(f"prefix_image_dropout_prob: {prefix_image_dropout_prob}")
         print(f"prefix_lang_dropout_prob: {prefix_lang_dropout_prob}")
         print(f"task_token_num: {task_token_num}")
+        print(f"algorithm_version: {algorithm_version}")
+        print(f"fusion_version: {fusion_version}")
 
         model = None
         mapanything_cfg = None
@@ -142,6 +162,9 @@ class _MapAnythingLlava3D_Interface(nn.Module):
                 mapanything_cfg.prefix_lang_dropout_prob = prefix_lang_dropout_prob
                 setattr(mapanything_cfg, "use_geometric_branch", use_geom)
                 setattr(mapanything_cfg, "task_token_num", int(task_token_num))
+                setattr(mapanything_cfg, "algorithm_version", str(algorithm_version))
+                setattr(mapanything_cfg, "task_token_pipeline_version", str(algorithm_version))
+                setattr(mapanything_cfg, "fusion_version", str(fusion_version))
                 cfg_vision = getattr(mapanything_cfg, "vision_model_name_or_path", None)
                 cfg_language = getattr(mapanything_cfg, "language_model_name_or_path", None)
                 if isinstance(cfg_vision, str) and cfg_vision:
@@ -166,6 +189,9 @@ class _MapAnythingLlava3D_Interface(nn.Module):
                 prefix_image_dropout_prob=prefix_image_dropout_prob,
                 prefix_lang_dropout_prob=prefix_lang_dropout_prob,
                 task_token_num=int(task_token_num),
+                algorithm_version=str(algorithm_version),
+                task_token_pipeline_version=str(algorithm_version),
+                fusion_version=str(fusion_version),
             )
             model = MapAnythingLlava3DForConditionalGeneration(mapanything_cfg)
         image_processor = AutoImageProcessor.from_pretrained(vision_model_name_or_path, trust_remote_code=True)
