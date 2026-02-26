@@ -1,5 +1,6 @@
 import dataclasses
 import datetime as dt
+import hashlib
 import json
 import logging
 import math
@@ -48,6 +49,11 @@ def _safe_float(value):
         return float(value)
     except Exception:
         return None
+
+
+def _short_hash(text: str, n: int = 12) -> str:
+    raw = "" if text is None else str(text)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[: max(4, int(n))]
 
 
 def _percentile(values: list[float], q: float):
@@ -152,6 +158,7 @@ def eval_libero(args: Args) -> None:
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
+    first_action_registry = []
     for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
         # Get task
         task = task_suite.get_task(task_id)
@@ -327,6 +334,8 @@ def eval_libero(args: Args) -> None:
                     )
                 else:
                     delta_action = np.concatenate([world_vector_delta, rotation_delta, gripper], axis=0)
+                instruction_text = str(example_dict.get("lang", ""))
+                instruction_hash = _short_hash(instruction_text)
 
                 full_actions.append(delta_action)
                 
@@ -366,6 +375,16 @@ def eval_libero(args: Args) -> None:
                     "rt/action_index_j_ref": int(j_ref),
                     "rt/phase_shift_steps_true": int(phase_shift_steps_true),
                     "rt/command_overlap_true_running": int(chunk_update_counts.get(chunk_id, 0)),
+                    "debug/instruction_hash": instruction_hash,
+                    "debug/action/wx": float(world_vector_delta[0]),
+                    "debug/action/wy": float(world_vector_delta[1]),
+                    "debug/action/wz": float(world_vector_delta[2]),
+                    "debug/action/rx": float(rotation_delta[0]),
+                    "debug/action/ry": float(rotation_delta[1]),
+                    "debug/action/rz": float(rotation_delta[2]),
+                    "debug/action/gripper_raw": float(open_gripper[0]),
+                    "debug/action/gripper_bin": float(gripper[0]),
+                    "debug/action/l2": float(np.linalg.norm(delta_action)),
                 }
                 if isinstance(policy_debug_info, dict):
                     rt_row["rt/policy_debug_timing/perception_ms"] = _safe_float(
@@ -404,6 +423,43 @@ def eval_libero(args: Args) -> None:
                     path_a_source = policy_debug_info.get("path_a_feedback/source")
                     rt_row["rt/policy_debug_path_a/source"] = (
                         None if path_a_source is None else str(path_a_source)
+                    )
+                    lang_sigs = policy_debug_info.get("lang_token_signatures")
+                    if isinstance(lang_sigs, (list, tuple)) and len(lang_sigs) > 0:
+                        try:
+                            rt_row["rt/policy_debug_lang/signature0"] = int(lang_sigs[0])
+                        except Exception:
+                            rt_row["rt/policy_debug_lang/signature0"] = None
+                    rt_row["rt/policy_debug_lang/non_ws_ratio_mean"] = _safe_float(
+                        policy_debug_info.get("lang_non_whitespace_ratio_mean")
+                    )
+                    instruction_preview = policy_debug_info.get("instruction_preview")
+                    if isinstance(instruction_preview, (list, tuple)) and len(instruction_preview) > 0:
+                        rt_row["rt/policy_debug_lang/instruction_preview0"] = str(instruction_preview[0])
+                if chunk_refresh and step == 0:
+                    for prev in first_action_registry:
+                        if prev["instruction_hash"] == instruction_hash:
+                            continue
+                        if np.allclose(delta_action, prev["delta_action"], atol=1e-6, rtol=1e-5):
+                            logging.warning(
+                                "[sanity] identical first action across different instructions | "
+                                "curr(task=%s,ep=%s,hash=%s) prev(task=%s,ep=%s,hash=%s) action=%s",
+                                task_id,
+                                episode_idx,
+                                instruction_hash,
+                                prev["task_id"],
+                                prev["episode_idx"],
+                                prev["instruction_hash"],
+                                np.array2string(delta_action, precision=6),
+                            )
+                            break
+                    first_action_registry.append(
+                        {
+                            "task_id": int(task_id),
+                            "episode_idx": int(episode_idx),
+                            "instruction_hash": instruction_hash,
+                            "delta_action": delta_action.copy(),
+                        }
                     )
                 step_metric_rows.append(rt_row)
                 if args.enable_rt_metrics:
