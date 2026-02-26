@@ -31,6 +31,7 @@ class ModelClient:
         adaptive_ensemble_alpha = 0.1,
         deterministic_seed: Optional[int] = None,
         return_debug_info: bool = False,
+        action_chunk_size_override: Optional[int] = None,
         host="0.0.0.0",
         port=10095,
     ) -> None:
@@ -65,6 +66,8 @@ class ModelClient:
 
         self.action_norm_stats = self.get_action_stats(self.unnorm_key, policy_ckpt_path=policy_ckpt_path)
         self.action_chunk_size = self.get_action_chunk_size(policy_ckpt_path=policy_ckpt_path)
+        if action_chunk_size_override is not None and int(action_chunk_size_override) > 0:
+            self.action_chunk_size = int(action_chunk_size_override)
         self.last_policy_debug_info = None
         
 

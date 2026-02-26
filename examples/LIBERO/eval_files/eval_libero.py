@@ -98,6 +98,8 @@ class Args:
     enable_rt_metrics: bool = True
     rt_metrics_filename: str = "rt_metrics.jsonl"
     rt_metrics_log_every_n_steps: int = 20
+    rotate_180: bool = True
+    action_chunk_size_override: int = -1
 
 
 def eval_libero(args: Args) -> None:
@@ -142,6 +144,9 @@ def eval_libero(args: Args) -> None:
         image_size=args.resize_size,
         deterministic_seed=(None if int(args.deterministic_seed) < 0 else int(args.deterministic_seed)),
         return_debug_info=bool(args.request_policy_debug_info),
+        action_chunk_size_override=(
+            None if int(args.action_chunk_size_override) <= 0 else int(args.action_chunk_size_override)
+        ),
     )
 
 
@@ -191,11 +196,15 @@ def eval_libero(args: Args) -> None:
                     t += 1
                     continue
 
-                # IMPORTANT: rotate 180 degrees to match train preprocessing
-                img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
-                wrist_img = np.ascontiguousarray(
-                    obs["robot0_eye_in_hand_image"][::-1, ::-1]
-                )
+                if args.rotate_180:
+                    # Historical eval setting used by prior LIBERO scripts.
+                    img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
+                    wrist_img = np.ascontiguousarray(
+                        obs["robot0_eye_in_hand_image"][::-1, ::-1]
+                    )
+                else:
+                    img = np.ascontiguousarray(obs["agentview_image"])
+                    wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"])
 
                 # Save preprocessed image for replay video
                 replay_images.append(img)

@@ -39,7 +39,9 @@ use_state=true
 expected_state_dim=8
 auto_pad_state_to_expected_dim=false
 log_payload_every_n_steps=1
-repeat_infer_debug_times=3
+repeat_infer_debug_times="${EVAL_REPEAT_INFER_DEBUG_TIMES:-1}"
+rotate_180="${EVAL_ROTATE_180:-True}"
+action_chunk_size_override="${EVAL_ACTION_CHUNK_OVERRIDE:--1}"
 
 extra_args=()
 if [ "$use_state" = true ]; then
@@ -54,6 +56,8 @@ extra_args+=(--args.repeat-infer-debug-times "$repeat_infer_debug_times")
 extra_args+=(--args.enable-rt-metrics "$enable_rt_metrics")
 extra_args+=(--args.rt-metrics-filename "$rt_metrics_filename")
 extra_args+=(--args.request-policy-debug-info "$request_policy_debug_info")
+extra_args+=(--args.rotate-180 "$rotate_180")
+extra_args+=(--args.action-chunk-size-override "$action_chunk_size_override")
 
 echo "Using host=$host"
 echo "Using base_port=$base_port"
@@ -69,6 +73,8 @@ echo "Using repeat_infer_debug_times=$repeat_infer_debug_times"
 echo "Using enable_rt_metrics=$enable_rt_metrics"
 echo "Using rt_metrics_filename=$rt_metrics_filename"
 echo "Using request_policy_debug_info=$request_policy_debug_info"
+echo "Using rotate_180=$rotate_180"
+echo "Using action_chunk_size_override=$action_chunk_size_override"
 echo "Logs will be saved to ${LOG_FILE}"
 
 "${LIBERO_Python}" ./examples/LIBERO/eval_files/eval_libero.py \

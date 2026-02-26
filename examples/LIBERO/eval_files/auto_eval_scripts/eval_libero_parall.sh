@@ -28,11 +28,26 @@ num_trials_per_task=50
 host="127.0.0.1"
 base_port=$((6450 + run_index))
 unnorm_key="franka"
+disable_patha_infer="${DISABLE_PATHA_INFER:-0}"
+enable_patha_infer="${ENABLE_PATHA_INFER:-0}"
+patha_feedback_scale="${PATHA_FEEDBACK_SCALE:-}"
+
+extra_server_args=()
+if [ "${disable_patha_infer}" = "1" ]; then
+  extra_server_args+=(--disable_path_a_inference)
+fi
+if [ "${enable_patha_infer}" = "1" ]; then
+  extra_server_args+=(--enable_path_a_inference)
+fi
+if [ -n "${patha_feedback_scale}" ]; then
+  extra_server_args+=(--path_a_feedback_scale "${patha_feedback_scale}")
+fi
 
 CUDA_VISIBLE_DEVICES=$gpu_id ${starVLA_python} deployment/model_server/server_policy.py \
     --ckpt_path ${your_ckpt} \
     --port ${base_port} \
-    --use_bf16 &
+    --use_bf16 \
+    "${extra_server_args[@]}" &
 
 
 # 获取服务的 PID

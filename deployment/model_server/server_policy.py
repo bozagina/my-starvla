@@ -22,6 +22,44 @@ def main(args) -> None:
         ckpt_path,
     )
 
+    # Runtime ablation toggles for Path-A inference (no checkpoint mutation).
+    if hasattr(vla, "enable_causal_feedback_inference"):
+        if args.disable_path_a_inference and args.enable_path_a_inference:
+            raise ValueError(
+                "Conflicting flags: both --disable_path_a_inference and "
+                "--enable_path_a_inference are set."
+            )
+        if args.disable_path_a_inference:
+            vla.enable_causal_feedback_inference = False
+            try:
+                vla.config.framework.action_model.enable_causal_feedback_inference = False
+            except Exception:
+                pass
+            logging.info("[ablation] Path-A inference is DISABLED by runtime flag.")
+        elif args.enable_path_a_inference:
+            vla.enable_causal_feedback_inference = True
+            try:
+                vla.config.framework.action_model.enable_causal_feedback_inference = True
+            except Exception:
+                pass
+            logging.info("[ablation] Path-A inference is ENABLED by runtime flag.")
+        else:
+            logging.info(
+                "[ablation] Path-A inference follows checkpoint/config default: %s",
+                bool(getattr(vla, "enable_causal_feedback_inference", True)),
+            )
+
+    if hasattr(vla, "causal_feedback_scale") and args.path_a_feedback_scale is not None:
+        try:
+            vla.causal_feedback_scale = float(args.path_a_feedback_scale)
+            try:
+                vla.config.framework.action_model.causal_feedback_scale = float(args.path_a_feedback_scale)
+            except Exception:
+                pass
+            logging.info("[ablation] Override Path-A feedback scale to %.6f", float(vla.causal_feedback_scale))
+        except Exception as e:
+            logging.warning("Failed to override path_a_feedback_scale: %s", e)
+
     if args.use_bf16: # False
         vla = vla.to(torch.bfloat16)
     vla = vla.to("cuda").eval()
@@ -48,6 +86,22 @@ def build_argparser():
     parser.add_argument("--port", type=int, default=10093)
     parser.add_argument("--use_bf16", action="store_true")
     parser.add_argument("--idle_timeout" , type=int, default=1800, help="Idle timeout in seconds, -1 means never close")
+    parser.add_argument(
+        "--disable_path_a_inference",
+        action="store_true",
+        help="Disable Path-A causal feedback tokens at inference time for strict A/B eval.",
+    )
+    parser.add_argument(
+        "--enable_path_a_inference",
+        action="store_true",
+        help="Force-enable Path-A causal feedback tokens at inference time.",
+    )
+    parser.add_argument(
+        "--path_a_feedback_scale",
+        type=float,
+        default=None,
+        help="Optional runtime override for Path-A feedback scale.",
+    )
     return parser
 
 
