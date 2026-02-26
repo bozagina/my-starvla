@@ -43,6 +43,21 @@ repeat_infer_debug_times="${EVAL_REPEAT_INFER_DEBUG_TIMES:-1}"
 rotate_180="${EVAL_ROTATE_180:-True}"
 action_chunk_size_override="${EVAL_ACTION_CHUNK_OVERRIDE:--1}"
 
+# Normalize shell bool-like strings to 1/0.
+# Accept: true/false, True/False, 1/0, yes/no, y/n, on/off.
+bool_to_01() {
+    local v
+    v="$(echo "${1:-}" | tr '[:upper:]' '[:lower:]')"
+    case "$v" in
+        1|true|yes|y|on) echo "1" ;;
+        0|false|no|n|off|"") echo "0" ;;
+        *)
+            echo "[eval_libero.sh][WARN] Unrecognized bool value '$1', fallback to 0" >&2
+            echo "0"
+            ;;
+    esac
+}
+
 extra_args=()
 if [ "$use_state" = true ]; then
     extra_args+=(--args.use-state)
@@ -53,11 +68,24 @@ fi
 extra_args+=(--args.expected-state-dim "$expected_state_dim")
 extra_args+=(--args.log-payload-every-n-steps "$log_payload_every_n_steps")
 extra_args+=(--args.repeat-infer-debug-times "$repeat_infer_debug_times")
-extra_args+=(--args.enable-rt-metrics "$enable_rt_metrics")
 extra_args+=(--args.rt-metrics-filename "$rt_metrics_filename")
-extra_args+=(--args.request-policy-debug-info "$request_policy_debug_info")
-extra_args+=(--args.rotate-180 "$rotate_180")
 extra_args+=(--args.action-chunk-size-override "$action_chunk_size_override")
+
+if [ "$(bool_to_01 "$enable_rt_metrics")" = "1" ]; then
+    extra_args+=(--args.enable-rt-metrics)
+else
+    extra_args+=(--no-args.enable-rt-metrics)
+fi
+if [ "$(bool_to_01 "$request_policy_debug_info")" = "1" ]; then
+    extra_args+=(--args.request-policy-debug-info)
+else
+    extra_args+=(--no-args.request-policy-debug-info)
+fi
+if [ "$(bool_to_01 "$rotate_180")" = "1" ]; then
+    extra_args+=(--args.rotate-180)
+else
+    extra_args+=(--no-args.rotate-180)
+fi
 
 echo "Using host=$host"
 echo "Using base_port=$base_port"
