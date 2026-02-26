@@ -71,6 +71,53 @@
 - `/Users/bazinga/code/my-starvla/starVLA/model/modules/action_model/LayerwiseFM_ActionHeader.py:1139`  
   `_apply_layerwise_cross_attention(..., task_tokens=context_task_tokens)`
 
+### 2.5 Path A 的输入/输出与形状定义（当前实现）
+
+按训练前向中实际张量约定（`MapAnythingLlava3DPI.forward`）：
+
+- `task_tokens`: `[B, K, H]`  
+  - `B`: batch size  
+  - `K`: task token 数（通常 32）  
+  - `H`: token hidden dim（当前为 4096）
+- `task_tokens_next`: `[B, K, H]`  
+  - 来自 `t+k` 图像分支（优先 `extract_task_tokens`）
+- `action_chunk`（训练里是 GT `actions_target`）: `[B, T, A]`  
+  - `T`: 预测窗口长度（`future_action_window_size + 1`）  
+  - `A`: action dim（当前为 7）
+- `action_context`: `[B, A]`  
+  - 由 `build_world_action_context` 从 `[B,T,A]` 汇聚得到（当前默认 `prefix_mean`）
+- `z_before`, `z_after`: `[B, H]`  
+  - 由 action-conditioned pooling 从 `[B,K,H]` 汇聚
+- `delta_z = z_after - z_before`: `[B, H]`
+- `feedback_tokens`: `[B, Kf, H]`  
+  - `Kf = causal_feedback_token_num`（当前配置为 4）
+- `context_task_tokens`: `[B, Kf + K, H]`  
+  - 在 action head 内部由 `cat([feedback_tokens, task_tokens], dim=1)` 构造
+- 辅助分支：  
+  - `pred_delta`: `[B, H]`（由 `feedback_tokens.mean(dim=1)` 经 recon head 得到）  
+  - `delta_z_target`: `[B, H]`  
+  - `loss_fb = mse(pred_delta, delta_z_target) + dir_w * (1 - cos)`
+
+补充：当前设置 `repeated_diffusion_steps > 1` 时，进入 action head 的有效 batch 变为 `B' = B * repeated_diffusion_steps`。
+
+### 2.6 Path A 当前到底在训练什么模块（实操口径）
+
+在 `enable_causal_feedback_token=true` 时，Path A 新增可学习模块包括：
+
+- `causal_feedback_delta_norm`
+- `causal_feedback_action_proj`
+- `causal_feedback_action_norm`
+- `causal_feedback_fuse`
+- `causal_feedback_recon_head`（仅当 `causal_feedback_aux_weight > 0` 才有训练驱动）
+
+同时，`feedback_tokens` 注入 action head 后，会通过主任务 loss 影响 action head 参数（DiT/cross-attn/action decoder）。
+
+关键梯度路径说明（当前实现）：
+
+- `t+k` 分支抽取 `task_tokens_next` 使用 `torch.no_grad()`，因此该分支本身不参与反传（见 `MapAnythingLlava3DPI.forward`）。
+- 若 `causal_feedback_detach_delta=true`，则 `delta_z` 反传被切断，Path A 对上游 token/pooling 的驱动明显变弱。
+- 若 `causal_feedback_aux_detach_target=true`，则 `loss_fb` 不反推 `delta_z_target` 分支，只训练预测侧。
+
 ---
 
 ## 3. 关键配置项（Path A）
@@ -136,6 +183,42 @@
 - `debug/timing/train_vlm_t_ms`
 - `debug/timing/train_vlm_tk_ms`
 - `debug/timing/vlm_forward_ratio`
+
+### B5. 量化证据显示 Path A“被启用但使用强度偏弱”
+
+基于最新 run：
+
+- 配置：  
+  `/Users/bazinga/code/my-starvla/_remote_runs/1229_libero4in1_MapAnythingLlava3DPI_s42_20260226_005832/config.yaml`
+- 指标：  
+  `/Users/bazinga/code/my-starvla/_remote_runs/1229_libero4in1_MapAnythingLlava3DPI_s42_20260226_005832/metrics.jsonl`
+
+对前 31 条 step 级日志统计结果：
+
+- Path A 一直生效：  
+  - `debug/causal_feedback/applied = 1.0`  
+  - `debug/causal_feedback/action_conditioned_pooling = 1.0`
+- 但 slot 选择性几乎没有形成：  
+  - `slot_entropy_before/after ≈ 3.465735`  
+  - 与 `ln(32)=3.465736` 几乎重合（接近均匀分配）
+- feedback 对主 loss 的权重占比偏小：  
+  - `loss_fb_weighted` 均值约 `0.0075`  
+  - `action_loss_base` 均值约 `0.638`  
+  - 推导 `fb_weighted_over_base = loss_fb_weighted / action_loss_base` 均值约 `1.7%`（早期约 `0.7%`）
+- 训练阶段仍极早：  
+  - 仅约 `epoch=0.02`  
+  - lr 仍在 warmup 前段（`1e-8 -> 3.1e-7`）  
+  - 短窗口下难观察到稳定增益
+- 额外事实：  
+  - `debug/timing/vlm_forward_ratio` 约 `0.74`，VLM 双前向成本占比高  
+  - 当前注入是 concat，无门控，反馈 token 在大上下文中可能被弱化
+
+由此，当前现象更符合“Path A 已接入且稳定，但属于弱条件注入，尚未形成明显主任务主导贡献”。
+
+### B6. 为什么 `slot_entropy` 看起来几乎不变
+
+当前配置中 `loss_w_geo=0`，而 `residual_slot_entropy_weight` 的作用点在 `loss_geo` 内部。  
+这意味着即使设置了 `residual_slot_entropy_weight`，在 `loss_w_geo=0` 时这条正则对总损失无实际贡献，因此 `slot_entropy` 很可能保持在近均匀状态。
 
 ---
 
@@ -283,4 +366,3 @@
 3. detach 策略的推荐调度曲线是什么（按 step 分段）？  
 4. concat 注入是否应升级为 gated 注入？何时值得做？  
 5. 在不增加太多训练时间的前提下，最优的三项改动是什么？
-

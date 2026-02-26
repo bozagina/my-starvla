@@ -20,7 +20,7 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Tuple
+from typing import Dict, List, Optional, Tuple
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import time
@@ -813,15 +813,205 @@ class VLATrainer(TrainerUtils):
 
         # execute evaluation step
 
-    def eval_action_model(self, step_metrics: dict = None) -> float:
-        """
-        Evaluate the model on the given dataset using the specified metric function.
+    @staticmethod
+    def _compute_masked_mse(
+        pred: np.ndarray,
+        target: np.ndarray,
+        valid_mask: Optional[np.ndarray] = None,
+    ) -> float:
+        if pred.shape != target.shape:
+            raise ValueError(
+                f"MSE shape mismatch: pred={pred.shape}, target={target.shape}"
+            )
+        if valid_mask is None:
+            return float(np.mean((pred - target) ** 2))
+        mask = np.asarray(valid_mask, dtype=np.float32).reshape(-1)
+        if mask.shape[0] != pred.shape[0]:
+            raise ValueError(
+                f"valid_mask batch mismatch: mask={mask.shape[0]}, batch={pred.shape[0]}"
+            )
+        keep = mask > 0.5
+        if not np.any(keep):
+            return float(np.mean((pred - target) ** 2))
+        return float(np.mean((pred[keep] - target[keep]) ** 2))
 
-        :param eval_dataset: List of evaluation samples, each containing 'image', 'instruction', and 'action'.
-        :param metric_fn: Function to compute the distance between predicted and ground truth actions.
-        :return: Average metric score across the evaluation dataset.
-        """
+    @staticmethod
+    def _clone_examples_for_temporal_view(
+        examples: List[dict],
+        *,
+        use_tk: bool,
+    ) -> List[dict]:
+        cloned = copy.deepcopy(examples)
+        for example in cloned:
+            if use_tk:
+                if "image_tk" in example:
+                    example["image"] = example["image_tk"]
+                elif "image_t" in example:
+                    example["image"] = example["image_t"]
+                if "state_tk" in example:
+                    example["state"] = example["state_tk"]
+                elif "state_t" in example:
+                    example["state"] = example["state_t"]
+            else:
+                if "image_t" in example:
+                    example["image"] = example["image_t"]
+                if "state_t" in example:
+                    example["state"] = example["state_t"]
+        return cloned
 
+    def _run_teacher_forced_feedback_ablation(self, examples: List[dict]) -> Dict[str, float]:
+        metrics: Dict[str, float] = {}
+        enabled = bool(
+            getattr(self.config.trainer, "eval_feedback_teacher_forced_ablation", False)
+        )
+        if not enabled:
+            return metrics
+
+        device_ids = []
+        if torch.cuda.is_available():
+            try:
+                device_ids = [torch.cuda.current_device()]
+            except Exception:
+                device_ids = []
+        seed_base = int(getattr(self.config, "seed", 0)) + int(self.completed_steps)
+
+        losses: Dict[str, float] = {}
+        for mode in ("none", "zero", "shuffle"):
+            with torch.random.fork_rng(devices=device_ids):
+                torch.manual_seed(seed_base)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(seed_base)
+                with torch.no_grad():
+                    output = self.model.forward(
+                        examples=copy.deepcopy(examples),
+                        feedback_ablation_mode=mode,
+                        feedback_ablation_seed=seed_base,
+                        feedback_disable_aux_loss=True,
+                    )
+                loss = output.get("action_loss", None)
+                if isinstance(loss, torch.Tensor):
+                    losses[mode] = float(loss.detach().float().cpu().item())
+
+        if "none" in losses:
+            metrics["debug/patha_sanity/tf_action_loss_none"] = float(losses["none"])
+        if "zero" in losses:
+            metrics["debug/patha_sanity/tf_action_loss_zero"] = float(losses["zero"])
+        if "shuffle" in losses:
+            metrics["debug/patha_sanity/tf_action_loss_shuffle"] = float(losses["shuffle"])
+        if "none" in losses and "zero" in losses:
+            base = max(abs(losses["none"]), 1e-12)
+            delta = losses["zero"] - losses["none"]
+            metrics["debug/patha_sanity/tf_action_loss_delta_zero"] = float(delta)
+            metrics["debug/patha_sanity/tf_action_loss_rel_delta_zero"] = float(delta / base)
+        if "none" in losses and "shuffle" in losses:
+            base = max(abs(losses["none"]), 1e-12)
+            delta = losses["shuffle"] - losses["none"]
+            metrics["debug/patha_sanity/tf_action_loss_delta_shuffle"] = float(delta)
+            metrics["debug/patha_sanity/tf_action_loss_rel_delta_shuffle"] = float(delta / base)
+        return metrics
+
+    def _run_inference_feedback_sanity(
+        self,
+        examples: List[dict],
+        *,
+        actions_tk: np.ndarray,
+        valid_tk: Optional[np.ndarray],
+        num_ddim_steps: int,
+    ) -> Dict[str, float]:
+        metrics: Dict[str, float] = {}
+
+        examples_t = self._clone_examples_for_temporal_view(examples, use_tk=False)
+        examples_tk = self._clone_examples_for_temporal_view(examples, use_tk=True)
+
+        # Step-1 fix: evaluate Path-A in temporal order t -> t+k.
+        _ = self.model.predict_action(
+            examples=examples_t,
+            use_ddim=True,
+            num_ddim_steps=num_ddim_steps,
+            reset_inference_state=True,
+        )
+        output_auto = self.model.predict_action(
+            examples=examples_tk,
+            use_ddim=True,
+            num_ddim_steps=num_ddim_steps,
+            reset_inference_state=False,
+            return_feedback_tokens=True,
+            return_debug_info=False,
+        )
+        pred_auto = np.asarray(output_auto["normalized_actions"], dtype=np.float32)
+        metrics["mse_score_patha"] = self._compute_masked_mse(pred_auto, actions_tk, valid_mask=valid_tk)
+
+        if isinstance(valid_tk, np.ndarray):
+            valid_ratio = float(np.asarray(valid_tk, dtype=np.float32).mean())
+            metrics["debug/patha_sanity/valid_tk_ratio"] = valid_ratio
+
+        run_infer_ablation = bool(
+            getattr(self.config.trainer, "eval_feedback_inference_ablation", False)
+        )
+        feedback_tokens = output_auto.get("feedback_tokens", None)
+        has_feedback = isinstance(feedback_tokens, np.ndarray) and feedback_tokens.ndim == 3
+        metrics["debug/patha_sanity/feedback_token_available"] = 1.0 if has_feedback else 0.0
+        if not run_infer_ablation or not has_feedback:
+            return metrics
+
+        feedback_tokens = np.asarray(feedback_tokens, dtype=np.float32)
+        output_ext_none = self.model.predict_action(
+            examples=examples_tk,
+            use_ddim=True,
+            num_ddim_steps=num_ddim_steps,
+            reset_inference_state=True,
+            feedback_tokens=feedback_tokens,
+        )
+        pred_ext_none = np.asarray(output_ext_none["normalized_actions"], dtype=np.float32)
+        mse_ext_none = self._compute_masked_mse(pred_ext_none, actions_tk, valid_mask=valid_tk)
+        metrics["debug/patha_sanity/mse_ext_feedback_none"] = float(mse_ext_none)
+
+        zero_feedback = np.zeros_like(feedback_tokens, dtype=np.float32)
+        output_ext_zero = self.model.predict_action(
+            examples=examples_tk,
+            use_ddim=True,
+            num_ddim_steps=num_ddim_steps,
+            reset_inference_state=True,
+            feedback_tokens=zero_feedback,
+        )
+        pred_ext_zero = np.asarray(output_ext_zero["normalized_actions"], dtype=np.float32)
+        mse_ext_zero = self._compute_masked_mse(pred_ext_zero, actions_tk, valid_mask=valid_tk)
+        metrics["debug/patha_sanity/mse_ext_feedback_zero"] = float(mse_ext_zero)
+
+        if feedback_tokens.shape[0] > 1:
+            seed_base = int(getattr(self.config, "seed", 0)) + int(self.completed_steps)
+            perm = np.random.default_rng(seed_base).permutation(feedback_tokens.shape[0])
+            shuffle_feedback = feedback_tokens[perm]
+        else:
+            shuffle_feedback = feedback_tokens
+        output_ext_shuffle = self.model.predict_action(
+            examples=examples_tk,
+            use_ddim=True,
+            num_ddim_steps=num_ddim_steps,
+            reset_inference_state=True,
+            feedback_tokens=shuffle_feedback,
+        )
+        pred_ext_shuffle = np.asarray(output_ext_shuffle["normalized_actions"], dtype=np.float32)
+        mse_ext_shuffle = self._compute_masked_mse(pred_ext_shuffle, actions_tk, valid_mask=valid_tk)
+        metrics["debug/patha_sanity/mse_ext_feedback_shuffle"] = float(mse_ext_shuffle)
+
+        base = max(abs(mse_ext_none), 1e-12)
+        metrics["debug/patha_sanity/mse_delta_zero_vs_ext_none"] = float(mse_ext_zero - mse_ext_none)
+        metrics["debug/patha_sanity/mse_rel_delta_zero_vs_ext_none"] = float(
+            (mse_ext_zero - mse_ext_none) / base
+        )
+        metrics["debug/patha_sanity/mse_delta_shuffle_vs_ext_none"] = float(
+            mse_ext_shuffle - mse_ext_none
+        )
+        metrics["debug/patha_sanity/mse_rel_delta_shuffle_vs_ext_none"] = float(
+            (mse_ext_shuffle - mse_ext_none) / base
+        )
+        metrics["debug/patha_sanity/mse_delta_auto_vs_ext_none"] = float(
+            metrics["mse_score_patha"] - mse_ext_none
+        )
+        return metrics
+
+    def eval_action_model(self, step_metrics: Optional[dict] = None) -> dict:
         if step_metrics is None:
             step_metrics = {}
 
@@ -835,28 +1025,46 @@ class VLATrainer(TrainerUtils):
 
         examples = copy.deepcopy(self.eval_examples_cache)
         actions = np.asarray([example["action"] for example in examples], dtype=np.float32)
+        actions_tk = np.asarray([example.get("action_tk", example["action"]) for example in examples], dtype=np.float32)
+        valid_tk = np.asarray([float(example.get("valid_tk", 1.0)) for example in examples], dtype=np.float32)
+        num_ddim_steps = int(getattr(self.config.trainer, "eval_num_ddim_steps", 20))
 
         was_training = bool(getattr(self.model, "training", False))
         self.model.eval()
         try:
-            # Predict actions with reset inference state to avoid temporal leakage
+            # Legacy baseline (reset state every eval call).
             output_dict = self.model.predict_action(
                 examples=examples,
                 use_ddim=True,
-                num_ddim_steps=20,
+                num_ddim_steps=num_ddim_steps,
                 reset_inference_state=True,
             )
 
             if self.accelerator.is_main_process:
                 normalized_actions = np.asarray(output_dict["normalized_actions"], dtype=np.float32)  # B, T, D
-                if normalized_actions.shape != actions.shape:
-                    raise ValueError(
-                        "Shape mismatch in eval_action_model: "
-                        f"pred={normalized_actions.shape}, gt={actions.shape}"
-                    )
-                # True MSE over all elements
-                mse_score = float(np.mean((normalized_actions - actions) ** 2))
+                mse_score = self._compute_masked_mse(normalized_actions, actions)
                 step_metrics["mse_score"] = mse_score
+
+            try:
+                infer_metrics = self._run_inference_feedback_sanity(
+                    examples=examples,
+                    actions_tk=actions_tk,
+                    valid_tk=valid_tk,
+                    num_ddim_steps=num_ddim_steps,
+                )
+                if self.accelerator.is_main_process:
+                    step_metrics.update(infer_metrics)
+            except Exception as e:
+                if self.accelerator.is_main_process:
+                    logger.warning(f"Feedback inference sanity check failed: {e}")
+
+            try:
+                tf_metrics = self._run_teacher_forced_feedback_ablation(examples=examples)
+                if self.accelerator.is_main_process:
+                    step_metrics.update(tf_metrics)
+            except Exception as e:
+                if self.accelerator.is_main_process:
+                    logger.warning(f"Teacher-forced feedback ablation failed: {e}")
         finally:
             if was_training:
                 self.model.train()
@@ -1222,6 +1430,58 @@ class VLATrainer(TrainerUtils):
             except Exception:
                 pass
 
+    def _collect_feedback_grad_attribution(self, metrics: dict):
+        """Collect gradient attribution on feedback tokens vs task tokens."""
+        try:
+            base_model = self.accelerator.unwrap_model(self.model)
+            fb_tokens = getattr(base_model, "_debug_last_feedback_tokens_for_grad", None)
+            task_tokens = getattr(base_model, "_debug_last_task_tokens_for_grad", None)
+
+            fb_grad = (
+                fb_tokens.grad.detach().float()
+                if isinstance(fb_tokens, torch.Tensor) and fb_tokens.grad is not None
+                else None
+            )
+            task_grad = (
+                task_tokens.grad.detach().float()
+                if isinstance(task_tokens, torch.Tensor) and task_tokens.grad is not None
+                else None
+            )
+
+            fb_available = bool(isinstance(fb_grad, torch.Tensor) and fb_grad.numel() > 0)
+            task_available = bool(isinstance(task_grad, torch.Tensor) and task_grad.numel() > 0)
+            metrics["debug/causal_feedback_grad/fb_available"] = 1.0 if fb_available else 0.0
+            metrics["debug/causal_feedback_grad/task_available"] = 1.0 if task_available else 0.0
+
+            fb_l2 = float(torch.sum(fb_grad * fb_grad).sqrt().item()) if fb_available else 0.0
+            task_l2 = float(torch.sum(task_grad * task_grad).sqrt().item()) if task_available else 0.0
+            fb_rms = float(torch.mean(fb_grad * fb_grad).sqrt().item()) if fb_available else 0.0
+            task_rms = float(torch.mean(task_grad * task_grad).sqrt().item()) if task_available else 0.0
+
+            metrics["debug/causal_feedback_grad/fb_grad_l2"] = fb_l2
+            metrics["debug/causal_feedback_grad/task_grad_l2"] = task_l2
+            metrics["debug/causal_feedback_grad/fb_grad_rms"] = fb_rms
+            metrics["debug/causal_feedback_grad/task_grad_rms"] = task_rms
+            metrics["debug/causal_feedback_grad/fb_grad_share_l2"] = float(
+                fb_l2 / max(fb_l2 + task_l2, 1e-12)
+            )
+            metrics["debug/causal_feedback_grad/fb_grad_share_rms"] = float(
+                fb_rms / max(fb_rms + task_rms, 1e-12)
+            )
+        except Exception as e:
+            metrics["debug/causal_feedback_grad/collect_error"] = 1.0
+            if self.accelerator.is_main_process:
+                logger.warning(f"Failed to collect feedback grad attribution: {e}")
+        finally:
+            try:
+                base_model = self.accelerator.unwrap_model(self.model)
+                if hasattr(base_model, "_debug_last_feedback_tokens_for_grad"):
+                    base_model._debug_last_feedback_tokens_for_grad = None
+                if hasattr(base_model, "_debug_last_task_tokens_for_grad"):
+                    base_model._debug_last_task_tokens_for_grad = None
+            except Exception:
+                pass
+
     def _train_step(self, batch_vla, batch_vlm=None):
         """execute single training step"""
         with self.accelerator.accumulate(self.model):
@@ -1275,6 +1535,7 @@ class VLATrainer(TrainerUtils):
 
             # VLA backward propagation
             self.accelerator.backward(total_loss)
+            self._collect_feedback_grad_attribution(step_metrics)
 
             geom_vision_only_steps = getattr(self.config.trainer, "geom_vision_only_steps", 0)
             lang_freeze_steps = getattr(self.config.trainer, "lang_freeze_steps", 0)

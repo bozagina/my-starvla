@@ -164,6 +164,8 @@ class MapAnythingLlava3D_PI(baseframework):
         self._rrr_prev_expected_change = None
         self._patha_prev_task_tokens = None
         self._patha_prev_action_chunk = None
+        self._debug_last_feedback_tokens_for_grad = None
+        self._debug_last_task_tokens_for_grad = None
         self.reset_inference_state()
         self._configure_memory_optimizations()
 
@@ -255,6 +257,68 @@ class MapAnythingLlava3D_PI(baseframework):
         if isinstance(value, str):
             return value.strip().lower() in ("1", "true", "yes", "y", "on")
         return bool(value)
+
+    @staticmethod
+    def _resolve_feedback_ablation_mode(value) -> str:
+        mode = "none" if value is None else str(value).strip().lower()
+        if mode in ("0", "false", "off"):
+            mode = "none"
+        if mode not in ("none", "zero", "shuffle"):
+            raise ValueError(
+                f"Invalid `feedback_ablation_mode`={value!r}; expected one of ['none', 'zero', 'shuffle']."
+            )
+        return mode
+
+    def _apply_feedback_ablation(
+        self,
+        feedback_tokens: Optional[torch.Tensor],
+        *,
+        mode: str = "none",
+        seed: Optional[int] = None,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
+        stats: Dict[str, float] = {
+            "debug/causal_feedback/ablation_mode_none": 1.0 if mode == "none" else 0.0,
+            "debug/causal_feedback/ablation_mode_zero": 1.0 if mode == "zero" else 0.0,
+            "debug/causal_feedback/ablation_mode_shuffle": 1.0 if mode == "shuffle" else 0.0,
+            "debug/causal_feedback/ablation_applied": 0.0,
+        }
+        if not isinstance(feedback_tokens, torch.Tensor):
+            return feedback_tokens, stats
+        if mode == "none":
+            return feedback_tokens, stats
+
+        ablated = feedback_tokens
+        if mode == "zero":
+            ablated = torch.zeros_like(feedback_tokens)
+        elif mode == "shuffle":
+            batch = int(feedback_tokens.shape[0])
+            if batch > 1:
+                try:
+                    if seed is not None:
+                        generator = torch.Generator(device=feedback_tokens.device)
+                        generator.manual_seed(int(seed))
+                        perm = torch.randperm(batch, device=feedback_tokens.device, generator=generator)
+                    else:
+                        perm = torch.randperm(batch, device=feedback_tokens.device)
+                except Exception:
+                    perm = torch.randperm(batch, device=feedback_tokens.device)
+                ablated = feedback_tokens.index_select(0, perm)
+                with torch.no_grad():
+                    stats["debug/causal_feedback/ablation_shuffle_changed"] = float(
+                        bool((perm != torch.arange(batch, device=perm.device)).any().item())
+                    )
+            else:
+                stats["debug/causal_feedback/ablation_shuffle_changed"] = 0.0
+
+        stats["debug/causal_feedback/ablation_applied"] = 1.0
+        with torch.no_grad():
+            stats["debug/causal_feedback/token_norm_mean_after_ablation"] = float(
+                ablated.detach().norm(dim=-1).mean().item()
+            )
+            stats["debug/causal_feedback/token_absmax_after_ablation"] = float(
+                ablated.detach().abs().max().item()
+            )
+        return ablated, stats
 
     @staticmethod
     def _safe_metric_key(text: str) -> str:
@@ -702,6 +766,21 @@ class MapAnythingLlava3D_PI(baseframework):
         examples: List[dict] = None,
         **kwargs,
     ) -> Tuple:
+        self._debug_last_feedback_tokens_for_grad = None
+        self._debug_last_task_tokens_for_grad = None
+        feedback_ablation_mode = self._resolve_feedback_ablation_mode(
+            kwargs.get("feedback_ablation_mode", "none")
+        )
+        feedback_disable_aux_loss = self._parse_bool_flag(
+            kwargs.get("feedback_disable_aux_loss", False), default=False
+        )
+        feedback_ablation_seed = kwargs.get("feedback_ablation_seed", None)
+        if feedback_ablation_seed is not None:
+            try:
+                feedback_ablation_seed = int(feedback_ablation_seed)
+            except Exception:
+                feedback_ablation_seed = None
+
         # Prefer explicit temporal keys when available; fall back to legacy keys.
         batch_images_t = [example.get("image_t", example["image"]) for example in examples]
         batch_images_tk = [
@@ -1044,6 +1123,18 @@ class MapAnythingLlava3D_PI(baseframework):
             feedback_stats = {}
             feedback_aux_loss = None
             feedback_aux_stats = {}
+            debug_metrics["debug/causal_feedback/ablation_mode_none"] = (
+                1.0 if feedback_ablation_mode == "none" else 0.0
+            )
+            debug_metrics["debug/causal_feedback/ablation_mode_zero"] = (
+                1.0 if feedback_ablation_mode == "zero" else 0.0
+            )
+            debug_metrics["debug/causal_feedback/ablation_mode_shuffle"] = (
+                1.0 if feedback_ablation_mode == "shuffle" else 0.0
+            )
+            debug_metrics["debug/causal_feedback/ablation_disable_aux_loss"] = (
+                1.0 if feedback_disable_aux_loss else 0.0
+            )
             if self._causal_feedback_ready:
                 feedback_tokens_repeated, feedback_stats = self._build_causal_feedback_tokens(
                     task_tokens=task_tokens_repeated,
@@ -1052,6 +1143,12 @@ class MapAnythingLlava3D_PI(baseframework):
                     valid_tk_mask=valid_tk_repeated,
                 )
                 debug_metrics.update(feedback_stats)
+                feedback_tokens_repeated, feedback_ablation_stats = self._apply_feedback_ablation(
+                    feedback_tokens_repeated,
+                    mode=feedback_ablation_mode,
+                    seed=feedback_ablation_seed,
+                )
+                debug_metrics.update(feedback_ablation_stats)
                 feedback_aux_loss, feedback_aux_stats = self._compute_causal_feedback_aux_loss(
                     feedback_tokens=feedback_tokens_repeated,
                     task_tokens=task_tokens_repeated,
@@ -1068,6 +1165,16 @@ class MapAnythingLlava3D_PI(baseframework):
                 )
                 state_repeated = state.repeat(repeated_diffusion_steps, 1, 1)
 
+            try:
+                if isinstance(task_tokens_repeated, torch.Tensor) and task_tokens_repeated.requires_grad:
+                    task_tokens_repeated.retain_grad()
+                    self._debug_last_task_tokens_for_grad = task_tokens_repeated
+                if isinstance(feedback_tokens_repeated, torch.Tensor) and feedback_tokens_repeated.requires_grad:
+                    feedback_tokens_repeated.retain_grad()
+                    self._debug_last_feedback_tokens_for_grad = feedback_tokens_repeated
+            except Exception:
+                debug_metrics["debug/causal_feedback_grad/probe_retain_failed"] = 1.0
+
             action_loss = self.action_model(
                 vl_embs_list_repeated,
                 actions_target_repeated,
@@ -1078,13 +1185,17 @@ class MapAnythingLlava3D_PI(baseframework):
                 valid_tk=valid_tk_repeated,
                 feedback_tokens=feedback_tokens_repeated,
             )
-            if isinstance(feedback_aux_loss, torch.Tensor) and self.causal_feedback_aux_weight > 0.0:
-                debug_metrics["debug/causal_feedback/loss_fb_weighted"] = float(
-                    (float(self.causal_feedback_aux_weight) * feedback_aux_loss.detach()).item()
-                )
+            if isinstance(feedback_aux_loss, torch.Tensor):
                 debug_metrics["debug/causal_feedback/action_loss_base"] = float(action_loss.detach().item())
-                action_loss = action_loss + float(self.causal_feedback_aux_weight) * feedback_aux_loss
-                debug_metrics["debug/causal_feedback/action_loss_total"] = float(action_loss.detach().item())
+                if self.causal_feedback_aux_weight > 0.0 and not feedback_disable_aux_loss:
+                    debug_metrics["debug/causal_feedback/loss_fb_weighted"] = float(
+                        (float(self.causal_feedback_aux_weight) * feedback_aux_loss.detach()).item()
+                    )
+                    action_loss = action_loss + float(self.causal_feedback_aux_weight) * feedback_aux_loss
+                    debug_metrics["debug/causal_feedback/action_loss_total"] = float(action_loss.detach().item())
+                else:
+                    debug_metrics["debug/causal_feedback/loss_fb_weighted"] = 0.0
+                    debug_metrics["debug/causal_feedback/action_loss_total"] = float(action_loss.detach().item())
             try:
                 layer_means = getattr(self.action_model, "_last_dit_layer_means", None)
                 layer_vars = getattr(self.action_model, "_last_dit_layer_vars", None)
@@ -1180,6 +1291,9 @@ class MapAnythingLlava3D_PI(baseframework):
         state = [example["state"] for example in examples] if "state" in examples[0] else None
         deterministic_seed = kwargs.get("deterministic_seed", None)
         return_debug_info = self._parse_bool_flag(kwargs.get("return_debug_info", False), default=False)
+        return_feedback_tokens = self._parse_bool_flag(
+            kwargs.get("return_feedback_tokens", False), default=False
+        )
         request_reset_state = self._parse_bool_flag(kwargs.get("reset_inference_state", False), default=False)
         if request_reset_state:
             self.reset_inference_state()
@@ -1882,6 +1996,13 @@ class MapAnythingLlava3D_PI(baseframework):
         reflex_step_over_cycle = float(reflex_step_ms_mean / max(control_cycle_ms, 1e-6))
 
         output = {"normalized_actions": normalized_actions}
+        if return_feedback_tokens:
+            if isinstance(feedback_tokens, torch.Tensor):
+                output["feedback_tokens"] = (
+                    feedback_tokens.detach().to(dtype=torch.float32).cpu().numpy()
+                )
+            else:
+                output["feedback_tokens"] = None
         if return_debug_info:
             if debug_info is None:
                 debug_info = {}
