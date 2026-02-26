@@ -64,6 +64,30 @@ def _main_print(msg: str) -> None:
         print(msg, flush=True)
 
 
+def _normalize_cli_overrides(args: List[str]) -> List[str]:
+    """
+    Support both styles:
+    1) --trainer.xxx=true
+    2) trainer.xxx=true
+    """
+    normalized = list(normalize_dotlist_args(args))
+    existing = set(normalized)
+    for arg in args:
+        if arg.startswith("-"):
+            continue
+        if "=" not in arg:
+            continue
+        key, value = arg.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        candidate = f"{key}={value}"
+        if candidate not in existing:
+            normalized.append(candidate)
+            existing.add(candidate)
+    return normalized
+
+
 def _ensure_output_dir(cfg) -> str:
     run_root = str(getattr(cfg, "run_root_dir", "./results/Checkpoints"))
     run_id = str(getattr(cfg, "run_id", f"patha_ablation_{datetime.now().strftime('%Y%m%d_%H%M%S')}"))
@@ -367,6 +391,17 @@ def run(args, cfg) -> Dict[str, object]:
     run_teacher_forced = not bool(args.skip_teacher_forced)
     run_infer_ablation = not bool(args.skip_inference_ablation)
     run_grad_probe = not bool(args.skip_grad_probe)
+    cfg_infer_ablation = bool(getattr(cfg.trainer, "eval_feedback_inference_ablation", False))
+    cfg_tf_ablation = bool(getattr(cfg.trainer, "eval_feedback_teacher_forced_ablation", False))
+    if rank == 0:
+        _main_print(
+            "[PathA-Ablation] switches: "
+            f"cfg.eval_feedback_inference_ablation={cfg_infer_ablation}, "
+            f"cfg.eval_feedback_teacher_forced_ablation={cfg_tf_ablation}, "
+            f"skip_inference_ablation={args.skip_inference_ablation}, "
+            f"skip_teacher_forced={args.skip_teacher_forced}, "
+            f"skip_grad_probe={args.skip_grad_probe}"
+        )
 
     num_ddim_steps = int(getattr(cfg.trainer, "eval_num_ddim_steps", 20))
     local_sums: Dict[str, float] = defaultdict(float)
@@ -492,7 +527,7 @@ def main():
     args, clipargs = parser.parse_known_args()
 
     cfg = OmegaConf.load(args.config_yaml)
-    dotlist = normalize_dotlist_args(clipargs)
+    dotlist = _normalize_cli_overrides(clipargs)
     cli_cfg = OmegaConf.from_dotlist(dotlist)
     cfg = OmegaConf.merge(cfg, cli_cfg)
 
