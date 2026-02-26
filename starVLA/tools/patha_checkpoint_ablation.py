@@ -25,6 +25,7 @@ import contextlib
 import copy
 import json
 import os
+import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -134,42 +135,94 @@ def _numeric_items(metrics: Dict[str, object]) -> Iterable[Tuple[str, float]]:
                 yield key, val
 
 
-def _collect_key_union(local_keys: List[str]) -> List[str]:
-    key_set = set(local_keys)
-    if dist.is_initialized():
-        gathered: List[List[str]] = [None for _ in range(_world_size())]  # type: ignore
-        dist.all_gather_object(gathered, list(key_set))
-        for ks in gathered:
-            if ks is None:
-                continue
-            key_set.update(ks)
-    return sorted(key_set)
-
-
-def _reduce_scalar(value: float, device: torch.device) -> float:
-    tensor = torch.tensor(float(value), device=device, dtype=torch.float64)
-    if dist.is_initialized():
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    return float(tensor.item())
-
-
-def _aggregate_metrics(
-    local_sums: Dict[str, float],
-    local_counts: Dict[str, int],
-    device: torch.device,
+def _aggregate_metrics_from_sums_counts(
+    sums: Dict[str, float],
+    counts: Dict[str, int],
 ) -> Dict[str, Dict[str, float]]:
-    all_keys = _collect_key_union(list(local_sums.keys()) + list(local_counts.keys()))
+    all_keys = sorted(set(list(sums.keys()) + list(counts.keys())))
     aggregated: Dict[str, Dict[str, float]] = {}
     for key in all_keys:
-        global_sum = _reduce_scalar(local_sums.get(key, 0.0), device=device)
-        global_count = _reduce_scalar(float(local_counts.get(key, 0)), device=device)
-        if global_count <= 0:
+        total_sum = float(sums.get(key, 0.0))
+        total_count = float(counts.get(key, 0))
+        if total_count <= 0:
             continue
         aggregated[key] = {
-            "mean": float(global_sum / max(global_count, 1.0)),
-            "count": float(global_count),
+            "mean": float(total_sum / max(total_count, 1.0)),
+            "count": float(total_count),
         }
     return aggregated
+
+
+def _rank_fragment_path(output_dir: str, rank: int) -> str:
+    return os.path.join(output_dir, f"patha_ablation_rank{rank}.json")
+
+
+def _write_rank_fragment(output_dir: str, fragment: Dict[str, object]) -> str:
+    rank = int(fragment["rank"])
+    out_path = _rank_fragment_path(output_dir, rank)
+    with open(out_path, "w") as f:
+        json.dump(fragment, f, indent=2, ensure_ascii=False)
+    return out_path
+
+
+def _load_fragments_with_polling(
+    output_dir: str,
+    world_size: int,
+    wait_seconds: int,
+    poll_interval: float = 1.0,
+) -> Tuple[List[Dict[str, object]], List[int]]:
+    deadline = time.time() + max(1, int(wait_seconds))
+    expected = list(range(world_size))
+    found: Dict[int, Dict[str, object]] = {}
+
+    while time.time() <= deadline and len(found) < len(expected):
+        for rk in expected:
+            if rk in found:
+                continue
+            fpath = _rank_fragment_path(output_dir, rk)
+            if not os.path.exists(fpath):
+                continue
+            try:
+                with open(fpath, "r") as f:
+                    found[rk] = json.load(f)
+            except Exception:
+                continue
+        if len(found) < len(expected):
+            time.sleep(poll_interval)
+
+    missing = [rk for rk in expected if rk not in found]
+    fragments = [found[rk] for rk in sorted(found.keys())]
+    return fragments, missing
+
+
+def _merge_fragments(
+    fragments: List[Dict[str, object]],
+) -> Tuple[Dict[str, float], Dict[str, int], float]:
+    merged_sums: Dict[str, float] = defaultdict(float)
+    merged_counts: Dict[str, int] = defaultdict(int)
+    processed_batches_sum = 0.0
+
+    for frag in fragments:
+        frag_sums = frag.get("local_sums", {})
+        frag_counts = frag.get("local_counts", {})
+        if isinstance(frag_sums, dict):
+            for key, value in frag_sums.items():
+                try:
+                    merged_sums[str(key)] += float(value)
+                except Exception:
+                    continue
+        if isinstance(frag_counts, dict):
+            for key, value in frag_counts.items():
+                try:
+                    merged_counts[str(key)] += int(value)
+                except Exception:
+                    continue
+        try:
+            processed_batches_sum += float(frag.get("processed_batches", 0.0))
+        except Exception:
+            pass
+
+    return dict(merged_sums), dict(merged_counts), float(processed_batches_sum)
 
 
 def _pick_mean(metrics: Dict[str, Dict[str, float]], key: str) -> Optional[float]:
@@ -365,22 +418,52 @@ def run(args, cfg) -> Dict[str, object]:
             )
 
     local_processed_batches = float(processed_batches)
-    aggregated = _aggregate_metrics(local_sums, local_counts, device=trainer.accelerator.device)
+    local_fragment = {
+        "rank": int(rank),
+        "world_size": int(_world_size()),
+        "timestamp": datetime.now().isoformat(),
+        "config_yaml": args.config_yaml,
+        "checkpoint": checkpoint_path,
+        "num_batches_requested": int(args.num_batches),
+        "num_ddim_steps_arg": int(num_ddim_steps),
+        "processed_batches": float(local_processed_batches),
+        "load_info": load_info,
+        "local_sums": dict(local_sums),
+        "local_counts": dict(local_counts),
+        "raw_batch_metrics_preview": raw_batch_metrics,
+    }
+    fragment_path = _write_rank_fragment(output_dir, local_fragment)
+
+    if rank != 0:
+        return {
+            "rank": int(rank),
+            "fragment_path": fragment_path,
+            "status": "fragment_written",
+        }
+
+    fragments, missing_ranks = _load_fragments_with_polling(
+        output_dir=output_dir,
+        world_size=int(_world_size()),
+        wait_seconds=int(args.merge_wait_seconds),
+    )
+    merged_sums, merged_counts, global_processed_batches = _merge_fragments(fragments)
+    aggregated = _aggregate_metrics_from_sums_counts(merged_sums, merged_counts)
     conclusion = _build_conclusion(aggregated)
 
-    global_processed_batches = _reduce_scalar(local_processed_batches, trainer.accelerator.device)
     report = {
         "timestamp": datetime.now().isoformat(),
         "config_yaml": args.config_yaml,
         "checkpoint": checkpoint_path,
-        "world_size": _world_size(),
+        "world_size": int(_world_size()),
+        "fragments_received": len(fragments),
+        "fragments_missing_ranks": missing_ranks,
         "num_batches_requested": int(args.num_batches),
         "num_batches_processed_sum_over_ranks": float(global_processed_batches),
         "num_ddim_steps_arg": int(num_ddim_steps),
-        "load_info": load_info,
+        "load_info_rank0": load_info,
         "aggregated_metrics": aggregated,
         "conclusion": conclusion,
-        "raw_batch_metrics_preview": raw_batch_metrics,
+        "raw_batch_metrics_preview_rank0": raw_batch_metrics,
     }
     return report
 
@@ -397,6 +480,12 @@ def main():
         help="Output report path. Default: <cfg.output_dir>/patha_ablation_report.json",
     )
     parser.add_argument("--keep_raw_batches", type=int, default=4, help="Keep first N raw batch metrics in report")
+    parser.add_argument(
+        "--merge_wait_seconds",
+        type=int,
+        default=180,
+        help="Rank0 polling timeout for gathering per-rank fragment files.",
+    )
     parser.add_argument("--skip_teacher_forced", action="store_true", help="Skip teacher-forced ablation")
     parser.add_argument("--skip_inference_ablation", action="store_true", help="Skip inference ablation")
     parser.add_argument("--skip_grad_probe", action="store_true", help="Skip gradient attribution probe")
@@ -437,10 +526,6 @@ def main():
         notes = conclusion.get("notes", [])
         for idx, note in enumerate(notes, start=1):
             _main_print(f"[PathA-Ablation] note{idx}: {note}")
-
-    if dist.is_initialized():
-        dist.barrier()
-
 
 if __name__ == "__main__":
     main()
