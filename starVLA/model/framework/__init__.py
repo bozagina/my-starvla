@@ -19,6 +19,7 @@ from starVLA.training.trainer_utils import initialize_overwatch
 
 logger = initialize_overwatch(__name__)
 _AUTO_IMPORT_ERRORS = {}
+_PKG_NAME = (__package__ or __name__).replace(".__init__", "")
 
 try:
     pkg_path = __path__
@@ -29,7 +30,7 @@ except NameError:
 if pkg_path is not None:
     for _, module_name, _ in pkgutil.iter_modules(pkg_path):
         try:
-            importlib.import_module(f"{__name__}.{module_name}")
+            importlib.import_module(f"{_PKG_NAME}.{module_name}")
         except Exception as e:
             _AUTO_IMPORT_ERRORS[module_name] = str(e)
             logger.warning(f"Failed to auto-import framework submodule {module_name}: {e}")
@@ -59,7 +60,7 @@ def build_framework(cfg):
     if framework_id not in FRAMEWORK_REGISTRY._registry:
         # Try lazy import by module name == framework id (e.g. MapAnythingLlava3DPI).
         try:
-            importlib.import_module(f"{__name__}.{framework_id}")
+            importlib.import_module(f"{_PKG_NAME}.{framework_id}")
         except Exception as e:
             lazy_err = str(e)
         else:

@@ -22,6 +22,34 @@ echo "[run_policy_server] DISABLE_PATHA_INFER=${disable_patha_infer}"
 echo "[run_policy_server] ENABLE_PATHA_INFER=${enable_patha_infer}"
 echo "[run_policy_server] PATHA_FEEDBACK_SCALE=${patha_feedback_scale}"
 
+${star_vla_python} - <<'PY'
+import importlib
+import sys
+
+required = ["torch", "omegaconf", "accelerate"]
+missing = []
+for name in required:
+    try:
+        importlib.import_module(name)
+    except Exception as e:
+        missing.append((name, str(e)))
+
+if missing:
+    print("[run_policy_server][ERROR] Missing required Python packages in current env:")
+    for name, err in missing:
+        print(f"  - {name}: {err}")
+    print("[run_policy_server][ERROR] Please switch to the training/eval env or install these deps, then retry.")
+    sys.exit(2)
+
+try:
+    importlib.import_module("starVLA.model.framework.MapAnythingLlava3DPI")
+except Exception as e:
+    print("[run_policy_server][ERROR] Failed to import target framework module:")
+    print(f"  - starVLA.model.framework.MapAnythingLlava3DPI: {e}")
+    print("[run_policy_server][ERROR] Current env is not compatible with this checkpoint.")
+    sys.exit(3)
+PY
+
 extra_args=()
 if [ "${disable_patha_infer}" = "1" ]; then
   extra_args+=(--disable_path_a_inference)

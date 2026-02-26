@@ -26,7 +26,7 @@ from starVLA.model.tools import auto_get_trainable_modules
 from starVLA.model.framework.share_tools import read_mode_config
 from starVLA.training.trainer_utils import initialize_overwatch
 from starVLA.model.framework.share_tools import dict_to_namespace
-from starVLA.model.framework.__init__ import build_framework
+from starVLA.model.framework import build_framework
 
 logger = initialize_overwatch(__name__)
 
