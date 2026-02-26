@@ -74,17 +74,17 @@ extra_args+=(--args.action-chunk-size-override "$action_chunk_size_override")
 if [ "$(bool_to_01 "$enable_rt_metrics")" = "1" ]; then
     extra_args+=(--args.enable-rt-metrics)
 else
-    extra_args+=(--no-args.enable-rt-metrics)
+    extra_args+=(--args.no-enable-rt-metrics)
 fi
 if [ "$(bool_to_01 "$request_policy_debug_info")" = "1" ]; then
     extra_args+=(--args.request-policy-debug-info)
 else
-    extra_args+=(--no-args.request-policy-debug-info)
+    extra_args+=(--args.no-request-policy-debug-info)
 fi
 if [ "$(bool_to_01 "$rotate_180")" = "1" ]; then
     extra_args+=(--args.rotate-180)
 else
-    extra_args+=(--no-args.rotate-180)
+    extra_args+=(--args.no-rotate-180)
 fi
 
 echo "Using host=$host"
