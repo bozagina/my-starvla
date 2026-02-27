@@ -264,6 +264,62 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         default=0,
         metadata={"help": "Do not run feedback probe before this train-forward step."},
     )
+    feedback_in_context_enabled: bool = field(
+        default=True,
+        metadata={"help": "If false, do not inject feedback tokens into cross-attention context (keep task_tokens only)."},
+    )
+    feedback_delta_action_enabled: bool = field(
+        default=False,
+        metadata={"help": "Enable residual delta-action head from feedback tokens."},
+    )
+    feedback_delta_action_enable_inference: bool = field(
+        default=True,
+        metadata={"help": "Apply residual delta-action head during inference."},
+    )
+    feedback_delta_action_norm_type: str = field(
+        default="layernorm",
+        metadata={"help": "Normalization for pooled feedback vector: none|layernorm|rmsnorm."},
+    )
+    feedback_delta_action_norm_eps: float = field(
+        default=1e-6,
+        metadata={"help": "Epsilon for feedback delta-action normalization."},
+    )
+    feedback_delta_action_hidden_dim: int = field(
+        default=0,
+        metadata={"help": "Hidden dim for feedback delta-action MLP. <=0 means use input embedding dim."},
+    )
+    feedback_delta_action_last_layer_scale: float = field(
+        default=1e-3,
+        metadata={"help": "Scale factor for last linear layer init in delta-action head."},
+    )
+    feedback_delta_action_clip: float = field(
+        default=0.05,
+        metadata={"help": "Per-dimension tanh clip magnitude for delta-action."},
+    )
+    feedback_delta_action_use_valid_tk_gate: bool = field(
+        default=True,
+        metadata={"help": "Multiply delta-action gate by valid_tk mask when available."},
+    )
+    feedback_delta_action_alpha_mode: str = field(
+        default="schedule",
+        metadata={"help": "Delta-action alpha mode: fixed|learnable|schedule."},
+    )
+    feedback_delta_action_alpha_init: float = field(
+        default=0.0,
+        metadata={"help": "Initial alpha for delta-action gate."},
+    )
+    feedback_delta_action_alpha_target: float = field(
+        default=0.1,
+        metadata={"help": "Target alpha for delta-action schedule."},
+    )
+    feedback_delta_action_alpha_warmup_steps: int = field(
+        default=2000,
+        metadata={"help": "Warmup steps holding alpha_init before ramp for delta-action schedule."},
+    )
+    feedback_delta_action_alpha_ramp_steps: int = field(
+        default=2000,
+        metadata={"help": "Ramp steps from alpha_init to alpha_target for delta-action schedule."},
+    )
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -421,6 +477,114 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             max(0, int(_cfg_get(action_config, "feedback_probe_start_step", 0)))
         )
         self._feedback_probe_step = 0
+        self.feedback_in_context_enabled = bool(
+            _cfg_get(action_config, "feedback_in_context_enabled", True)
+        )
+
+        self.feedback_delta_action_enabled = bool(
+            _cfg_get(action_config, "feedback_delta_action_enabled", False)
+        )
+        self.feedback_delta_action_enable_inference = bool(
+            _cfg_get(action_config, "feedback_delta_action_enable_inference", True)
+        )
+        self.feedback_delta_action_norm_type = str(
+            _cfg_get(action_config, "feedback_delta_action_norm_type", "layernorm")
+        ).lower()
+        if self.feedback_delta_action_norm_type not in ("none", "layernorm", "rmsnorm"):
+            logger.warning(
+                "Invalid feedback_delta_action_norm_type=%s, fallback to `layernorm`.",
+                self.feedback_delta_action_norm_type,
+            )
+            self.feedback_delta_action_norm_type = "layernorm"
+        self.feedback_delta_action_norm_eps = float(
+            _cfg_get(action_config, "feedback_delta_action_norm_eps", 1e-6)
+        )
+        hidden_dim_cfg = int(_cfg_get(action_config, "feedback_delta_action_hidden_dim", 0))
+        self.feedback_delta_action_hidden_dim = (
+            hidden_dim_cfg if hidden_dim_cfg > 0 else int(self.input_embedding_dim)
+        )
+        self.feedback_delta_action_last_layer_scale = float(
+            _cfg_get(action_config, "feedback_delta_action_last_layer_scale", 1e-3)
+        )
+        self.feedback_delta_action_clip = float(
+            _cfg_get(action_config, "feedback_delta_action_clip", 0.05)
+        )
+        self.feedback_delta_action_use_valid_tk_gate = bool(
+            _cfg_get(action_config, "feedback_delta_action_use_valid_tk_gate", True)
+        )
+        self.feedback_delta_action_alpha_mode = str(
+            _cfg_get(action_config, "feedback_delta_action_alpha_mode", "schedule")
+        ).lower()
+        if self.feedback_delta_action_alpha_mode not in ("fixed", "learnable", "schedule"):
+            logger.warning(
+                "Invalid feedback_delta_action_alpha_mode=%s, fallback to `schedule`.",
+                self.feedback_delta_action_alpha_mode,
+            )
+            self.feedback_delta_action_alpha_mode = "schedule"
+        self.feedback_delta_action_alpha_init = float(
+            _cfg_get(action_config, "feedback_delta_action_alpha_init", 0.0)
+        )
+        self.feedback_delta_action_alpha_target = float(
+            _cfg_get(action_config, "feedback_delta_action_alpha_target", 0.1)
+        )
+        self.feedback_delta_action_alpha_warmup_steps = int(
+            _cfg_get(action_config, "feedback_delta_action_alpha_warmup_steps", 2000)
+        )
+        self.feedback_delta_action_alpha_ramp_steps = int(
+            _cfg_get(action_config, "feedback_delta_action_alpha_ramp_steps", 2000)
+        )
+        if self.feedback_delta_action_alpha_warmup_steps < 0:
+            self.feedback_delta_action_alpha_warmup_steps = 0
+        if self.feedback_delta_action_alpha_ramp_steps < 1:
+            self.feedback_delta_action_alpha_ramp_steps = 1
+        if self.feedback_delta_action_alpha_mode == "learnable":
+            self.feedback_delta_action_alpha_param = nn.Parameter(
+                torch.tensor(self.feedback_delta_action_alpha_init, dtype=torch.float32)
+            )
+        else:
+            self.feedback_delta_action_alpha_param = None
+        self.register_buffer(
+            "_feedback_delta_action_schedule_step",
+            torch.zeros((), dtype=torch.long),
+            persistent=False,
+        )
+        self._last_feedback_delta_action_alpha_value = float(
+            self.feedback_delta_action_alpha_init
+        )
+
+        self.feedback_delta_action_norm = None
+        self._feedback_delta_action_manual_rmsnorm = False
+        if self.feedback_delta_action_enabled:
+            if self.feedback_delta_action_norm_type == "layernorm":
+                self.feedback_delta_action_norm = nn.LayerNorm(
+                    self.input_embedding_dim,
+                    eps=self.feedback_delta_action_norm_eps,
+                    elementwise_affine=False,
+                )
+            elif self.feedback_delta_action_norm_type == "rmsnorm":
+                if hasattr(nn, "RMSNorm"):
+                    self.feedback_delta_action_norm = nn.RMSNorm(
+                        self.input_embedding_dim,
+                        eps=self.feedback_delta_action_norm_eps,
+                        elementwise_affine=False,
+                    )
+                else:
+                    self._feedback_delta_action_manual_rmsnorm = True
+
+        self.feedback_delta_action_head = None
+        if self.feedback_delta_action_enabled:
+            self.feedback_delta_action_head = nn.Sequential(
+                nn.Linear(self.input_embedding_dim, self.feedback_delta_action_hidden_dim),
+                nn.SiLU(),
+                nn.Linear(self.feedback_delta_action_hidden_dim, self.action_dim),
+            )
+            # Keep initial residual near zero so base policy behavior is preserved.
+            with torch.no_grad():
+                last_linear = self.feedback_delta_action_head[-1]
+                if isinstance(last_linear, nn.Linear):
+                    nn.init.xavier_uniform_(last_linear.weight)
+                    last_linear.weight.mul_(self.feedback_delta_action_last_layer_scale)
+                    nn.init.zeros_(last_linear.bias)
 
         self.world_hidden_dim = int(_cfg_get(action_config, "world_hidden_dim", 512))
         self.world_num_layers = int(_cfg_get(action_config, "world_num_layers", 4))
@@ -552,7 +716,9 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             "LayerwiseFMActionHead initialized: use_concat_cross_context=%s, cross_attention_assert_inputs=%s, "
             "cross_attention_debug_log_interval=%d, world_params=%d, world_action_source=%s, "
             "world_action_context_mode=%s, residual_pooling_mode=%s, feedback_context_only=%s, "
-            "feedback_context_norm_type=%s, feedback_context_alpha_mode=%s",
+            "feedback_context_norm_type=%s, feedback_context_alpha_mode=%s, "
+            "feedback_in_context_enabled=%s, feedback_delta_action_enabled=%s, "
+            "feedback_delta_action_alpha_mode=%s",
             self.use_concat_cross_context,
             self.cross_attention_assert_inputs,
             self.cross_attention_debug_log_interval,
@@ -563,6 +729,9 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             self.feedback_context_only,
             self.feedback_context_norm_type,
             self.feedback_context_alpha_mode,
+            self.feedback_in_context_enabled,
+            self.feedback_delta_action_enabled,
+            self.feedback_delta_action_alpha_mode,
         )
 
     def sample_time(self, batch_size, device, dtype):
@@ -1031,6 +1200,149 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         if self.training and self.feedback_context_alpha_mode == "schedule":
             self._feedback_context_schedule_step.add_(1)
 
+    def _maybe_advance_feedback_delta_action_alpha_schedule(self):
+        if self.training and self.feedback_delta_action_alpha_mode == "schedule":
+            self._feedback_delta_action_schedule_step.add_(1)
+
+    def _apply_feedback_delta_action_norm(
+        self,
+        feedback_vec: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.feedback_delta_action_norm_type == "none":
+            return feedback_vec
+        if self.feedback_delta_action_norm is not None:
+            return self.feedback_delta_action_norm(feedback_vec)
+        if self._feedback_delta_action_manual_rmsnorm:
+            denom = feedback_vec.pow(2).mean(dim=-1, keepdim=True).add(
+                self.feedback_delta_action_norm_eps
+            ).rsqrt()
+            return feedback_vec * denom
+        return feedback_vec
+
+    def _compute_feedback_delta_action_alpha(
+        self,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, float]:
+        mode = self.feedback_delta_action_alpha_mode
+        if mode == "learnable" and isinstance(self.feedback_delta_action_alpha_param, torch.Tensor):
+            alpha_tensor = self.feedback_delta_action_alpha_param
+            if alpha_tensor.device != device or alpha_tensor.dtype != dtype:
+                alpha_tensor = alpha_tensor.to(device=device, dtype=dtype)
+            alpha_value = float(self.feedback_delta_action_alpha_param.detach().float().cpu().item())
+            self._last_feedback_delta_action_alpha_value = alpha_value
+            return alpha_tensor, alpha_value
+        if mode == "schedule":
+            step = int(self._feedback_delta_action_schedule_step.item())
+            warmup = int(max(self.feedback_delta_action_alpha_warmup_steps, 0))
+            ramp = int(max(self.feedback_delta_action_alpha_ramp_steps, 1))
+            alpha_init = float(self.feedback_delta_action_alpha_init)
+            alpha_target = float(self.feedback_delta_action_alpha_target)
+            if step <= warmup:
+                alpha_value = alpha_init
+            else:
+                progress = min(max((step - warmup) / float(ramp), 0.0), 1.0)
+                alpha_value = alpha_init + (alpha_target - alpha_init) * progress
+            self._last_feedback_delta_action_alpha_value = alpha_value
+            return torch.tensor(alpha_value, device=device, dtype=dtype), alpha_value
+        alpha_value = float(self.feedback_delta_action_alpha_init)
+        self._last_feedback_delta_action_alpha_value = alpha_value
+        return torch.tensor(alpha_value, device=device, dtype=dtype), alpha_value
+
+    def _apply_feedback_delta_action(
+        self,
+        *,
+        pred_velocity_base: torch.Tensor,
+        feedback_tokens: Optional[torch.Tensor],
+        valid_tk_mask: Optional[torch.Tensor],
+        enable_delta_action: bool,
+    ) -> Tuple[torch.Tensor, Dict[str, float], Optional[torch.Tensor]]:
+        """
+        Apply post-hoc residual correction:
+            a_out = a_base + g * clip(DeltaA(mean(feedback_tokens)))
+        """
+        metrics: Dict[str, float] = {
+            "delta_action_enabled": 1.0 if self.feedback_delta_action_enabled else 0.0,
+            "delta_action_applied": 0.0,
+        }
+        if (
+            (not self.feedback_delta_action_enabled)
+            or (not enable_delta_action)
+            or self.feedback_delta_action_head is None
+            or (not isinstance(feedback_tokens, torch.Tensor))
+        ):
+            metrics["delta_action_gate_mean"] = 0.0
+            metrics["delta_action_alpha"] = float(self._last_feedback_delta_action_alpha_value)
+            metrics["delta_action_norm_mean"] = 0.0
+            metrics["delta_action_norm_p95"] = 0.0
+            metrics["delta_action_effective_norm_mean"] = 0.0
+            return pred_velocity_base, metrics, None
+
+        if feedback_tokens.ndim != 3:
+            metrics["delta_action_invalid_feedback_shape"] = 1.0
+            metrics["delta_action_gate_mean"] = 0.0
+            metrics["delta_action_alpha"] = float(self._last_feedback_delta_action_alpha_value)
+            return pred_velocity_base, metrics, None
+
+        # fb_vec: [B, H]
+        feedback_vec = feedback_tokens.mean(dim=1)
+        feedback_vec = self._apply_feedback_delta_action_norm(feedback_vec)
+        raw_delta_action = self.feedback_delta_action_head(feedback_vec)  # [B, A]
+
+        clip_value = float(max(self.feedback_delta_action_clip, 0.0))
+        if clip_value > 0.0:
+            clipped_delta_action = clip_value * torch.tanh(
+                raw_delta_action / max(clip_value, 1e-8)
+            )
+        else:
+            clipped_delta_action = raw_delta_action
+
+        alpha_tensor, alpha_value = self._compute_feedback_delta_action_alpha(
+            device=pred_velocity_base.device,
+            dtype=pred_velocity_base.dtype,
+        )
+        gate = torch.ones(
+            (pred_velocity_base.shape[0],),
+            device=pred_velocity_base.device,
+            dtype=pred_velocity_base.dtype,
+        )
+        if self.feedback_delta_action_use_valid_tk_gate and isinstance(valid_tk_mask, torch.Tensor):
+            valid_gate = valid_tk_mask.to(device=gate.device, dtype=gate.dtype).view(-1)
+            if valid_gate.shape[0] != gate.shape[0]:
+                raise ValueError(
+                    f"`valid_tk_mask` batch mismatch for delta-action gate: got {valid_gate.shape[0]}, expected {gate.shape[0]}"
+                )
+            gate = gate * valid_gate.clamp(0.0, 1.0)
+        gate = gate * alpha_tensor
+
+        effective_delta = gate[:, None] * clipped_delta_action
+        pred_velocity = pred_velocity_base + effective_delta[:, None, :]
+
+        delta_norm = clipped_delta_action.detach().norm(dim=-1)
+        effective_delta_norm = effective_delta.detach().norm(dim=-1)
+        p95_vals = self._masked_percentiles(
+            delta_norm.view(-1),
+            valid_tk_mask if isinstance(valid_tk_mask, torch.Tensor) else None,
+            quantiles=(0.95,),
+        )
+        p95 = p95_vals[0] if len(p95_vals) > 0 else None
+
+        metrics.update(
+            {
+                "delta_action_applied": 1.0,
+                "delta_action_gate_mean": float(gate.detach().float().mean().item()),
+                "delta_action_alpha": float(alpha_value),
+                "delta_action_norm_mean": float(delta_norm.mean().item()),
+                "delta_action_norm_p95": float(p95 if p95 is not None else 0.0),
+                "delta_action_effective_norm_mean": float(effective_delta_norm.mean().item()),
+                "delta_action_feedback_vec_norm_mean": float(
+                    feedback_vec.detach().norm(dim=-1).mean().item()
+                ),
+            }
+        )
+        return pred_velocity, metrics, effective_delta
+
     def _prepare_feedback_tokens_for_context(
         self,
         feedback_tokens: Optional[torch.Tensor],
@@ -1323,14 +1635,15 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             feedback_tokens=feedback_tokens,
         )
         context_task_tokens = task_tokens
-        if self.feedback_context_only:
-            context_task_tokens = feedback_tokens_for_context
-        elif isinstance(feedback_tokens_for_context, torch.Tensor):
-            context_task_tokens = (
-                feedback_tokens_for_context
-                if context_task_tokens is None
-                else torch.cat((feedback_tokens_for_context, context_task_tokens), dim=1)
-            )
+        if self.feedback_in_context_enabled:
+            if self.feedback_context_only:
+                context_task_tokens = feedback_tokens_for_context
+            elif isinstance(feedback_tokens_for_context, torch.Tensor):
+                context_task_tokens = (
+                    feedback_tokens_for_context
+                    if context_task_tokens is None
+                    else torch.cat((feedback_tokens_for_context, context_task_tokens), dim=1)
+                )
         valid_tk_mask = None
         if isinstance(valid_tk, torch.Tensor):
             valid_tk_mask = valid_tk.to(device=device, dtype=sa_embs.dtype).view(-1)
@@ -1373,6 +1686,13 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         if isinstance(drift, torch.Tensor):
             self._record_health("forward/drift", drift)
             pred_velocity = pred_velocity + drift
+        pred_velocity_base = pred_velocity
+        pred_velocity, delta_action_metrics, _ = self._apply_feedback_delta_action(
+            pred_velocity_base=pred_velocity_base,
+            feedback_tokens=feedback_tokens,
+            valid_tk_mask=valid_tk_mask,
+            enable_delta_action=True,
+        )
         self._record_health("forward/pred_velocity_corrected", pred_velocity)
         loss_cfm = ((pred_velocity - velocity) ** 2).mean()
         feedback_probe_metrics: Dict[str, float] = {
@@ -1380,6 +1700,8 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             "feedback_probe_interval": float(self.feedback_probe_interval),
             "feedback_probe_step": float(self._feedback_probe_step),
             "feedback_probe_triggered": 0.0,
+            "feedback_probe_mode_light": 0.0,
+            "feedback_probe_mode_full": 0.0,
         }
         if (
             self._should_run_feedback_probe()
@@ -1390,60 +1712,85 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             try:
                 with torch.no_grad():
                     zero_feedback = torch.zeros_like(feedback_tokens)
-                    zero_feedback_tokens_for_context, _ = self._prepare_feedback_tokens_for_context(
-                        feedback_tokens=zero_feedback
-                    )
-                    context_task_tokens_no_fb = self._build_no_feedback_context_tokens(
-                        task_tokens=task_tokens,
-                        zero_feedback_tokens_for_context=zero_feedback_tokens_for_context,
-                        feedback_context_only=self.feedback_context_only,
-                    )
-
-                    saved_layer_means = list(self._last_dit_layer_means)
-                    saved_layer_vars = list(self._last_dit_layer_vars)
-                    saved_layer_calls = int(self._layerwise_forward_calls)
-                    saved_health_trace = list(self._last_health_trace)
-                    saved_first_nonfinite_stage = self._first_nonfinite_stage
-                    saved_first_nonfinite_record = (
-                        dict(self._first_nonfinite_record)
-                        if isinstance(self._first_nonfinite_record, dict)
-                        else self._first_nonfinite_record
-                    )
-                    saved_log_interval = int(self.cross_attention_debug_log_interval)
-                    try:
-                        self.cross_attention_debug_log_interval = 0
-                        hidden_states_no_fb = self._apply_layerwise_cross_attention(
-                            sa_embs,
-                            vl_embs_list,
-                            temb,
-                            encoder_attention_mask=encoder_attention_mask,
-                            task_tokens=context_task_tokens_no_fb,
-                            log_context="probe_no_feedback",
+                    if self.feedback_in_context_enabled:
+                        feedback_probe_metrics["feedback_probe_mode_full"] = 1.0
+                        zero_feedback_tokens_for_context, _ = self._prepare_feedback_tokens_for_context(
+                            feedback_tokens=zero_feedback
                         )
-                    finally:
-                        self.cross_attention_debug_log_interval = saved_log_interval
-                        self._last_dit_layer_means = saved_layer_means
-                        self._last_dit_layer_vars = saved_layer_vars
-                        self._layerwise_forward_calls = saved_layer_calls
-                        self._last_health_trace = saved_health_trace
-                        self._first_nonfinite_stage = saved_first_nonfinite_stage
-                        self._first_nonfinite_record = saved_first_nonfinite_record
+                        context_task_tokens_no_fb = self._build_no_feedback_context_tokens(
+                            task_tokens=task_tokens,
+                            zero_feedback_tokens_for_context=zero_feedback_tokens_for_context,
+                            feedback_context_only=self.feedback_context_only,
+                        )
 
-                    pred_velocity_no_fb = self._process_output(
-                        hidden_states_no_fb, temb, actions.shape[1]
-                    )
-                    if isinstance(drift, torch.Tensor):
-                        pred_velocity_no_fb = pred_velocity_no_fb + drift.detach()
-                    loss_no_fb = ((pred_velocity_no_fb - velocity.detach()) ** 2).mean()
+                        saved_layer_means = list(self._last_dit_layer_means)
+                        saved_layer_vars = list(self._last_dit_layer_vars)
+                        saved_layer_calls = int(self._layerwise_forward_calls)
+                        saved_health_trace = list(self._last_health_trace)
+                        saved_first_nonfinite_stage = self._first_nonfinite_stage
+                        saved_first_nonfinite_record = (
+                            dict(self._first_nonfinite_record)
+                            if isinstance(self._first_nonfinite_record, dict)
+                            else self._first_nonfinite_record
+                        )
+                        saved_log_interval = int(self.cross_attention_debug_log_interval)
+                        try:
+                            self.cross_attention_debug_log_interval = 0
+                            hidden_states_no_fb = self._apply_layerwise_cross_attention(
+                                sa_embs,
+                                vl_embs_list,
+                                temb,
+                                encoder_attention_mask=encoder_attention_mask,
+                                task_tokens=context_task_tokens_no_fb,
+                                log_context="probe_no_feedback",
+                            )
+                        finally:
+                            self.cross_attention_debug_log_interval = saved_log_interval
+                            self._last_dit_layer_means = saved_layer_means
+                            self._last_dit_layer_vars = saved_layer_vars
+                            self._layerwise_forward_calls = saved_layer_calls
+                            self._last_health_trace = saved_health_trace
+                            self._first_nonfinite_stage = saved_first_nonfinite_stage
+                            self._first_nonfinite_record = saved_first_nonfinite_record
 
-                    h_with = hidden_states.detach().float()
-                    h_no = hidden_states_no_fb.detach().float()
-                    denom = h_no.norm().clamp_min(1e-6)
-                    perturb_ratio = (h_with - h_no).norm() / denom
+                        pred_velocity_no_fb = self._process_output(
+                            hidden_states_no_fb, temb, actions.shape[1]
+                        )
+                        if isinstance(drift, torch.Tensor):
+                            pred_velocity_no_fb = pred_velocity_no_fb + drift.detach()
+                        pred_velocity_no_fb, _, _ = self._apply_feedback_delta_action(
+                            pred_velocity_base=pred_velocity_no_fb,
+                            feedback_tokens=zero_feedback,
+                            valid_tk_mask=valid_tk_mask,
+                            enable_delta_action=True,
+                        )
+                        loss_no_fb = ((pred_velocity_no_fb - velocity.detach()) ** 2).mean()
 
-                    feedback_probe_metrics["feedback_probe_hidden_perturb_ratio"] = float(
-                        perturb_ratio.item()
-                    )
+                        h_with = hidden_states.detach().float()
+                        h_no = hidden_states_no_fb.detach().float()
+                        denom = h_no.norm().clamp_min(1e-6)
+                        perturb_ratio = (h_with - h_no).norm() / denom
+                        feedback_probe_metrics["feedback_probe_hidden_perturb_ratio"] = float(
+                            perturb_ratio.item()
+                        )
+                    else:
+                        feedback_probe_metrics["feedback_probe_mode_light"] = 1.0
+                        pred_velocity_no_fb, _, _ = self._apply_feedback_delta_action(
+                            pred_velocity_base=pred_velocity_base.detach(),
+                            feedback_tokens=zero_feedback,
+                            valid_tk_mask=valid_tk_mask,
+                            enable_delta_action=True,
+                        )
+                        loss_no_fb = ((pred_velocity_no_fb - velocity.detach()) ** 2).mean()
+                        pred_with = pred_velocity.detach().float()
+                        pred_no = pred_velocity_no_fb.detach().float()
+                        denom = pred_no.norm().clamp_min(1e-6)
+                        perturb_ratio = (pred_with - pred_no).norm() / denom
+                        # Keep legacy key for compatibility with dashboards.
+                        feedback_probe_metrics["feedback_probe_hidden_perturb_ratio"] = float(
+                            perturb_ratio.item()
+                        )
+
                     feedback_probe_metrics["feedback_probe_delta_loss_with_minus_no"] = float(
                         (loss_cfm.detach() - loss_no_fb.detach()).item()
                     )
@@ -1494,12 +1841,28 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         if feedback_alpha_value is not None:
             self._last_loss_breakdown["feedback_alpha"] = float(feedback_alpha_value)
         self._last_loss_breakdown["feedback_context_only"] = 1.0 if self.feedback_context_only else 0.0
+        self._last_loss_breakdown["feedback_in_context_enabled"] = 1.0 if self.feedback_in_context_enabled else 0.0
         self._last_loss_breakdown["feedback_context_norm_enabled"] = 0.0 if self.feedback_context_norm_type == "none" else 1.0
         self._last_loss_breakdown["feedback_context_alpha_mode_fixed"] = 1.0 if self.feedback_context_alpha_mode == "fixed" else 0.0
         self._last_loss_breakdown["feedback_context_alpha_mode_learnable"] = 1.0 if self.feedback_context_alpha_mode == "learnable" else 0.0
         self._last_loss_breakdown["feedback_context_alpha_mode_schedule"] = 1.0 if self.feedback_context_alpha_mode == "schedule" else 0.0
         self._last_loss_breakdown["feedback_context_alpha_schedule_step"] = float(
             int(self._feedback_context_schedule_step.item())
+        )
+        self._last_loss_breakdown["feedback_delta_action_inference_enabled"] = (
+            1.0 if self.feedback_delta_action_enable_inference else 0.0
+        )
+        self._last_loss_breakdown["feedback_delta_action_alpha_mode_fixed"] = (
+            1.0 if self.feedback_delta_action_alpha_mode == "fixed" else 0.0
+        )
+        self._last_loss_breakdown["feedback_delta_action_alpha_mode_learnable"] = (
+            1.0 if self.feedback_delta_action_alpha_mode == "learnable" else 0.0
+        )
+        self._last_loss_breakdown["feedback_delta_action_alpha_mode_schedule"] = (
+            1.0 if self.feedback_delta_action_alpha_mode == "schedule" else 0.0
+        )
+        self._last_loss_breakdown["feedback_delta_action_alpha_schedule_step"] = float(
+            int(self._feedback_delta_action_schedule_step.item())
         )
         rrr = world_guidance.get("rrr")
         if isinstance(rrr, torch.Tensor) and rrr.numel() > 0:
@@ -1535,8 +1898,10 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             if drift_p95 is not None:
                 self._last_loss_breakdown["drift_l2_p95"] = float(drift_p95)
                 self._last_loss_breakdown["drift_norm_p95"] = float(drift_p95)
+        self._last_loss_breakdown.update(delta_action_metrics)
         self._last_loss_breakdown.update(feedback_probe_metrics)
         self._maybe_advance_feedback_alpha_schedule()
+        self._maybe_advance_feedback_delta_action_alpha_schedule()
         self._record_health("forward/loss_total", total_loss.unsqueeze(0))
         return total_loss
 
@@ -1616,14 +1981,15 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             feedback_tokens=feedback_tokens,
         )
         context_task_tokens = task_tokens
-        if self.feedback_context_only:
-            context_task_tokens = feedback_tokens_for_context
-        elif isinstance(feedback_tokens_for_context, torch.Tensor):
-            context_task_tokens = (
-                feedback_tokens_for_context
-                if context_task_tokens is None
-                else torch.cat((feedback_tokens_for_context, context_task_tokens), dim=1)
-            )
+        if self.feedback_in_context_enabled:
+            if self.feedback_context_only:
+                context_task_tokens = feedback_tokens_for_context
+            elif isinstance(feedback_tokens_for_context, torch.Tensor):
+                context_task_tokens = (
+                    feedback_tokens_for_context
+                    if context_task_tokens is None
+                    else torch.cat((feedback_tokens_for_context, context_task_tokens), dim=1)
+                )
         replans = 0
         t = 0
         predicted_task_tokens = None
@@ -1632,6 +1998,8 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         delta_z_norm_trace = []
         geo_energy_trace = []
         drift_action_cos_trace = []
+        delta_action_gate_trace = []
+        delta_action_effective_norm_trace = []
         while t < num_steps:
             if use_cuda_timing:
                 step_start_event = torch.cuda.Event(enable_timing=True)
@@ -1689,6 +2057,18 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             drift = world_guidance["drift"]
             if isinstance(drift, torch.Tensor):
                 pred_velocity = pred_velocity + drift
+            pred_velocity, delta_action_metrics, _ = self._apply_feedback_delta_action(
+                pred_velocity_base=pred_velocity,
+                feedback_tokens=feedback_tokens,
+                valid_tk_mask=None,
+                enable_delta_action=bool(self.feedback_delta_action_enable_inference),
+            )
+            gate_val = delta_action_metrics.get("delta_action_gate_mean", None)
+            eff_norm_val = delta_action_metrics.get("delta_action_effective_norm_mean", None)
+            if isinstance(gate_val, (float, int)):
+                delta_action_gate_trace.append(float(gate_val))
+            if isinstance(eff_norm_val, (float, int)):
+                delta_action_effective_norm_trace.append(float(eff_norm_val))
             if use_cuda_timing:
                 reflex_end_event.record()
                 reflex_events.append((reflex_start_event, reflex_end_event))
@@ -1812,6 +2192,18 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             "feedback/alpha_mode": str(self.feedback_context_alpha_mode),
             "feedback/alpha": float(feedback_alpha_value) if feedback_alpha_value is not None else None,
             "feedback/alpha_schedule_step": int(self._feedback_context_schedule_step.item()),
+            "feedback/in_context_enabled": bool(self.feedback_in_context_enabled),
+            "feedback/delta_action_enabled": bool(self.feedback_delta_action_enabled),
+            "feedback/delta_action_gate_mean": (
+                float(sum(delta_action_gate_trace) / len(delta_action_gate_trace))
+                if len(delta_action_gate_trace) > 0
+                else 0.0
+            ),
+            "feedback/delta_action_effective_norm_mean": (
+                float(sum(delta_action_effective_norm_trace) / len(delta_action_effective_norm_trace))
+                if len(delta_action_effective_norm_trace) > 0
+                else 0.0
+            ),
         }
         return actions, info
 
