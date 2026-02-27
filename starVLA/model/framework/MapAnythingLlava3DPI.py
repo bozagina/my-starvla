@@ -105,6 +105,13 @@ class MapAnythingLlava3D_PI(baseframework):
         self.causal_feedback_aux_dir_eps = float(
             getattr(action_cfg, "causal_feedback_aux_dir_eps", 1e-6)
         )
+        # Low-frequency stability probe for Path-A residual direction:
+        # cosine(mean(delta_t), mean(delta_{t-1})).
+        self.causal_feedback_delta_cos_interval = max(
+            1, int(getattr(action_cfg, "causal_feedback_delta_cos_interval", 100))
+        )
+        self._causal_feedback_delta_step = 0
+        self._causal_feedback_prev_delta_mean = None
         action_dim = int(getattr(action_cfg, "action_dim", 0) or 0)
         self._causal_feedback_hidden_size = int(llm_hidden_size)
         self._causal_feedback_ready = bool(
@@ -164,6 +171,8 @@ class MapAnythingLlava3D_PI(baseframework):
         self._rrr_prev_expected_change = None
         self._patha_prev_task_tokens = None
         self._patha_prev_action_chunk = None
+        self._causal_feedback_prev_delta_mean = None
+        self._causal_feedback_delta_step = 0
         self._debug_last_feedback_tokens_for_grad = None
         self._debug_last_task_tokens_for_grad = None
         self.reset_inference_state()
@@ -334,6 +343,21 @@ class MapAnythingLlava3D_PI(baseframework):
         if not key:
             return "unknown"
         return key[:64]
+
+    @staticmethod
+    def _token_std_mean(tokens: Optional[torch.Tensor]) -> Optional[float]:
+        """
+        Mean std across token dimension:
+            std(tokens, dim=1) -> mean(all dims).
+        Used to detect token-level homogenization.
+        """
+        if not isinstance(tokens, torch.Tensor) or tokens.ndim != 3:
+            return None
+        if tokens.shape[1] <= 1:
+            return 0.0
+        with torch.no_grad():
+            t = tokens.detach().float()
+            return float(t.std(dim=1, unbiased=False).mean().item())
 
     @staticmethod
     def _masked_mean(values: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
@@ -597,6 +621,34 @@ class MapAnythingLlava3D_PI(baseframework):
         delta_z = z_after - z_before
         if self.causal_feedback_detach_delta:
             delta_z = delta_z.detach()
+        # Residual direction stability probe: low-frequency cosine between
+        # consecutive batch-mean deltas.
+        with torch.no_grad():
+            try:
+                self._causal_feedback_delta_step += 1
+                curr_delta_mean = delta_z.detach().float().mean(dim=0)
+                prev_delta_mean = self._causal_feedback_prev_delta_mean
+                should_log_cos = (
+                    self.causal_feedback_delta_cos_interval <= 1
+                    or (self._causal_feedback_delta_step % self.causal_feedback_delta_cos_interval == 0)
+                )
+                if (
+                    should_log_cos
+                    and isinstance(prev_delta_mean, torch.Tensor)
+                    and prev_delta_mean.shape == curr_delta_mean.shape
+                ):
+                    cos_prev = F.cosine_similarity(
+                        curr_delta_mean.unsqueeze(0),
+                        prev_delta_mean.to(device=curr_delta_mean.device).unsqueeze(0),
+                        dim=-1,
+                    )
+                    stats["debug/causal_feedback/delta_mean_cos_prev"] = float(cos_prev.item())
+                    stats["debug/causal_feedback/delta_mean_cos_prev_available"] = 1.0
+                elif should_log_cos:
+                    stats["debug/causal_feedback/delta_mean_cos_prev_available"] = 0.0
+                self._causal_feedback_prev_delta_mean = curr_delta_mean.detach().cpu()
+            except Exception:
+                stats["debug/causal_feedback/delta_mean_cos_prev_error"] = 1.0
         # Feedback submodules may stay in fp32 while task tokens can be bf16/fp16
         # during inference eval. Run this branch in module parameter dtype to avoid
         # Float/BFloat16 mismatches (e.g., LayerNorm expected Float).
@@ -884,6 +936,12 @@ class MapAnythingLlava3D_PI(baseframework):
                 geom_stats = getattr(vlm_core, "geom_feature_stats", None)
                 geom_model_forward_ms = getattr(vlm_core, "debug_last_geom_model_forward_ms", None)
                 geom_feature_extract_ms = getattr(vlm_core, "debug_last_geom_feature_extract_ms", None)
+                vision_token_std_mean = self._token_std_mean(getattr(vlm_core, "_last_vision_features", None))
+                if vision_token_std_mean is not None:
+                    debug_metrics["debug/module1/vision_token_std_mean"] = vision_token_std_mean
+                geo_token_std_mean = self._token_std_mean(getattr(vlm_core, "_last_geometric_projected", None))
+                if geo_token_std_mean is not None:
+                    debug_metrics["debug/module1/geo_token_std_mean"] = geo_token_std_mean
                 if isinstance(geom_model_forward_ms, (int, float)):
                     debug_metrics["debug/timing/geom_model_forward_ms"] = float(geom_model_forward_ms)
                 if isinstance(geom_feature_extract_ms, (int, float)):

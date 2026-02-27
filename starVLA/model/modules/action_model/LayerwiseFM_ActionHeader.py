@@ -256,6 +256,14 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         default=1000,
         metadata={"help": "Linear ramp steps from alpha_init to alpha_target for schedule mode."},
     )
+    feedback_probe_interval: int = field(
+        default=0,
+        metadata={"help": "If >0, run low-frequency no-feedback probe every N train forwards."},
+    )
+    feedback_probe_start_step: int = field(
+        default=0,
+        metadata={"help": "Do not run feedback probe before this train-forward step."},
+    )
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -406,6 +414,13 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             persistent=False,
         )
         self._last_feedback_alpha_value = float(self.feedback_context_alpha_init)
+        self.feedback_probe_interval = int(
+            max(0, int(_cfg_get(action_config, "feedback_probe_interval", 0)))
+        )
+        self.feedback_probe_start_step = int(
+            max(0, int(_cfg_get(action_config, "feedback_probe_start_step", 0)))
+        )
+        self._feedback_probe_step = 0
 
         self.world_hidden_dim = int(_cfg_get(action_config, "world_hidden_dim", 512))
         self.world_num_layers = int(_cfg_get(action_config, "world_num_layers", 4))
@@ -1032,6 +1047,38 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             context_feedback_tokens = context_feedback_tokens * float(self.feedback_context_scale)
         return context_feedback_tokens, alpha_value
 
+    def _should_run_feedback_probe(self) -> bool:
+        """
+        Low-frequency diagnostics probe:
+        compare normal branch vs no-feedback branch without extra VLM forward.
+        """
+        if not self.training:
+            return False
+        interval = int(max(self.feedback_probe_interval, 0))
+        if interval <= 0:
+            return False
+        self._feedback_probe_step += 1
+        if self._feedback_probe_step < int(max(self.feedback_probe_start_step, 0)):
+            return False
+        return (self._feedback_probe_step % interval) == 0
+
+    @staticmethod
+    def _build_no_feedback_context_tokens(
+        *,
+        task_tokens: Optional[torch.Tensor],
+        zero_feedback_tokens_for_context: Optional[torch.Tensor],
+        feedback_context_only: bool,
+    ) -> Optional[torch.Tensor]:
+        if feedback_context_only:
+            return zero_feedback_tokens_for_context
+        if isinstance(zero_feedback_tokens_for_context, torch.Tensor):
+            return (
+                zero_feedback_tokens_for_context
+                if task_tokens is None
+                else torch.cat((zero_feedback_tokens_for_context, task_tokens), dim=1)
+            )
+        return task_tokens
+
     def _predict_next_task_tokens(
         self,
         task_tokens: Optional[torch.Tensor],
@@ -1328,6 +1375,84 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             pred_velocity = pred_velocity + drift
         self._record_health("forward/pred_velocity_corrected", pred_velocity)
         loss_cfm = ((pred_velocity - velocity) ** 2).mean()
+        feedback_probe_metrics: Dict[str, float] = {
+            "feedback_probe_enabled": 1.0 if self.feedback_probe_interval > 0 else 0.0,
+            "feedback_probe_interval": float(self.feedback_probe_interval),
+            "feedback_probe_step": float(self._feedback_probe_step),
+            "feedback_probe_triggered": 0.0,
+        }
+        if (
+            self._should_run_feedback_probe()
+            and isinstance(feedback_tokens, torch.Tensor)
+        ):
+            feedback_probe_metrics["feedback_probe_triggered"] = 1.0
+            feedback_probe_metrics["feedback_probe_step"] = float(self._feedback_probe_step)
+            try:
+                with torch.no_grad():
+                    zero_feedback = torch.zeros_like(feedback_tokens)
+                    zero_feedback_tokens_for_context, _ = self._prepare_feedback_tokens_for_context(
+                        feedback_tokens=zero_feedback
+                    )
+                    context_task_tokens_no_fb = self._build_no_feedback_context_tokens(
+                        task_tokens=task_tokens,
+                        zero_feedback_tokens_for_context=zero_feedback_tokens_for_context,
+                        feedback_context_only=self.feedback_context_only,
+                    )
+
+                    saved_layer_means = list(self._last_dit_layer_means)
+                    saved_layer_vars = list(self._last_dit_layer_vars)
+                    saved_layer_calls = int(self._layerwise_forward_calls)
+                    saved_health_trace = list(self._last_health_trace)
+                    saved_first_nonfinite_stage = self._first_nonfinite_stage
+                    saved_first_nonfinite_record = (
+                        dict(self._first_nonfinite_record)
+                        if isinstance(self._first_nonfinite_record, dict)
+                        else self._first_nonfinite_record
+                    )
+                    saved_log_interval = int(self.cross_attention_debug_log_interval)
+                    try:
+                        self.cross_attention_debug_log_interval = 0
+                        hidden_states_no_fb = self._apply_layerwise_cross_attention(
+                            sa_embs,
+                            vl_embs_list,
+                            temb,
+                            encoder_attention_mask=encoder_attention_mask,
+                            task_tokens=context_task_tokens_no_fb,
+                            log_context="probe_no_feedback",
+                        )
+                    finally:
+                        self.cross_attention_debug_log_interval = saved_log_interval
+                        self._last_dit_layer_means = saved_layer_means
+                        self._last_dit_layer_vars = saved_layer_vars
+                        self._layerwise_forward_calls = saved_layer_calls
+                        self._last_health_trace = saved_health_trace
+                        self._first_nonfinite_stage = saved_first_nonfinite_stage
+                        self._first_nonfinite_record = saved_first_nonfinite_record
+
+                    pred_velocity_no_fb = self._process_output(
+                        hidden_states_no_fb, temb, actions.shape[1]
+                    )
+                    if isinstance(drift, torch.Tensor):
+                        pred_velocity_no_fb = pred_velocity_no_fb + drift.detach()
+                    loss_no_fb = ((pred_velocity_no_fb - velocity.detach()) ** 2).mean()
+
+                    h_with = hidden_states.detach().float()
+                    h_no = hidden_states_no_fb.detach().float()
+                    denom = h_no.norm().clamp_min(1e-6)
+                    perturb_ratio = (h_with - h_no).norm() / denom
+
+                    feedback_probe_metrics["feedback_probe_hidden_perturb_ratio"] = float(
+                        perturb_ratio.item()
+                    )
+                    feedback_probe_metrics["feedback_probe_delta_loss_with_minus_no"] = float(
+                        (loss_cfm.detach() - loss_no_fb.detach()).item()
+                    )
+                    feedback_probe_metrics["feedback_probe_loss_no"] = float(
+                        loss_no_fb.detach().item()
+                    )
+            except Exception:
+                feedback_probe_metrics["feedback_probe_error"] = 1.0
+        feedback_probe_metrics["feedback_probe_step"] = float(self._feedback_probe_step)
         loss_dyn = world_guidance["loss_dyn"]
         loss_geo = world_guidance["loss_geo"]
         loss_align = world_guidance.get("loss_align", loss_cfm.new_tensor(0.0))
@@ -1410,6 +1535,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             if drift_p95 is not None:
                 self._last_loss_breakdown["drift_l2_p95"] = float(drift_p95)
                 self._last_loss_breakdown["drift_norm_p95"] = float(drift_p95)
+        self._last_loss_breakdown.update(feedback_probe_metrics)
         self._maybe_advance_feedback_alpha_schedule()
         self._record_health("forward/loss_total", total_loss.unsqueeze(0))
         return total_loss
