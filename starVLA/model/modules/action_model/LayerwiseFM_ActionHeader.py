@@ -264,6 +264,10 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         default=0,
         metadata={"help": "Do not run feedback probe before this train-forward step."},
     )
+    feedback_probe_compare_unmasked: bool = field(
+        default=False,
+        metadata={"help": "If true, compare masked vs uniform-mask feedback in probe (light mode)."},
+    )
     feedback_in_context_enabled: bool = field(
         default=True,
         metadata={"help": "If false, do not inject feedback tokens into cross-attention context (keep task_tokens only)."},
@@ -527,6 +531,9 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         )
         self.feedback_probe_start_step = int(
             max(0, int(_cfg_get(action_config, "feedback_probe_start_step", 0)))
+        )
+        self.feedback_probe_compare_unmasked = bool(
+            _cfg_get(action_config, "feedback_probe_compare_unmasked", False)
         )
         self._feedback_probe_step = 0
         self.feedback_in_context_enabled = bool(
@@ -1643,6 +1650,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         task_tokens_next: Optional[torch.Tensor] = None,
         valid_tk: Optional[torch.Tensor] = None,
         feedback_tokens: Optional[torch.Tensor] = None,
+        feedback_tokens_unmasked: Optional[torch.Tensor] = None,
         loss_weight_override: Optional[Dict[str, float]] = None,
     ):
         """
@@ -1704,6 +1712,12 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         )
         feedback_tokens = self._normalize_feedback_tokens(
             feedback_tokens=feedback_tokens,
+            batch_size=B,
+            device=device,
+            dtype=sa_embs.dtype,
+        )
+        feedback_tokens_unmasked = self._normalize_feedback_tokens(
+            feedback_tokens=feedback_tokens_unmasked,
             batch_size=B,
             device=device,
             dtype=sa_embs.dtype,
@@ -1781,6 +1795,12 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             "feedback_probe_mode_full": 0.0,
             "feedback_probe_delta_loss_per_effective": 0.0,
             "feedback_probe_effective_norm_with": 0.0,
+            "feedback_probe_compare_unmasked_enabled": 1.0 if self.feedback_probe_compare_unmasked else 0.0,
+            "feedback_probe_compare_unmasked_available": 0.0,
+            "feedback_probe_delta_loss_per_effective_masked": 0.0,
+            "feedback_probe_delta_loss_per_effective_unmasked": 0.0,
+            "feedback_probe_delta_loss_per_effective_masked_minus_unmasked": 0.0,
+            "feedback_probe_effective_norm_unmasked": 0.0,
         }
         if (
             self._should_run_feedback_probe()
@@ -1878,9 +1898,42 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                     )
                     eff_norm_with = float(delta_action_metrics.get("delta_action_effective_norm_mean", 0.0))
                     feedback_probe_metrics["feedback_probe_effective_norm_with"] = eff_norm_with
+                    delta_loss_masked = (loss_cfm.detach() - loss_no_fb.detach()).item()
                     feedback_probe_metrics["feedback_probe_delta_loss_per_effective"] = float(
-                        (loss_cfm.detach() - loss_no_fb.detach()).item() / max(eff_norm_with, 1e-8)
+                        delta_loss_masked / max(eff_norm_with, 1e-8)
                     )
+                    feedback_probe_metrics["feedback_probe_delta_loss_per_effective_masked"] = float(
+                        delta_loss_masked / max(eff_norm_with, 1e-8)
+                    )
+
+                    if (
+                        self.feedback_probe_compare_unmasked
+                        and (not self.feedback_in_context_enabled)
+                        and isinstance(feedback_tokens_unmasked, torch.Tensor)
+                    ):
+                        pred_velocity_unmasked, delta_action_metrics_unmasked, _ = self._apply_feedback_delta_action(
+                            pred_velocity_base=pred_velocity_base.detach(),
+                            feedback_tokens=feedback_tokens_unmasked,
+                            valid_tk_mask=valid_tk_mask,
+                            enable_delta_action=True,
+                        )
+                        loss_unmasked = ((pred_velocity_unmasked - velocity.detach()) ** 2).mean()
+                        delta_loss_unmasked = (loss_unmasked.detach() - loss_no_fb.detach()).item()
+                        eff_norm_unmasked = float(
+                            delta_action_metrics_unmasked.get("delta_action_effective_norm_mean", 0.0)
+                        )
+                        unmasked_per_eff = float(delta_loss_unmasked / max(eff_norm_unmasked, 1e-8))
+                        masked_per_eff = float(delta_loss_masked / max(eff_norm_with, 1e-8))
+                        feedback_probe_metrics["feedback_probe_compare_unmasked_available"] = 1.0
+                        feedback_probe_metrics["feedback_probe_effective_norm_unmasked"] = eff_norm_unmasked
+                        feedback_probe_metrics["feedback_probe_loss_unmasked"] = float(loss_unmasked.detach().item())
+                        feedback_probe_metrics["feedback_probe_delta_loss_unmasked_with_minus_no"] = float(
+                            delta_loss_unmasked
+                        )
+                        feedback_probe_metrics["feedback_probe_delta_loss_per_effective_unmasked"] = unmasked_per_eff
+                        feedback_probe_metrics["feedback_probe_delta_loss_per_effective_masked_minus_unmasked"] = float(
+                            masked_per_eff - unmasked_per_eff
+                        )
             except Exception:
                 feedback_probe_metrics["feedback_probe_error"] = 1.0
         feedback_probe_metrics["feedback_probe_step"] = float(self._feedback_probe_step)

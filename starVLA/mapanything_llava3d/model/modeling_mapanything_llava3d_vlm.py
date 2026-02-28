@@ -103,7 +103,16 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
             semantic_heads = 1
         self.semantic_num_heads = semantic_heads
         self.semantic_query_max_tokens = int(getattr(config, "semantic_query_max_tokens", 64))
-        self.semantic_topk_tokens = int(getattr(config, "semantic_topk_tokens", 32))
+        self.semantic_topk_tokens = int(getattr(config, "semantic_topk_tokens", 16))
+        self.semantic_query_select_mode = str(
+            getattr(config, "semantic_query_select_mode", "summary_topk")
+        ).strip().lower()
+        if self.semantic_query_select_mode not in ("uniform", "topk_norm", "summary_topk"):
+            logger.warning(
+                "Invalid semantic_query_select_mode=%s, fallback to summary_topk.",
+                self.semantic_query_select_mode,
+            )
+            self.semantic_query_select_mode = "summary_topk"
         self.semantic_anchor_attention = nn.MultiheadAttention(
             embed_dim=self.hidden_size,
             num_heads=self.semantic_num_heads,
@@ -274,24 +283,51 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
             lang_mask = active
 
         max_tokens = max(1, int(self.semantic_query_max_tokens))
-        max_valid = int(lang_mask.sum(dim=1).max().item()) if bsz > 0 else 0
-        query_len = max(1, min(max_tokens, max_valid if max_valid > 0 else 1))
-        queries = inputs_embeds.new_zeros((bsz, query_len, hidden))
-        query_mask = torch.zeros((bsz, query_len), dtype=torch.bool, device=device)
-
+        select_mode = self.semantic_query_select_mode
+        topk_cap_cfg = int(self.semantic_topk_tokens)
+        query_lens: List[int] = []
+        sample_valid_indices: List[torch.Tensor] = []
         for bid in range(bsz):
             valid_idx = torch.nonzero(lang_mask[bid], as_tuple=False).flatten()
             if valid_idx.numel() == 0:
                 valid_idx = torch.tensor([0], device=device, dtype=torch.long)
-            if valid_idx.numel() > query_len:
-                sample_pos = torch.linspace(
-                    0,
-                    float(valid_idx.numel() - 1),
-                    steps=query_len,
-                    device=device,
-                ).long()
-                valid_idx = valid_idx[sample_pos]
-            token_query = inputs_embeds[bid, valid_idx]
+            sample_valid_indices.append(valid_idx)
+            if select_mode == "uniform":
+                query_lens.append(min(max_tokens, int(valid_idx.numel())))
+            else:
+                topk_cap = max_tokens if topk_cap_cfg <= 0 else min(max_tokens, topk_cap_cfg)
+                query_lens.append(min(topk_cap, int(valid_idx.numel())))
+        query_len = max(1, max(query_lens) if query_lens else 1)
+        queries = inputs_embeds.new_zeros((bsz, query_len, hidden))
+        query_mask = torch.zeros((bsz, query_len), dtype=torch.bool, device=device)
+
+        for bid in range(bsz):
+            valid_idx = sample_valid_indices[bid]
+            token_pool = inputs_embeds[bid, valid_idx]
+            if select_mode == "uniform":
+                if valid_idx.numel() > query_len:
+                    sample_pos = torch.linspace(
+                        0,
+                        float(valid_idx.numel() - 1),
+                        steps=query_len,
+                        device=device,
+                    ).long()
+                    valid_idx = valid_idx[sample_pos]
+                token_query = inputs_embeds[bid, valid_idx]
+            elif select_mode == "topk_norm":
+                take_n = min(query_len, int(token_pool.shape[0]))
+                token_score = token_pool.float().norm(dim=-1)
+                topk_idx = torch.topk(token_score, k=take_n, largest=True).indices
+                token_query = token_pool.index_select(0, topk_idx)
+            else:  # summary_topk
+                take_n = min(query_len, int(token_pool.shape[0]))
+                summary = token_pool.float().mean(dim=0, keepdim=True)
+                token_score = torch.matmul(
+                    F.normalize(token_pool.float(), dim=-1),
+                    F.normalize(summary, dim=-1).squeeze(0),
+                )
+                topk_idx = torch.topk(token_score, k=take_n, largest=True).indices
+                token_query = token_pool.index_select(0, topk_idx)
             take_n = token_query.shape[0]
             queries[bid, :take_n] = token_query
             query_mask[bid, :take_n] = True

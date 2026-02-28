@@ -960,10 +960,12 @@ class MapAnythingLlava3D_PI(baseframework):
         vision_tokens: Optional[torch.Tensor] = None,
         language_queries: Optional[torch.Tensor] = None,
         language_query_mask: Optional[torch.Tensor] = None,
+        force_uniform_mask: bool = False,
     ) -> Tuple[Optional[torch.Tensor], Dict[str, float], Optional[torch.Tensor]]:
         stats: Dict[str, float] = {
             "debug/causal_feedback/enabled": float(self._causal_feedback_ready),
             "debug/causal_feedback/applied": 0.0,
+            "debug/causal_feedback/force_uniform_mask": 1.0 if force_uniform_mask else 0.0,
             "debug/causal_feedback/residual_mode_token_delta_geo": 1.0
             if self.patha_residual_mode == "token_delta_geo"
             else 0.0,
@@ -1066,16 +1068,8 @@ class MapAnythingLlava3D_PI(baseframework):
                     delta_tokens = geo_after - geo_before
                     if self.causal_feedback_detach_delta:
                         delta_tokens = delta_tokens.detach()
-                    alpha, soft_stats = self._build_soft_mask(
-                        vision_tokens=vision_tokens[:, :token_n, :]
-                        if isinstance(vision_tokens, torch.Tensor) and vision_tokens.ndim == 3
-                        else None,
-                        geometric_tokens=geo_before,
-                        language_queries=language_queries,
-                        language_query_mask=language_query_mask,
-                    )
-                    stats.update(soft_stats)
-                    if not isinstance(alpha, torch.Tensor):
+                    alpha = None
+                    if force_uniform_mask:
                         alpha = torch.full(
                             (batch_size, token_n),
                             1.0 / max(token_n, 1),
@@ -1083,15 +1077,32 @@ class MapAnythingLlava3D_PI(baseframework):
                             dtype=delta_tokens.dtype,
                         )
                     else:
-                        alpha = alpha.to(device=delta_tokens.device, dtype=delta_tokens.dtype)
-                        if alpha.shape[0] != batch_size or alpha.shape[1] != token_n:
+                        alpha, soft_stats = self._build_soft_mask(
+                            vision_tokens=vision_tokens[:, :token_n, :]
+                            if isinstance(vision_tokens, torch.Tensor) and vision_tokens.ndim == 3
+                            else None,
+                            geometric_tokens=geo_before,
+                            language_queries=language_queries,
+                            language_query_mask=language_query_mask,
+                        )
+                        stats.update(soft_stats)
+                        if not isinstance(alpha, torch.Tensor):
                             alpha = torch.full(
                                 (batch_size, token_n),
                                 1.0 / max(token_n, 1),
                                 device=delta_tokens.device,
                                 dtype=delta_tokens.dtype,
                             )
-                            stats["debug/causal_feedback/soft_mask_shape_mismatch"] = 1.0
+                        else:
+                            alpha = alpha.to(device=delta_tokens.device, dtype=delta_tokens.dtype)
+                            if alpha.shape[0] != batch_size or alpha.shape[1] != token_n:
+                                alpha = torch.full(
+                                    (batch_size, token_n),
+                                    1.0 / max(token_n, 1),
+                                    device=delta_tokens.device,
+                                    dtype=delta_tokens.dtype,
+                                )
+                                stats["debug/causal_feedback/soft_mask_shape_mismatch"] = 1.0
                     if isinstance(valid, torch.Tensor):
                         delta_tokens = delta_tokens * valid
                     residual_tokens = delta_tokens * alpha.unsqueeze(-1)
@@ -1827,6 +1838,7 @@ class MapAnythingLlava3D_PI(baseframework):
                         geometric_tokens_repeated.detach(),
                     )
             feedback_tokens_repeated = None
+            feedback_tokens_unmasked_repeated = None
             residual_target_repeated = None
             feedback_stats = {}
             feedback_aux_loss = None
@@ -1862,6 +1874,28 @@ class MapAnythingLlava3D_PI(baseframework):
                     seed=feedback_ablation_seed,
                 )
                 debug_metrics.update(feedback_ablation_stats)
+                if (
+                    bool(getattr(self.action_model, "feedback_probe_compare_unmasked", False))
+                    and feedback_ablation_mode == "none"
+                ):
+                    try:
+                        feedback_tokens_unmasked_repeated, _, _ = self._build_causal_feedback_tokens(
+                            task_tokens=task_tokens_repeated,
+                            task_tokens_next=task_tokens_next_repeated,
+                            action_chunk=actions_target_repeated,
+                            valid_tk_mask=valid_tk_repeated,
+                            geometric_tokens=geometric_tokens_repeated,
+                            geometric_tokens_next=geometric_tokens_next_repeated,
+                            vision_tokens=vision_tokens_repeated,
+                            language_queries=language_queries_repeated,
+                            language_query_mask=language_query_mask_repeated,
+                            force_uniform_mask=True,
+                        )
+                        debug_metrics["debug/causal_feedback/probe_unmasked_feedback_available"] = (
+                            1.0 if isinstance(feedback_tokens_unmasked_repeated, torch.Tensor) else 0.0
+                        )
+                    except Exception:
+                        debug_metrics["debug/causal_feedback/probe_unmasked_feedback_error"] = 1.0
                 feedback_aux_loss, feedback_aux_stats = self._compute_causal_feedback_aux_loss(
                     feedback_tokens=feedback_tokens_repeated,
                     task_tokens=task_tokens_repeated,
@@ -1898,6 +1932,7 @@ class MapAnythingLlava3D_PI(baseframework):
                 task_tokens_next=task_tokens_next_repeated,
                 valid_tk=valid_tk_repeated,
                 feedback_tokens=feedback_tokens_repeated,
+                feedback_tokens_unmasked=feedback_tokens_unmasked_repeated,
             )
             if isinstance(feedback_aux_loss, torch.Tensor):
                 debug_metrics["debug/causal_feedback/action_loss_base"] = float(action_loss.detach().item())
