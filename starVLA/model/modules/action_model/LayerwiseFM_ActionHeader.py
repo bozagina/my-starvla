@@ -1299,6 +1299,8 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             "delta_action_applied": 0.0,
             # Clip diagnostics (minimal): pre-clip norm and saturation ratio.
             "delta_action_raw_norm_mean": 0.0,
+            "delta_action_postclip_norm_mean": 0.0,
+            "delta_action_post_over_raw_norm_mean": 0.0,
             "delta_action_clip_saturation_frac": 0.0,
             # Delta-head learning status (minimal): last linear layer weight RMS.
             "delta_action_last_layer_weight_rms": 0.0,
@@ -1371,6 +1373,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
 
         delta_norm = clipped_delta_action.detach().norm(dim=-1)
         effective_delta_norm = effective_delta.detach().norm(dim=-1)
+        post_over_raw = (delta_norm / raw_delta_norm.clamp_min(1e-8)).mean()
         p95_vals = self._masked_percentiles(
             delta_norm.view(-1),
             valid_tk_mask if isinstance(valid_tk_mask, torch.Tensor) else None,
@@ -1384,6 +1387,8 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 "delta_action_gate_mean": float(gate.detach().float().mean().item()),
                 "delta_action_alpha": float(alpha_value),
                 "delta_action_raw_norm_mean": float(raw_delta_norm.mean().item()),
+                "delta_action_postclip_norm_mean": float(delta_norm.mean().item()),
+                "delta_action_post_over_raw_norm_mean": float(post_over_raw.item()),
                 "delta_action_clip_saturation_frac": float(clip_saturation_frac),
                 "delta_action_norm_mean": float(delta_norm.mean().item()),
                 "delta_action_norm_p95": float(p95 if p95 is not None else 0.0),
@@ -1754,6 +1759,8 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             "feedback_probe_triggered": 0.0,
             "feedback_probe_mode_light": 0.0,
             "feedback_probe_mode_full": 0.0,
+            "feedback_probe_delta_loss_per_effective": 0.0,
+            "feedback_probe_effective_norm_with": 0.0,
         }
         if (
             self._should_run_feedback_probe()
@@ -1848,6 +1855,11 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                     )
                     feedback_probe_metrics["feedback_probe_loss_no"] = float(
                         loss_no_fb.detach().item()
+                    )
+                    eff_norm_with = float(delta_action_metrics.get("delta_action_effective_norm_mean", 0.0))
+                    feedback_probe_metrics["feedback_probe_effective_norm_with"] = eff_norm_with
+                    feedback_probe_metrics["feedback_probe_delta_loss_per_effective"] = float(
+                        (loss_cfm.detach() - loss_no_fb.detach()).item() / max(eff_norm_with, 1e-8)
                     )
             except Exception:
                 feedback_probe_metrics["feedback_probe_error"] = 1.0

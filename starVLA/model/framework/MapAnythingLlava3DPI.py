@@ -569,13 +569,61 @@ class MapAnythingLlava3D_PI(baseframework):
         alpha = self._maybe_apply_soft_mask_ema(alpha)
 
         with torch.no_grad():
+            # Soft-mask diagnostics:
+            # 1) logits dynamic range (to detect near-flat softmax inputs),
+            # 2) pre/post aggregation entropy (to locate flattening from query aggregation),
+            # 3) alpha sharpness proxy.
+            query_count = (
+                query_mask.to(dtype=torch.float32).sum(dim=1)
+                if isinstance(query_mask, torch.Tensor)
+                else torch.full((bsz,), float(language_queries.shape[1]), device=device, dtype=torch.float32)
+            )
+            query_count_mean = float(query_count.mean().item())
+            logits_vis_std_q = logits_vis.detach().float().std(dim=-1, unbiased=False)
+            logits_geo_std_q = logits_geo.detach().float().std(dim=-1, unbiased=False)
+            logits_vis_rng_q = (logits_vis.detach().float().amax(dim=-1) - logits_vis.detach().float().amin(dim=-1))
+            logits_geo_rng_q = (logits_geo.detach().float().amax(dim=-1) - logits_geo.detach().float().amin(dim=-1))
+            query_weight_f = query_weight.detach().float()
+            logits_vis_std = float((logits_vis_std_q * query_weight_f).sum(dim=1).mean().item())
+            logits_geo_std = float((logits_geo_std_q * query_weight_f).sum(dim=1).mean().item())
+            logits_vis_rng = float((logits_vis_rng_q * query_weight_f).sum(dim=1).mean().item())
+            logits_geo_rng = float((logits_geo_rng_q * query_weight_f).sum(dim=1).mean().item())
+
+            ent_vis_q = -torch.sum(attn_vis.detach().float() * torch.log(attn_vis.detach().float().clamp_min(1e-9)), dim=-1)
+            ent_geo_q = -torch.sum(attn_geo.detach().float() * torch.log(attn_geo.detach().float().clamp_min(1e-9)), dim=-1)
+            ent_vis_q_mean = float((ent_vis_q * query_weight_f).sum(dim=1).mean().item())
+            ent_geo_q_mean = float((ent_geo_q * query_weight_f).sum(dim=1).mean().item())
+
+            alpha_vis_norm = alpha_vis.detach().float().clamp_min(0.0)
+            alpha_geo_norm = alpha_geo.detach().float().clamp_min(0.0)
+            alpha_vis_norm = alpha_vis_norm / alpha_vis_norm.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+            alpha_geo_norm = alpha_geo_norm / alpha_geo_norm.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+            ent_alpha_vis = -torch.sum(alpha_vis_norm * torch.log(alpha_vis_norm.clamp_min(1e-9)), dim=-1)
+            ent_alpha_geo = -torch.sum(alpha_geo_norm * torch.log(alpha_geo_norm.clamp_min(1e-9)), dim=-1)
+
             entropy = -torch.sum(alpha * torch.log(alpha.clamp_min(1e-9)), dim=-1)
             topk = min(int(token_n), 32)
-            topk_mass = alpha.topk(topk, dim=-1).values.sum(dim=-1)
+            alpha_topk_vals = alpha.topk(topk, dim=-1).values
+            topk_mass = alpha_topk_vals.sum(dim=-1)
+            alpha_max = alpha.amax(dim=-1)
+            alpha_top1_over_top32 = alpha_topk_vals[:, 0] / topk_mass.clamp_min(1e-9)
             stats["debug/causal_feedback/soft_mask_applied"] = 1.0
             stats["debug/causal_feedback/soft_mask_token_num"] = float(token_n)
+            stats["debug/causal_feedback/language_query_count_mean"] = query_count_mean
+            stats["debug/causal_feedback/soft_mask_logits_std_vis"] = logits_vis_std
+            stats["debug/causal_feedback/soft_mask_logits_std_geo"] = logits_geo_std
+            stats["debug/causal_feedback/soft_mask_logits_maxmin_vis"] = logits_vis_rng
+            stats["debug/causal_feedback/soft_mask_logits_maxmin_geo"] = logits_geo_rng
+            stats["debug/causal_feedback/soft_mask_entropy_attn_vis_query"] = ent_vis_q_mean
+            stats["debug/causal_feedback/soft_mask_entropy_attn_geo_query"] = ent_geo_q_mean
+            stats["debug/causal_feedback/soft_mask_entropy_alpha_vis"] = float(ent_alpha_vis.mean().item())
+            stats["debug/causal_feedback/soft_mask_entropy_alpha_geo"] = float(ent_alpha_geo.mean().item())
             stats["debug/causal_feedback/soft_mask_entropy"] = float(entropy.mean().item())
             stats["debug/causal_feedback/soft_mask_topk_mass_32"] = float(topk_mass.mean().item())
+            stats["debug/causal_feedback/soft_mask_alpha_max_mean"] = float(alpha_max.mean().item())
+            stats["debug/causal_feedback/soft_mask_alpha_top1_over_top32"] = float(
+                alpha_top1_over_top32.mean().item()
+            )
             try:
                 curr_mean = alpha.detach().float().mean(dim=0)
                 prev_mean = self._patha_prev_soft_mask_mean
