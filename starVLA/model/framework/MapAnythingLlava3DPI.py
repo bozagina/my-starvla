@@ -105,6 +105,45 @@ class MapAnythingLlava3D_PI(baseframework):
         self.causal_feedback_aux_dir_eps = float(
             getattr(action_cfg, "causal_feedback_aux_dir_eps", 1e-6)
         )
+        # v4-1-1 residual/soft-mask options.
+        self.patha_residual_mode = str(
+            getattr(action_cfg, "patha_residual_mode", "pooled_delta_z")
+        ).strip().lower()
+        if self.patha_residual_mode not in ("pooled_delta_z", "token_delta_geo"):
+            logger.warning(
+                "[causal_feedback] invalid patha_residual_mode=%s, fallback to pooled_delta_z",
+                self.patha_residual_mode,
+            )
+            self.patha_residual_mode = "pooled_delta_z"
+        self.soft_mask_enabled = bool(
+            getattr(action_cfg, "soft_mask_enabled", False)
+        )
+        self.soft_mask_lambda = float(
+            getattr(action_cfg, "soft_mask_lambda", 0.3)
+        )
+        self.soft_mask_ema_beta = float(
+            getattr(action_cfg, "soft_mask_ema_beta", 0.2)
+        )
+        self.soft_mask_query_agg = str(
+            getattr(action_cfg, "soft_mask_query_agg", "mean")
+        ).strip().lower()
+        if self.soft_mask_query_agg not in ("mean", "max"):
+            logger.warning(
+                "[causal_feedback] invalid soft_mask_query_agg=%s, fallback to mean",
+                self.soft_mask_query_agg,
+            )
+            self.soft_mask_query_agg = "mean"
+        self.soft_mask_temperature = float(
+            getattr(action_cfg, "soft_mask_temperature", 1.0)
+        )
+        if self.soft_mask_temperature <= 0.0:
+            self.soft_mask_temperature = 1.0
+        self.soft_mask_use_ema_inference = bool(
+            getattr(action_cfg, "soft_mask_use_ema_inference", True)
+        )
+        self.soft_mask_use_ema_training = bool(
+            getattr(action_cfg, "soft_mask_use_ema_training", False)
+        )
         # Low-frequency stability probe for Path-A residual direction:
         # cosine(mean(delta_t), mean(delta_{t-1})).
         self.causal_feedback_delta_cos_interval = max(
@@ -171,6 +210,12 @@ class MapAnythingLlava3D_PI(baseframework):
         self._rrr_prev_expected_change = None
         self._patha_prev_task_tokens = None
         self._patha_prev_action_chunk = None
+        self._patha_prev_geo_tokens = None
+        self._patha_prev_vision_tokens = None
+        self._patha_prev_language_queries = None
+        self._patha_prev_language_query_mask = None
+        self._patha_soft_mask_ema = None
+        self._patha_prev_soft_mask_mean = None
         self._causal_feedback_prev_delta_mean = None
         self._causal_feedback_delta_step = 0
         self._debug_last_feedback_tokens_for_grad = None
@@ -191,6 +236,12 @@ class MapAnythingLlava3D_PI(baseframework):
         self._rrr_prev_expected_change = None
         self._patha_prev_task_tokens = None
         self._patha_prev_action_chunk = None
+        self._patha_prev_geo_tokens = None
+        self._patha_prev_vision_tokens = None
+        self._patha_prev_language_queries = None
+        self._patha_prev_language_query_mask = None
+        self._patha_soft_mask_ema = None
+        self._patha_prev_soft_mask_mean = None
 
     @staticmethod
     def _set_module_use_cache(module, use_cache: bool, module_name: str):
@@ -375,6 +426,174 @@ class MapAnythingLlava3D_PI(baseframework):
             return values.new_tensor(0.0)
         return torch.sum(values * m) / denom
 
+    @staticmethod
+    def _masked_quantiles_1d(
+        values: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        quantiles: Tuple[float, ...],
+    ) -> List[Optional[float]]:
+        if values.ndim != 1:
+            values = values.view(-1)
+        if mask is None:
+            active = values
+        else:
+            m = mask.view(-1).to(device=values.device, dtype=values.dtype)
+            if m.shape[0] != values.shape[0]:
+                return [None for _ in quantiles]
+            active = values[m > 0.5]
+        if active.numel() == 0:
+            return [None for _ in quantiles]
+        try:
+            q_tensor = torch.tensor(
+                [float(max(0.0, min(1.0, q))) for q in quantiles],
+                device=active.device,
+                dtype=active.dtype,
+            )
+            out = torch.quantile(active, q_tensor)
+            return [float(v.item()) for v in out]
+        except Exception:
+            sorted_vals, _ = torch.sort(active)
+            n = int(sorted_vals.numel())
+            out = []
+            for q in quantiles:
+                idx = int(max(0, min(n - 1, round(float(q) * max(n - 1, 0)))))
+                out.append(float(sorted_vals[idx].item()))
+            return out
+
+    def _maybe_apply_soft_mask_ema(
+        self,
+        alpha: torch.Tensor,
+    ) -> torch.Tensor:
+        if not isinstance(alpha, torch.Tensor) or alpha.ndim != 2:
+            return alpha
+        use_ema = bool(self.soft_mask_use_ema_training if self.training else self.soft_mask_use_ema_inference)
+        if not use_ema:
+            return alpha
+        beta = float(max(0.0, min(1.0, self.soft_mask_ema_beta)))
+        if beta <= 0.0:
+            return alpha
+        with torch.no_grad():
+            cached = self._patha_soft_mask_ema
+            alpha_detached = alpha.detach()
+            if not isinstance(cached, torch.Tensor) or cached.shape != alpha_detached.shape:
+                cached = alpha_detached.clone()
+            else:
+                cached = (1.0 - beta) * cached.to(device=alpha_detached.device, dtype=alpha_detached.dtype) + beta * alpha_detached
+            self._patha_soft_mask_ema = cached.detach()
+        return self._patha_soft_mask_ema.to(device=alpha.device, dtype=alpha.dtype)
+
+    def _build_soft_mask(
+        self,
+        *,
+        vision_tokens: Optional[torch.Tensor],
+        geometric_tokens: Optional[torch.Tensor],
+        language_queries: Optional[torch.Tensor],
+        language_query_mask: Optional[torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
+        stats: Dict[str, float] = {
+            "debug/causal_feedback/soft_mask_enabled": float(self.soft_mask_enabled),
+            "debug/causal_feedback/soft_mask_applied": 0.0,
+            "debug/causal_feedback/soft_mask_lambda": float(self.soft_mask_lambda),
+            "debug/causal_feedback/soft_mask_temperature": float(self.soft_mask_temperature),
+        }
+        if not self.soft_mask_enabled:
+            return None, stats
+        if not (
+            isinstance(vision_tokens, torch.Tensor)
+            and isinstance(geometric_tokens, torch.Tensor)
+            and isinstance(language_queries, torch.Tensor)
+        ):
+            stats["debug/causal_feedback/soft_mask_missing_inputs"] = 1.0
+            return None, stats
+        if vision_tokens.ndim != 3 or geometric_tokens.ndim != 3 or language_queries.ndim != 3:
+            stats["debug/causal_feedback/soft_mask_invalid_ndim"] = 1.0
+            return None, stats
+        if vision_tokens.shape[0] != geometric_tokens.shape[0] or vision_tokens.shape[0] != language_queries.shape[0]:
+            stats["debug/causal_feedback/soft_mask_batch_mismatch"] = 1.0
+            return None, stats
+        if vision_tokens.shape[2] != geometric_tokens.shape[2] or vision_tokens.shape[2] != language_queries.shape[2]:
+            stats["debug/causal_feedback/soft_mask_hidden_mismatch"] = 1.0
+            return None, stats
+        bsz = int(vision_tokens.shape[0])
+        token_n = int(min(vision_tokens.shape[1], geometric_tokens.shape[1]))
+        if token_n <= 0:
+            stats["debug/causal_feedback/soft_mask_empty_tokens"] = 1.0
+            return None, stats
+        vision_tokens = vision_tokens[:, :token_n, :]
+        geometric_tokens = geometric_tokens[:, :token_n, :]
+
+        dtype = language_queries.dtype
+        device = language_queries.device
+        temp = float(max(self.soft_mask_temperature, 1e-6))
+        lam = float(max(0.0, min(1.0, self.soft_mask_lambda)))
+
+        q = F.normalize(language_queries.to(dtype=dtype), dim=-1)
+        v = F.normalize(vision_tokens.to(device=device, dtype=dtype), dim=-1)
+        g = F.normalize(geometric_tokens.to(device=device, dtype=dtype), dim=-1)
+        logits_vis = torch.einsum("blh,bnh->bln", q, v) / temp
+        logits_geo = torch.einsum("blh,bnh->bln", q, g) / temp
+        attn_vis = torch.softmax(logits_vis, dim=-1)
+        attn_geo = torch.softmax(logits_geo, dim=-1)
+
+        query_mask = None
+        if isinstance(language_query_mask, torch.Tensor):
+            qm = language_query_mask.to(device=device, dtype=torch.bool)
+            if qm.ndim == 2 and qm.shape[0] == bsz and qm.shape[1] == language_queries.shape[1]:
+                query_mask = qm
+
+        if query_mask is None:
+            query_weight = torch.full(
+                (bsz, language_queries.shape[1]),
+                1.0 / max(int(language_queries.shape[1]), 1),
+                device=device,
+                dtype=dtype,
+            )
+        else:
+            query_weight = query_mask.to(dtype=dtype)
+            query_weight = query_weight / query_weight.sum(dim=1, keepdim=True).clamp_min(1.0)
+
+        if self.soft_mask_query_agg == "max":
+            if query_mask is not None:
+                mask_expand = query_mask.unsqueeze(-1)
+                attn_vis = attn_vis.masked_fill(~mask_expand, 0.0)
+                attn_geo = attn_geo.masked_fill(~mask_expand, 0.0)
+            alpha_vis = attn_vis.max(dim=1).values
+            alpha_geo = attn_geo.max(dim=1).values
+        else:
+            alpha_vis = torch.sum(attn_vis * query_weight.unsqueeze(-1), dim=1)
+            alpha_geo = torch.sum(attn_geo * query_weight.unsqueeze(-1), dim=1)
+
+        alpha = (1.0 - lam) * alpha_vis + lam * alpha_geo
+        alpha = alpha.clamp_min(0.0)
+        alpha = alpha / alpha.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        alpha = self._maybe_apply_soft_mask_ema(alpha)
+
+        with torch.no_grad():
+            entropy = -torch.sum(alpha * torch.log(alpha.clamp_min(1e-9)), dim=-1)
+            topk = min(int(token_n), 32)
+            topk_mass = alpha.topk(topk, dim=-1).values.sum(dim=-1)
+            stats["debug/causal_feedback/soft_mask_applied"] = 1.0
+            stats["debug/causal_feedback/soft_mask_token_num"] = float(token_n)
+            stats["debug/causal_feedback/soft_mask_entropy"] = float(entropy.mean().item())
+            stats["debug/causal_feedback/soft_mask_topk_mass_32"] = float(topk_mass.mean().item())
+            try:
+                curr_mean = alpha.detach().float().mean(dim=0)
+                prev_mean = self._patha_prev_soft_mask_mean
+                if isinstance(prev_mean, torch.Tensor) and prev_mean.shape == curr_mean.shape:
+                    cos_prev = F.cosine_similarity(
+                        curr_mean.unsqueeze(0),
+                        prev_mean.to(device=curr_mean.device).unsqueeze(0),
+                        dim=-1,
+                    )
+                    stats["debug/causal_feedback/soft_mask_cos_prev"] = float(cos_prev.item())
+                    stats["debug/causal_feedback/soft_mask_cos_prev_available"] = 1.0
+                else:
+                    stats["debug/causal_feedback/soft_mask_cos_prev_available"] = 0.0
+                self._patha_prev_soft_mask_mean = curr_mean.detach().cpu()
+            except Exception:
+                stats["debug/causal_feedback/soft_mask_cos_prev_error"] = 1.0
+        return alpha, stats
+
     def _pool_task_tokens_with_action_context(
         self,
         *,
@@ -533,20 +752,33 @@ class MapAnythingLlava3D_PI(baseframework):
         task_tokens_next: Optional[torch.Tensor],
         action_chunk: Optional[torch.Tensor],
         valid_tk_mask: Optional[torch.Tensor],
-    ) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
+        geometric_tokens: Optional[torch.Tensor] = None,
+        geometric_tokens_next: Optional[torch.Tensor] = None,
+        vision_tokens: Optional[torch.Tensor] = None,
+        language_queries: Optional[torch.Tensor] = None,
+        language_query_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, float], Optional[torch.Tensor]]:
         stats: Dict[str, float] = {
             "debug/causal_feedback/enabled": float(self._causal_feedback_ready),
             "debug/causal_feedback/applied": 0.0,
+            "debug/causal_feedback/residual_mode_token_delta_geo": 1.0
+            if self.patha_residual_mode == "token_delta_geo"
+            else 0.0,
+            "debug/causal_feedback/residual_mode_pooled_delta_z": 1.0
+            if self.patha_residual_mode == "pooled_delta_z"
+            else 0.0,
+            "debug/causal_feedback/residual_mode_used_token_delta_geo": 0.0,
+            "debug/causal_feedback/residual_mode_used_pooled_delta_z": 0.0,
         }
         if not self._causal_feedback_ready:
-            return None, stats
+            return None, stats, None
         if not isinstance(task_tokens, torch.Tensor):
-            return None, stats
+            return None, stats, None
         if not isinstance(task_tokens_next, torch.Tensor):
             stats["debug/causal_feedback/missing_next_tokens"] = 1.0
-            return None, stats
+            return None, stats, None
         if not isinstance(action_chunk, torch.Tensor):
-            return None, stats
+            return None, stats, None
         if task_tokens.shape != task_tokens_next.shape:
             logger.warning(
                 "[causal_feedback] skip due to shape mismatch task=%s next=%s",
@@ -554,14 +786,14 @@ class MapAnythingLlava3D_PI(baseframework):
                 tuple(task_tokens_next.shape),
             )
             stats["debug/causal_feedback/shape_mismatch"] = 1.0
-            return None, stats
+            return None, stats, None
         if task_tokens.ndim != 3:
             logger.warning(
                 "[causal_feedback] skip due to invalid task token ndim=%s",
                 task_tokens.ndim,
             )
             stats["debug/causal_feedback/invalid_task_ndim"] = 1.0
-            return None, stats
+            return None, stats, None
         batch_size, _, hidden = task_tokens.shape
         if hidden != self._causal_feedback_hidden_size:
             logger.warning(
@@ -570,7 +802,7 @@ class MapAnythingLlava3D_PI(baseframework):
                 self._causal_feedback_hidden_size,
             )
             stats["debug/causal_feedback/hidden_mismatch"] = 1.0
-            return None, stats
+            return None, stats, None
         if action_chunk.ndim != 3 or action_chunk.shape[0] != batch_size:
             logger.warning(
                 "[causal_feedback] skip due to invalid action chunk shape=%s batch=%s",
@@ -578,7 +810,7 @@ class MapAnythingLlava3D_PI(baseframework):
                 batch_size,
             )
             stats["debug/causal_feedback/invalid_action_shape"] = 1.0
-            return None, stats
+            return None, stats, None
 
         module_dtype = task_tokens.dtype
         try:
@@ -595,38 +827,119 @@ class MapAnythingLlava3D_PI(baseframework):
         if self.causal_feedback_detach_action:
             action_context = action_context.detach()
 
-        z_before, slot_w_before, used_cond_before = self._pool_task_tokens_with_action_context(
-            task_tokens=task_tokens,
-            action_context=action_context,
-        )
-        z_after, slot_w_after, used_cond_after = self._pool_task_tokens_with_action_context(
-            task_tokens=task_tokens_next,
-            action_context=action_context,
-        )
-        used_action_cond_pool = bool(used_cond_before and used_cond_after)
-        stats["debug/causal_feedback/uses_action_slot_pooling"] = float(
-            hasattr(self.action_model, "pool_task_tokens")
-        )
-        stats["debug/causal_feedback/action_conditioned_pooling"] = 1.0 if used_action_cond_pool else 0.0
+        residual_vec = None
+        residual_vec_target = None
+        delta_tokens_for_stats = None
+        valid = None
+        if (
+            self.causal_feedback_use_valid_mask
+            and isinstance(valid_tk_mask, torch.Tensor)
+            and valid_tk_mask.numel() == batch_size
+        ):
+            valid = valid_tk_mask.to(device=task_tokens.device, dtype=module_dtype).view(-1, 1, 1).clamp(0.0, 1.0)
+            stats["debug/causal_feedback/valid_tk_ratio"] = float((valid > 0.5).float().mean().item())
 
-        if isinstance(slot_w_before, torch.Tensor):
-            with torch.no_grad():
-                entropy = -torch.sum(slot_w_before * torch.log(slot_w_before.clamp_min(1e-9)), dim=1)
-                stats["debug/causal_feedback/slot_entropy_before"] = float(entropy.mean().item())
-        if isinstance(slot_w_after, torch.Tensor):
-            with torch.no_grad():
-                entropy = -torch.sum(slot_w_after * torch.log(slot_w_after.clamp_min(1e-9)), dim=1)
-                stats["debug/causal_feedback/slot_entropy_after"] = float(entropy.mean().item())
+        use_token_delta_geo = bool(self.patha_residual_mode == "token_delta_geo")
+        if use_token_delta_geo:
+            if (
+                isinstance(geometric_tokens, torch.Tensor)
+                and isinstance(geometric_tokens_next, torch.Tensor)
+                and geometric_tokens.ndim == 3
+                and geometric_tokens_next.ndim == 3
+                and geometric_tokens.shape[0] == geometric_tokens_next.shape[0] == batch_size
+                and geometric_tokens.shape[2] == geometric_tokens_next.shape[2] == hidden
+            ):
+                token_n = min(int(geometric_tokens.shape[1]), int(geometric_tokens_next.shape[1]))
+                if (
+                    isinstance(vision_tokens, torch.Tensor)
+                    and vision_tokens.ndim == 3
+                    and vision_tokens.shape[0] == batch_size
+                    and vision_tokens.shape[2] == hidden
+                ):
+                    token_n = min(token_n, int(vision_tokens.shape[1]))
+                if token_n > 0:
+                    geo_before = geometric_tokens[:, :token_n, :].to(device=task_tokens.device, dtype=module_dtype)
+                    geo_after = geometric_tokens_next[:, :token_n, :].to(device=task_tokens.device, dtype=module_dtype)
+                    delta_tokens = geo_after - geo_before
+                    if self.causal_feedback_detach_delta:
+                        delta_tokens = delta_tokens.detach()
+                    alpha, soft_stats = self._build_soft_mask(
+                        vision_tokens=vision_tokens[:, :token_n, :]
+                        if isinstance(vision_tokens, torch.Tensor) and vision_tokens.ndim == 3
+                        else None,
+                        geometric_tokens=geo_before,
+                        language_queries=language_queries,
+                        language_query_mask=language_query_mask,
+                    )
+                    stats.update(soft_stats)
+                    if not isinstance(alpha, torch.Tensor):
+                        alpha = torch.full(
+                            (batch_size, token_n),
+                            1.0 / max(token_n, 1),
+                            device=delta_tokens.device,
+                            dtype=delta_tokens.dtype,
+                        )
+                    else:
+                        alpha = alpha.to(device=delta_tokens.device, dtype=delta_tokens.dtype)
+                        if alpha.shape[0] != batch_size or alpha.shape[1] != token_n:
+                            alpha = torch.full(
+                                (batch_size, token_n),
+                                1.0 / max(token_n, 1),
+                                device=delta_tokens.device,
+                                dtype=delta_tokens.dtype,
+                            )
+                            stats["debug/causal_feedback/soft_mask_shape_mismatch"] = 1.0
+                    if isinstance(valid, torch.Tensor):
+                        delta_tokens = delta_tokens * valid
+                    residual_tokens = delta_tokens * alpha.unsqueeze(-1)
+                    residual_vec = residual_tokens.sum(dim=1)
+                    residual_vec_target = residual_vec
+                    delta_tokens_for_stats = delta_tokens
+                    stats["debug/causal_feedback/residual_mode_used_token_delta_geo"] = 1.0
+                    stats["debug/causal_feedback/residual_token_num"] = float(token_n)
+                else:
+                    stats["debug/causal_feedback/token_delta_geo_empty"] = 1.0
+            else:
+                stats["debug/causal_feedback/token_delta_geo_unavailable"] = 1.0
 
-        delta_z = z_after - z_before
-        if self.causal_feedback_detach_delta:
-            delta_z = delta_z.detach()
+        if residual_vec is None:
+            z_before, slot_w_before, used_cond_before = self._pool_task_tokens_with_action_context(
+                task_tokens=task_tokens,
+                action_context=action_context,
+            )
+            z_after, slot_w_after, used_cond_after = self._pool_task_tokens_with_action_context(
+                task_tokens=task_tokens_next,
+                action_context=action_context,
+            )
+            used_action_cond_pool = bool(used_cond_before and used_cond_after)
+            stats["debug/causal_feedback/uses_action_slot_pooling"] = float(
+                hasattr(self.action_model, "pool_task_tokens")
+            )
+            stats["debug/causal_feedback/action_conditioned_pooling"] = 1.0 if used_action_cond_pool else 0.0
+
+            if isinstance(slot_w_before, torch.Tensor):
+                with torch.no_grad():
+                    entropy = -torch.sum(slot_w_before * torch.log(slot_w_before.clamp_min(1e-9)), dim=1)
+                    stats["debug/causal_feedback/slot_entropy_before"] = float(entropy.mean().item())
+            if isinstance(slot_w_after, torch.Tensor):
+                with torch.no_grad():
+                    entropy = -torch.sum(slot_w_after * torch.log(slot_w_after.clamp_min(1e-9)), dim=1)
+                    stats["debug/causal_feedback/slot_entropy_after"] = float(entropy.mean().item())
+
+            residual_vec = z_after - z_before
+            if self.causal_feedback_detach_delta:
+                residual_vec = residual_vec.detach()
+            if isinstance(valid, torch.Tensor):
+                residual_vec = residual_vec * valid.view(batch_size, 1)
+            residual_vec_target = residual_vec
+            stats["debug/causal_feedback/residual_mode_used_pooled_delta_z"] = 1.0
+
         # Residual direction stability probe: low-frequency cosine between
         # consecutive batch-mean deltas.
         with torch.no_grad():
             try:
                 self._causal_feedback_delta_step += 1
-                curr_delta_mean = delta_z.detach().float().mean(dim=0)
+                curr_delta_mean = residual_vec.detach().float().mean(dim=0)
                 prev_delta_mean = self._causal_feedback_prev_delta_mean
                 should_log_cos = (
                     self.causal_feedback_delta_cos_interval <= 1
@@ -652,9 +965,10 @@ class MapAnythingLlava3D_PI(baseframework):
         # Feedback submodules may stay in fp32 while task tokens can be bf16/fp16
         # during inference eval. Run this branch in module parameter dtype to avoid
         # Float/BFloat16 mismatches (e.g., LayerNorm expected Float).
-        delta_z = delta_z.to(dtype=module_dtype)
+        residual_vec = residual_vec.to(dtype=module_dtype)
+        residual_vec_target = residual_vec_target.to(dtype=module_dtype)
 
-        delta_feat = self.causal_feedback_delta_norm(delta_z)
+        delta_feat = self.causal_feedback_delta_norm(residual_vec)
         action_feat = self.causal_feedback_action_norm(self.causal_feedback_action_proj(action_context))
         fused = torch.cat((delta_feat, action_feat), dim=-1)
         feedback_flat = self.causal_feedback_fuse(fused)
@@ -667,29 +981,32 @@ class MapAnythingLlava3D_PI(baseframework):
         if self.causal_feedback_scale != 1.0:
             feedback_tokens = feedback_tokens * float(self.causal_feedback_scale)
 
-        if (
-            self.causal_feedback_use_valid_mask
-            and isinstance(valid_tk_mask, torch.Tensor)
-            and valid_tk_mask.numel() == batch_size
-        ):
-            valid = valid_tk_mask.to(device=feedback_tokens.device, dtype=feedback_tokens.dtype).view(-1, 1, 1)
-            valid = valid.clamp(0.0, 1.0)
+        if isinstance(valid, torch.Tensor):
+            valid = valid.to(device=feedback_tokens.device, dtype=feedback_tokens.dtype)
             feedback_tokens = feedback_tokens * valid
-            delta_z = delta_z * valid.view(batch_size, 1)
-            stats["debug/causal_feedback/valid_tk_ratio"] = float((valid > 0.5).float().mean().item())
+            residual_vec_target = residual_vec_target * valid.view(batch_size, 1)
 
         # Keep external contract: downstream branches expect feedback aligned to task token dtype.
         feedback_tokens = feedback_tokens.to(dtype=task_tokens.dtype)
+        residual_vec_target = residual_vec_target.to(dtype=task_tokens.dtype)
 
         with torch.no_grad():
+            residual_norm = residual_vec_target.detach().norm(dim=-1)
+            p50, p95 = self._masked_quantiles_1d(
+                residual_norm.view(-1),
+                valid_tk_mask if isinstance(valid_tk_mask, torch.Tensor) else None,
+                quantiles=(0.50, 0.95),
+            )
             stats.update(
                 {
                     "debug/causal_feedback/applied": 1.0,
                     "debug/causal_feedback/token_num": float(feedback_tokens.shape[1]),
                     "debug/causal_feedback/token_hidden": float(feedback_tokens.shape[2]),
                     "debug/causal_feedback/delta_z_norm_mean": float(
-                        delta_z.detach().norm(dim=-1).mean().item()
+                        residual_norm.mean().item()
                     ),
+                    "debug/causal_feedback/delta_z_norm_p50": float(p50 if p50 is not None else 0.0),
+                    "debug/causal_feedback/delta_z_norm_p95": float(p95 if p95 is not None else 0.0),
                     "debug/causal_feedback/token_norm_mean": float(
                         feedback_tokens.detach().norm(dim=-1).mean().item()
                     ),
@@ -698,7 +1015,21 @@ class MapAnythingLlava3D_PI(baseframework):
                     ),
                 }
             )
-        return feedback_tokens, stats
+            if isinstance(delta_tokens_for_stats, torch.Tensor):
+                token_delta_norm = delta_tokens_for_stats.detach().norm(dim=-1)
+                stats["debug/causal_feedback/delta_geo_token_norm_mean"] = float(token_delta_norm.mean().item())
+                token_p50, token_p95 = self._masked_quantiles_1d(
+                    token_delta_norm.mean(dim=-1).view(-1),
+                    valid_tk_mask if isinstance(valid_tk_mask, torch.Tensor) else None,
+                    quantiles=(0.50, 0.95),
+                )
+                stats["debug/causal_feedback/delta_geo_token_norm_p50"] = float(
+                    token_p50 if token_p50 is not None else 0.0
+                )
+                stats["debug/causal_feedback/delta_geo_token_norm_p95"] = float(
+                    token_p95 if token_p95 is not None else 0.0
+                )
+        return feedback_tokens, stats, residual_vec_target
 
     def _compute_causal_feedback_aux_loss(
         self,
@@ -708,6 +1039,7 @@ class MapAnythingLlava3D_PI(baseframework):
         task_tokens_next: Optional[torch.Tensor],
         valid_tk_mask: Optional[torch.Tensor],
         action_chunk: Optional[torch.Tensor] = None,
+        residual_target: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
         stats: Dict[str, float] = {
             "debug/causal_feedback/loss_fb_enabled": float(
@@ -742,34 +1074,40 @@ class MapAnythingLlava3D_PI(baseframework):
             stats["debug/causal_feedback/loss_fb_batch_mismatch"] = 1.0
             return None, stats
 
-        action_context = None
-        if isinstance(action_chunk, torch.Tensor):
-            try:
-                if action_chunk.ndim == 3 and action_chunk.shape[0] == task_tokens.shape[0]:
-                    if hasattr(self.action_model, "build_world_action_context"):
-                        action_context = self.action_model.build_world_action_context(action_chunk)
+        delta_z_target = None
+        if isinstance(residual_target, torch.Tensor):
+            delta_z_target = residual_target
+            stats["debug/causal_feedback/loss_fb_target_from_residual"] = 1.0
+        else:
+            action_context = None
+            if isinstance(action_chunk, torch.Tensor):
+                try:
+                    if action_chunk.ndim == 3 and action_chunk.shape[0] == task_tokens.shape[0]:
+                        if hasattr(self.action_model, "build_world_action_context"):
+                            action_context = self.action_model.build_world_action_context(action_chunk)
+                        else:
+                            action_context = action_chunk.mean(dim=1)
+                        if self.causal_feedback_detach_action and isinstance(action_context, torch.Tensor):
+                            action_context = action_context.detach()
                     else:
-                        action_context = action_chunk.mean(dim=1)
-                    if self.causal_feedback_detach_action and isinstance(action_context, torch.Tensor):
-                        action_context = action_context.detach()
-                else:
-                    stats["debug/causal_feedback/loss_fb_action_shape_mismatch"] = 1.0
-            except Exception:
-                stats["debug/causal_feedback/loss_fb_action_context_error"] = 1.0
-                action_context = None
+                        stats["debug/causal_feedback/loss_fb_action_shape_mismatch"] = 1.0
+                except Exception:
+                    stats["debug/causal_feedback/loss_fb_action_context_error"] = 1.0
+                    action_context = None
 
-        z_before, _, used_cond_before = self._pool_task_tokens_with_action_context(
-            task_tokens=task_tokens,
-            action_context=action_context,
-        )
-        z_after, _, used_cond_after = self._pool_task_tokens_with_action_context(
-            task_tokens=task_tokens_next,
-            action_context=action_context,
-        )
-        stats["debug/causal_feedback/loss_fb_action_conditioned_pooling"] = float(
-            used_cond_before and used_cond_after
-        )
-        delta_z_target = z_after - z_before
+            z_before, _, used_cond_before = self._pool_task_tokens_with_action_context(
+                task_tokens=task_tokens,
+                action_context=action_context,
+            )
+            z_after, _, used_cond_after = self._pool_task_tokens_with_action_context(
+                task_tokens=task_tokens_next,
+                action_context=action_context,
+            )
+            stats["debug/causal_feedback/loss_fb_action_conditioned_pooling"] = float(
+                used_cond_before and used_cond_after
+            )
+            delta_z_target = z_after - z_before
+            stats["debug/causal_feedback/loss_fb_target_from_residual"] = 0.0
         if self.causal_feedback_aux_detach_target:
             delta_z_target = delta_z_target.detach()
 
@@ -845,7 +1183,12 @@ class MapAnythingLlava3D_PI(baseframework):
         else:
             state = None
         has_temporal_images = any("image_tk" in example for example in examples)
-        valid_tk_values = [float(example.get("valid_tk", 1.0)) for example in examples]
+        valid_tk_values = []
+        for example in examples:
+            try:
+                valid_tk_values.append(float(example.get("valid_tk", 1.0)))
+            except Exception:
+                valid_tk_values.append(1.0)
         configured_task_token_num = None
         try:
             ma_cfg = getattr(getattr(self.config, "framework", None), "mapanything_llava3d", None)
@@ -881,6 +1224,12 @@ class MapAnythingLlava3D_PI(baseframework):
         vlm_t_timer = self._start_step_timer()
         task_tokens_next = None
         valid_tk_tensor = None
+        geometric_tokens = None
+        geometric_tokens_next = None
+        vision_tokens = None
+        vision_tokens_next = None
+        language_queries = None
+        language_query_mask = None
         with torch.autocast("cuda", dtype=torch.bfloat16):
             vlm_outputs = self.mapanythingllava3d_vlm_interface(
                 **vlm_inputs,
@@ -914,6 +1263,18 @@ class MapAnythingLlava3D_PI(baseframework):
                         f"`task_hidden_states` token count mismatch: got K={task_tokens.shape[1]}, "
                         f"expected configured K={configured_task_token_num}"
                     )
+            geom_out = getattr(vlm_outputs, "geometric_hidden_states", None)
+            if isinstance(geom_out, torch.Tensor):
+                geometric_tokens = geom_out.to(device=base_hidden.device, dtype=base_hidden.dtype)
+            vis_out = getattr(vlm_outputs, "vision_hidden_states", None)
+            if isinstance(vis_out, torch.Tensor):
+                vision_tokens = vis_out.to(device=base_hidden.device, dtype=base_hidden.dtype)
+            lang_q_out = getattr(vlm_outputs, "language_queries", None)
+            if isinstance(lang_q_out, torch.Tensor):
+                language_queries = lang_q_out.to(device=base_hidden.device, dtype=base_hidden.dtype)
+            lang_q_mask_out = getattr(vlm_outputs, "language_query_mask", None)
+            if isinstance(lang_q_mask_out, torch.Tensor):
+                language_query_mask = lang_q_mask_out.to(device=base_hidden.device, dtype=torch.bool)
             attention_mask = vlm_inputs.get("attention_mask", None)
             if isinstance(attention_mask, torch.Tensor):
                 attention_mask = attention_mask.to(device=base_hidden.device)
@@ -933,6 +1294,22 @@ class MapAnythingLlava3D_PI(baseframework):
                 except Exception:
                     debug_metrics = debug_metrics
                 vlm_core = getattr(self.mapanythingllava3d_vlm_interface, "model", None)
+                if geometric_tokens is None:
+                    geo_cached = getattr(vlm_core, "_last_geometric_projected", None)
+                    if isinstance(geo_cached, torch.Tensor):
+                        geometric_tokens = geo_cached.to(device=base_hidden.device, dtype=base_hidden.dtype)
+                if vision_tokens is None:
+                    vis_cached = getattr(vlm_core, "_last_vision_features", None)
+                    if isinstance(vis_cached, torch.Tensor):
+                        vision_tokens = vis_cached.to(device=base_hidden.device, dtype=base_hidden.dtype)
+                if language_queries is None:
+                    lang_q_cached = getattr(vlm_core, "_last_language_queries", None)
+                    if isinstance(lang_q_cached, torch.Tensor):
+                        language_queries = lang_q_cached.to(device=base_hidden.device, dtype=base_hidden.dtype)
+                if language_query_mask is None:
+                    lang_qm_cached = getattr(vlm_core, "_last_language_query_mask", None)
+                    if isinstance(lang_qm_cached, torch.Tensor):
+                        language_query_mask = lang_qm_cached.to(device=base_hidden.device, dtype=torch.bool)
                 geom_stats = getattr(vlm_core, "geom_feature_stats", None)
                 geom_model_forward_ms = getattr(vlm_core, "debug_last_geom_model_forward_ms", None)
                 geom_feature_extract_ms = getattr(vlm_core, "debug_last_geom_feature_extract_ms", None)
@@ -1073,6 +1450,18 @@ class MapAnythingLlava3D_PI(baseframework):
                             )
                     vlm_tk_ms = self._stop_step_timer(vlm_tk_timer, reference=base_hidden)
                     task_tokens_next = getattr(vlm_outputs_next, "task_hidden_states", None)
+                    geom_out_next = getattr(vlm_outputs_next, "geometric_hidden_states", None)
+                    if isinstance(geom_out_next, torch.Tensor):
+                        geometric_tokens_next = geom_out_next.to(
+                            device=base_hidden.device,
+                            dtype=base_hidden.dtype,
+                        )
+                    vis_out_next = getattr(vlm_outputs_next, "vision_hidden_states", None)
+                    if isinstance(vis_out_next, torch.Tensor):
+                        vision_tokens_next = vis_out_next.to(
+                            device=base_hidden.device,
+                            dtype=base_hidden.dtype,
+                        )
                     if isinstance(task_tokens_next, torch.Tensor):
                         task_tokens_next = task_tokens_next.to(
                             device=base_hidden.device,
@@ -1088,6 +1477,8 @@ class MapAnythingLlava3D_PI(baseframework):
                                 f"{tuple(task_tokens_next.shape)} vs {tuple(task_tokens.shape)}; drop next tokens."
                             )
                             task_tokens_next = None
+                            geometric_tokens_next = None
+                            vision_tokens_next = None
                         if (
                             isinstance(task_tokens, torch.Tensor)
                             and isinstance(task_tokens_next, torch.Tensor)
@@ -1102,9 +1493,27 @@ class MapAnythingLlava3D_PI(baseframework):
                                 tuple(task_tokens_next.shape),
                             )
                             task_tokens_next = None
+                            geometric_tokens_next = None
+                            vision_tokens_next = None
+                    if geometric_tokens_next is None:
+                        geo_cached_next = getattr(self.mapanythingllava3d_vlm_interface.model, "_last_geometric_projected", None)
+                        if isinstance(geo_cached_next, torch.Tensor):
+                            geometric_tokens_next = geo_cached_next.to(
+                                device=base_hidden.device,
+                                dtype=base_hidden.dtype,
+                            )
+                    if vision_tokens_next is None:
+                        vis_cached_next = getattr(self.mapanythingllava3d_vlm_interface.model, "_last_vision_features", None)
+                        if isinstance(vis_cached_next, torch.Tensor):
+                            vision_tokens_next = vis_cached_next.to(
+                                device=base_hidden.device,
+                                dtype=base_hidden.dtype,
+                            )
                 except Exception as exc:
                     logger.warning(f"[temporal_supervision] failed to build next-step task tokens: {exc}")
                     task_tokens_next = None
+                    geometric_tokens_next = None
+                    vision_tokens_next = None
                 temporal_sync_ms = self._stop_step_timer(sync_timer, reference=base_hidden)
                 debug_metrics["debug/timing/tk_fastpath_used"] = float(tk_fastpath_used)
 
@@ -1112,6 +1521,18 @@ class MapAnythingLlava3D_PI(baseframework):
             debug_metrics["debug/temporal/valid_tk_ratio"] = float(valid_tk_tensor.mean().item())
             debug_metrics["debug/temporal/task_tokens_next_available"] = float(
                 isinstance(task_tokens_next, torch.Tensor)
+            )
+            debug_metrics["debug/temporal/geo_tokens_available"] = float(
+                isinstance(geometric_tokens, torch.Tensor)
+            )
+            debug_metrics["debug/temporal/geo_tokens_next_available"] = float(
+                isinstance(geometric_tokens_next, torch.Tensor)
+            )
+            debug_metrics["debug/temporal/vision_tokens_available"] = float(
+                isinstance(vision_tokens, torch.Tensor)
+            )
+            debug_metrics["debug/temporal/language_queries_available"] = float(
+                isinstance(language_queries, torch.Tensor)
             )
             if isinstance(task_tokens, torch.Tensor):
                 debug_metrics["debug/temporal/task_token_num"] = float(task_tokens.shape[1])
@@ -1160,6 +1581,21 @@ class MapAnythingLlava3D_PI(baseframework):
             task_tokens_next_repeated = None
             if isinstance(task_tokens_next, torch.Tensor):
                 task_tokens_next_repeated = task_tokens_next.repeat(repeated_diffusion_steps, 1, 1)
+            geometric_tokens_repeated = None
+            if isinstance(geometric_tokens, torch.Tensor):
+                geometric_tokens_repeated = geometric_tokens.repeat(repeated_diffusion_steps, 1, 1)
+            geometric_tokens_next_repeated = None
+            if isinstance(geometric_tokens_next, torch.Tensor):
+                geometric_tokens_next_repeated = geometric_tokens_next.repeat(repeated_diffusion_steps, 1, 1)
+            vision_tokens_repeated = None
+            if isinstance(vision_tokens, torch.Tensor):
+                vision_tokens_repeated = vision_tokens.repeat(repeated_diffusion_steps, 1, 1)
+            language_queries_repeated = None
+            if isinstance(language_queries, torch.Tensor):
+                language_queries_repeated = language_queries.repeat(repeated_diffusion_steps, 1, 1)
+            language_query_mask_repeated = None
+            if isinstance(language_query_mask, torch.Tensor):
+                language_query_mask_repeated = language_query_mask.repeat(repeated_diffusion_steps, 1)
             attention_mask_repeated = None
             if isinstance(attention_mask, torch.Tensor):
                 attention_mask_repeated = attention_mask.repeat(repeated_diffusion_steps, 1)
@@ -1177,7 +1613,18 @@ class MapAnythingLlava3D_PI(baseframework):
                     task_tokens_next_repeated,
                     task_tokens_repeated.detach(),
                 )
+                if (
+                    isinstance(geometric_tokens_repeated, torch.Tensor)
+                    and isinstance(geometric_tokens_next_repeated, torch.Tensor)
+                    and geometric_tokens_repeated.shape == geometric_tokens_next_repeated.shape
+                ):
+                    geometric_tokens_next_repeated = torch.where(
+                        valid_mask,
+                        geometric_tokens_next_repeated,
+                        geometric_tokens_repeated.detach(),
+                    )
             feedback_tokens_repeated = None
+            residual_target_repeated = None
             feedback_stats = {}
             feedback_aux_loss = None
             feedback_aux_stats = {}
@@ -1194,11 +1641,16 @@ class MapAnythingLlava3D_PI(baseframework):
                 1.0 if feedback_disable_aux_loss else 0.0
             )
             if self._causal_feedback_ready:
-                feedback_tokens_repeated, feedback_stats = self._build_causal_feedback_tokens(
+                feedback_tokens_repeated, feedback_stats, residual_target_repeated = self._build_causal_feedback_tokens(
                     task_tokens=task_tokens_repeated,
                     task_tokens_next=task_tokens_next_repeated,
                     action_chunk=actions_target_repeated,
                     valid_tk_mask=valid_tk_repeated,
+                    geometric_tokens=geometric_tokens_repeated,
+                    geometric_tokens_next=geometric_tokens_next_repeated,
+                    vision_tokens=vision_tokens_repeated,
+                    language_queries=language_queries_repeated,
+                    language_query_mask=language_query_mask_repeated,
                 )
                 debug_metrics.update(feedback_stats)
                 feedback_tokens_repeated, feedback_ablation_stats = self._apply_feedback_ablation(
@@ -1213,6 +1665,7 @@ class MapAnythingLlava3D_PI(baseframework):
                     task_tokens_next=task_tokens_next_repeated,
                     valid_tk_mask=valid_tk_repeated,
                     action_chunk=actions_target_repeated,
+                    residual_target=residual_target_repeated,
                 )
                 debug_metrics.update(feedback_aux_stats)
 
@@ -1347,11 +1800,23 @@ class MapAnythingLlava3D_PI(baseframework):
         batch_images = [to_pil_preserve(example["image"]) for example in examples]
         instructions = [example["lang"] for example in examples]
         state = [example["state"] for example in examples] if "state" in examples[0] else None
+        valid_tk_values = []
+        for example in examples:
+            try:
+                valid_tk_values.append(float(example.get("valid_tk", 1.0)))
+            except Exception:
+                valid_tk_values.append(1.0)
         deterministic_seed = kwargs.get("deterministic_seed", None)
         return_debug_info = self._parse_bool_flag(kwargs.get("return_debug_info", False), default=False)
         return_feedback_tokens = self._parse_bool_flag(
             kwargs.get("return_feedback_tokens", False), default=False
         )
+        requested_infer_steps = None
+        if kwargs.get("num_ddim_steps", None) is not None:
+            try:
+                requested_infer_steps = max(1, int(kwargs.get("num_ddim_steps")))
+            except Exception:
+                requested_infer_steps = None
         request_reset_state = self._parse_bool_flag(kwargs.get("reset_inference_state", False), default=False)
         if request_reset_state:
             self.reset_inference_state()
@@ -1395,6 +1860,35 @@ class MapAnythingLlava3D_PI(baseframework):
             task_tokens = getattr(vlm_outputs, "task_hidden_states", None)
             if isinstance(task_tokens, torch.Tensor):
                 task_tokens = task_tokens.to(device=base_hidden.device, dtype=base_hidden.dtype)
+            geometric_tokens = getattr(vlm_outputs, "geometric_hidden_states", None)
+            if isinstance(geometric_tokens, torch.Tensor):
+                geometric_tokens = geometric_tokens.to(device=base_hidden.device, dtype=base_hidden.dtype)
+            vision_tokens = getattr(vlm_outputs, "vision_hidden_states", None)
+            if isinstance(vision_tokens, torch.Tensor):
+                vision_tokens = vision_tokens.to(device=base_hidden.device, dtype=base_hidden.dtype)
+            language_queries = getattr(vlm_outputs, "language_queries", None)
+            if isinstance(language_queries, torch.Tensor):
+                language_queries = language_queries.to(device=base_hidden.device, dtype=base_hidden.dtype)
+            language_query_mask = getattr(vlm_outputs, "language_query_mask", None)
+            if isinstance(language_query_mask, torch.Tensor):
+                language_query_mask = language_query_mask.to(device=base_hidden.device, dtype=torch.bool)
+            vlm_core = getattr(self.mapanythingllava3d_vlm_interface, "model", None)
+            if geometric_tokens is None:
+                geo_cached = getattr(vlm_core, "_last_geometric_projected", None)
+                if isinstance(geo_cached, torch.Tensor):
+                    geometric_tokens = geo_cached.to(device=base_hidden.device, dtype=base_hidden.dtype)
+            if vision_tokens is None:
+                vis_cached = getattr(vlm_core, "_last_vision_features", None)
+                if isinstance(vis_cached, torch.Tensor):
+                    vision_tokens = vis_cached.to(device=base_hidden.device, dtype=base_hidden.dtype)
+            if language_queries is None:
+                lang_q_cached = getattr(vlm_core, "_last_language_queries", None)
+                if isinstance(lang_q_cached, torch.Tensor):
+                    language_queries = lang_q_cached.to(device=base_hidden.device, dtype=base_hidden.dtype)
+            if language_query_mask is None:
+                lang_qm_cached = getattr(vlm_core, "_last_language_query_mask", None)
+                if isinstance(lang_qm_cached, torch.Tensor):
+                    language_query_mask = lang_qm_cached.to(device=base_hidden.device, dtype=torch.bool)
             force_replan = False
             rrr_entry = None
             if (
@@ -1884,6 +2378,11 @@ class MapAnythingLlava3D_PI(baseframework):
         vlm_forward_ms = float((time.perf_counter() - vlm_t0) * 1000.0)
 
         state_tensor = torch.from_numpy(np.array(state)).to(base_hidden.device, dtype=base_hidden.dtype) if state is not None else None
+        valid_tk_tensor = torch.tensor(
+            valid_tk_values,
+            device=base_hidden.device,
+            dtype=base_hidden.dtype,
+        ).view(-1)
         feedback_tokens = kwargs.get("feedback_tokens", None)
         if feedback_tokens is not None:
             if not isinstance(feedback_tokens, torch.Tensor):
@@ -1917,6 +2416,30 @@ class MapAnythingLlava3D_PI(baseframework):
                 device=task_tokens.device,
                 dtype=task_tokens.dtype,
             )
+            prev_geo = None
+            if isinstance(self._patha_prev_geo_tokens, torch.Tensor):
+                prev_geo = self._patha_prev_geo_tokens.to(
+                    device=task_tokens.device,
+                    dtype=task_tokens.dtype,
+                )
+            prev_vis = None
+            if isinstance(self._patha_prev_vision_tokens, torch.Tensor):
+                prev_vis = self._patha_prev_vision_tokens.to(
+                    device=task_tokens.device,
+                    dtype=task_tokens.dtype,
+                )
+            prev_lang_q = None
+            if isinstance(self._patha_prev_language_queries, torch.Tensor):
+                prev_lang_q = self._patha_prev_language_queries.to(
+                    device=task_tokens.device,
+                    dtype=task_tokens.dtype,
+                )
+            prev_lang_q_mask = None
+            if isinstance(self._patha_prev_language_query_mask, torch.Tensor):
+                prev_lang_q_mask = self._patha_prev_language_query_mask.to(
+                    device=task_tokens.device,
+                    dtype=torch.bool,
+                )
             prev_actions = self._patha_prev_action_chunk.to(
                 device=task_tokens.device,
                 dtype=task_tokens.dtype,
@@ -1931,19 +2454,54 @@ class MapAnythingLlava3D_PI(baseframework):
                     prev_actions = prev_actions.expand(task_tokens.shape[0], -1, -1)
                 else:
                     prev_task = None
+            if isinstance(prev_task, torch.Tensor) and isinstance(prev_geo, torch.Tensor) and prev_geo.shape[0] != task_tokens.shape[0]:
+                if prev_geo.shape[0] == 1:
+                    prev_geo = prev_geo.expand(task_tokens.shape[0], -1, -1)
+                else:
+                    prev_geo = None
+            if isinstance(prev_task, torch.Tensor) and isinstance(prev_vis, torch.Tensor) and prev_vis.shape[0] != task_tokens.shape[0]:
+                if prev_vis.shape[0] == 1:
+                    prev_vis = prev_vis.expand(task_tokens.shape[0], -1, -1)
+                else:
+                    prev_vis = None
+            if isinstance(prev_task, torch.Tensor) and isinstance(prev_lang_q, torch.Tensor) and prev_lang_q.shape[0] != task_tokens.shape[0]:
+                if prev_lang_q.shape[0] == 1:
+                    prev_lang_q = prev_lang_q.expand(task_tokens.shape[0], -1, -1)
+                else:
+                    prev_lang_q = None
+            if (
+                isinstance(prev_task, torch.Tensor)
+                and isinstance(prev_lang_q_mask, torch.Tensor)
+                and prev_lang_q_mask.shape[0] != task_tokens.shape[0]
+            ):
+                if prev_lang_q_mask.shape[0] == 1:
+                    prev_lang_q_mask = prev_lang_q_mask.expand(task_tokens.shape[0], -1)
+                else:
+                    prev_lang_q_mask = None
             if isinstance(prev_task, torch.Tensor):
                 token_n = min(task_tokens.shape[1], prev_task.shape[1])
                 if token_n > 0:
-                    valid_mask = torch.ones(
-                        (task_tokens.shape[0],),
-                        device=task_tokens.device,
-                        dtype=task_tokens.dtype,
-                    )
-                    feedback_tokens, patha_auto_stats = self._build_causal_feedback_tokens(
+                    if isinstance(valid_tk_tensor, torch.Tensor) and valid_tk_tensor.numel() == task_tokens.shape[0]:
+                        valid_mask = valid_tk_tensor.to(
+                            device=task_tokens.device,
+                            dtype=task_tokens.dtype,
+                        ).clamp(0.0, 1.0)
+                    else:
+                        valid_mask = torch.ones(
+                            (task_tokens.shape[0],),
+                            device=task_tokens.device,
+                            dtype=task_tokens.dtype,
+                        )
+                    feedback_tokens, patha_auto_stats, _ = self._build_causal_feedback_tokens(
                         task_tokens=prev_task[:, :token_n, :],
                         task_tokens_next=task_tokens[:, :token_n, :],
                         action_chunk=prev_actions,
                         valid_tk_mask=valid_mask,
+                        geometric_tokens=prev_geo,
+                        geometric_tokens_next=geometric_tokens,
+                        vision_tokens=prev_vis if isinstance(prev_vis, torch.Tensor) else vision_tokens,
+                        language_queries=prev_lang_q if isinstance(prev_lang_q, torch.Tensor) else language_queries,
+                        language_query_mask=prev_lang_q_mask if isinstance(prev_lang_q_mask, torch.Tensor) else language_query_mask,
                     )
                     if isinstance(feedback_tokens, torch.Tensor):
                         feedback_source = "auto_path_a"
@@ -1963,6 +2521,8 @@ class MapAnythingLlava3D_PI(baseframework):
             feedback_tokens = feedback_tokens.to(device=action_device, dtype=action_dtype)
         if isinstance(state_tensor, torch.Tensor):
             state_tensor = state_tensor.to(device=action_device, dtype=action_dtype)
+        if isinstance(valid_tk_tensor, torch.Tensor):
+            valid_tk_tensor = valid_tk_tensor.to(device=action_device, dtype=action_dtype)
         if isinstance(attention_mask, torch.Tensor):
             attention_mask = attention_mask.to(device=action_device)
 
@@ -1981,6 +2541,8 @@ class MapAnythingLlava3D_PI(baseframework):
                 encoder_attention_mask=attention_mask,
                 task_tokens=task_tokens,
                 feedback_tokens=feedback_tokens,
+                valid_tk=valid_tk_tensor,
+                num_inference_timesteps=requested_infer_steps,
                 force_replan=force_replan,
                 rrr_threshold=self.rrr_replan_threshold,
                 return_info=True,
@@ -1998,6 +2560,14 @@ class MapAnythingLlava3D_PI(baseframework):
         if isinstance(task_tokens, torch.Tensor):
             self._rrr_prev_observed_task_tokens = task_tokens.detach()
             self._patha_prev_task_tokens = task_tokens.detach()
+        if isinstance(geometric_tokens, torch.Tensor):
+            self._patha_prev_geo_tokens = geometric_tokens.detach()
+        if isinstance(vision_tokens, torch.Tensor):
+            self._patha_prev_vision_tokens = vision_tokens.detach()
+        if isinstance(language_queries, torch.Tensor):
+            self._patha_prev_language_queries = language_queries.detach()
+        if isinstance(language_query_mask, torch.Tensor):
+            self._patha_prev_language_query_mask = language_query_mask.detach()
         pred_task_tokens = planning_info.get("predicted_task_tokens", None) if isinstance(planning_info, dict) else None
         if isinstance(pred_task_tokens, torch.Tensor):
             self._rrr_prev_predicted_task_tokens = pred_task_tokens.detach()
@@ -2113,6 +2683,7 @@ class MapAnythingLlava3D_PI(baseframework):
             debug_info["path_a_feedback/enabled"] = float(
                 self._causal_feedback_ready and self.enable_causal_feedback_inference
             )
+            debug_info["path_a_feedback/applied"] = 1.0 if isinstance(feedback_tokens, torch.Tensor) else 0.0
             if isinstance(feedback_tokens, torch.Tensor):
                 debug_info["path_a_feedback/token_num"] = int(feedback_tokens.shape[1])
                 debug_info["path_a_feedback/token_norm_mean"] = float(
@@ -2124,6 +2695,19 @@ class MapAnythingLlava3D_PI(baseframework):
                 for k, v in patha_auto_stats.items():
                     if isinstance(k, str) and k.startswith("debug/causal_feedback/") and isinstance(v, (int, float)):
                         debug_info[f"path_a_feedback/{k.split('debug/causal_feedback/', 1)[-1]}"] = float(v)
+            if isinstance(planning_info, dict):
+                gate_mean = planning_info.get("feedback/delta_action_gate_mean", None)
+                eff_norm = planning_info.get("feedback/delta_action_effective_norm_mean", None)
+                valid_ratio = planning_info.get("feedback/valid_tk_ratio", None)
+                infer_steps_used = planning_info.get("feedback/num_inference_timesteps_used", None)
+                if isinstance(gate_mean, (int, float)):
+                    debug_info["path_a_feedback/delta_action_gate_mean"] = float(gate_mean)
+                if isinstance(eff_norm, (int, float)):
+                    debug_info["path_a_feedback/delta_action_effective_norm_mean"] = float(eff_norm)
+                if isinstance(valid_ratio, (int, float)):
+                    debug_info["path_a_feedback/valid_tk_ratio"] = float(valid_ratio)
+                if isinstance(infer_steps_used, (int, float)):
+                    debug_info["timing/num_inference_timesteps_used"] = float(infer_steps_used)
             # Derived from action-head timing, exposed here for single-place monitoring.
             debug_info["timing/flow_total_ms_agg"] = float(flow_total_ms)
             debug_info["timing/flow_step_ms_mean_agg"] = float(flow_step_ms_mean)

@@ -29,6 +29,10 @@ class MapAnythingLlava3DOutput(ModelOutput):
     attentions: Optional[Tuple[torch.FloatTensor]] = None
     image_hidden_states: Optional[torch.FloatTensor] = None
     task_hidden_states: Optional[torch.FloatTensor] = None
+    geometric_hidden_states: Optional[torch.FloatTensor] = None
+    vision_hidden_states: Optional[torch.FloatTensor] = None
+    language_queries: Optional[torch.FloatTensor] = None
+    language_query_mask: Optional[torch.Tensor] = None
 
 
 class MapAnythingLlava3DPreTrainedModel(PreTrainedModel):
@@ -185,6 +189,10 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
         self._last_geometric_projected: Optional[torch.Tensor] = None
         self._last_vision_features: Optional[torch.Tensor] = None
         self._last_fused_features: Optional[torch.Tensor] = None
+        self._last_image_features: Optional[torch.Tensor] = None
+        self._last_task_tokens: Optional[torch.Tensor] = None
+        self._last_language_queries: Optional[torch.Tensor] = None
+        self._last_language_query_mask: Optional[torch.Tensor] = None
 
     def _infer_geom_dim(self) -> int:
         mam = getattr(self.geometric_model, "map_anything_model", None)
@@ -736,6 +744,10 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
                 attentions=None,
                 image_hidden_states=outputs.image_hidden_states,
                 task_hidden_states=outputs.task_hidden_states,
+                geometric_hidden_states=outputs.geometric_hidden_states,
+                vision_hidden_states=outputs.vision_hidden_states,
+                language_queries=outputs.language_queries,
+                language_query_mask=outputs.language_query_mask,
             )
 
         embed = self.get_input_embeddings()
@@ -772,6 +784,8 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
                 attention_mask=attention_mask,
                 image_token_index=spatial_img_id,
             )
+            self._last_language_queries = language_queries
+            self._last_language_query_mask = language_query_mask
             image_features = self.get_image_features(
                 pixel_values,
                 intrinsic,
@@ -794,6 +808,10 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
             attentions=None,
             image_hidden_states=image_features if pixel_values is not None else None,
             task_hidden_states=task_tokens if pixel_values is not None else None,
+            geometric_hidden_states=self._last_geometric_projected if pixel_values is not None else None,
+            vision_hidden_states=self._last_vision_features if pixel_values is not None else None,
+            language_queries=self._last_language_queries if pixel_values is not None else None,
+            language_query_mask=self._last_language_query_mask if pixel_values is not None else None,
         )
 
         
@@ -858,6 +876,8 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
                 attention_mask=attention_mask,
                 image_token_index=spatial_img_id,
             )
+            self._last_language_queries = language_queries
+            self._last_language_query_mask = language_query_mask
             image_features = self.get_image_features(
                 pixel_values,
                 intrinsic,
@@ -992,6 +1012,10 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
             attentions=outputs.attentions,
             image_hidden_states=image_features if pixel_values is not None else None,
             task_hidden_states=task_tokens if pixel_values is not None else None,
+            geometric_hidden_states=self._last_geometric_projected if pixel_values is not None else None,
+            vision_hidden_states=self._last_vision_features if pixel_values is not None else None,
+            language_queries=self._last_language_queries if pixel_values is not None else None,
+            language_query_mask=self._last_language_query_mask if pixel_values is not None else None,
         )
 
     def prepare_inputs_for_generation(

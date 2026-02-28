@@ -922,24 +922,42 @@ class VLATrainer(TrainerUtils):
 
         examples_t = self._clone_examples_for_temporal_view(examples, use_tk=False)
         examples_tk = self._clone_examples_for_temporal_view(examples, use_tk=True)
+        seed_base = int(getattr(self.config, "seed", 0)) + int(self.completed_steps)
+        metrics["debug/patha_sanity/eval_seed_base"] = float(seed_base)
+        metrics["debug/patha_sanity/protocol_temporal_t_to_tk"] = 1.0
 
-        # Step-1 fix: evaluate Path-A in temporal order t -> t+k.
-        _ = self.model.predict_action(
-            examples=examples_t,
-            use_ddim=True,
-            num_ddim_steps=num_ddim_steps,
-            reset_inference_state=True,
-        )
-        output_auto = self.model.predict_action(
-            examples=examples_tk,
-            use_ddim=True,
-            num_ddim_steps=num_ddim_steps,
-            reset_inference_state=False,
-            return_feedback_tokens=True,
-            return_debug_info=False,
-        )
+        def _predict_temporal_tk(
+            *,
+            feedback_tokens_override: Optional[np.ndarray] = None,
+            return_feedback_tokens: bool = False,
+        ) -> Dict[str, np.ndarray]:
+            _ = self.model.predict_action(
+                examples=examples_t,
+                use_ddim=True,
+                num_ddim_steps=num_ddim_steps,
+                reset_inference_state=True,
+                deterministic_seed=seed_base,
+            )
+            kwargs = {
+                "examples": examples_tk,
+                "use_ddim": True,
+                "num_ddim_steps": num_ddim_steps,
+                "reset_inference_state": False,
+                "deterministic_seed": seed_base + 1,
+            }
+            if feedback_tokens_override is not None:
+                kwargs["feedback_tokens"] = feedback_tokens_override
+            if return_feedback_tokens:
+                kwargs["return_feedback_tokens"] = True
+                kwargs["return_debug_info"] = False
+            return self.model.predict_action(**kwargs)
+
+        # Temporal protocol: always evaluate t -> t+k with identical reset semantics.
+        output_auto = _predict_temporal_tk(return_feedback_tokens=True)
         pred_auto = np.asarray(output_auto["normalized_actions"], dtype=np.float32)
-        metrics["mse_score_patha"] = self._compute_masked_mse(pred_auto, actions_tk, valid_mask=valid_tk)
+        mse_auto = self._compute_masked_mse(pred_auto, actions_tk, valid_mask=valid_tk)
+        metrics["mse_score_patha"] = float(mse_auto)  # legacy key for dashboards
+        metrics["debug/patha_sanity/mse_temporal_auto"] = float(mse_auto)
 
         if isinstance(valid_tk, np.ndarray):
             valid_ratio = float(np.asarray(valid_tk, dtype=np.float32).mean())
@@ -955,45 +973,29 @@ class VLATrainer(TrainerUtils):
             return metrics
 
         feedback_tokens = np.asarray(feedback_tokens, dtype=np.float32)
-        output_ext_none = self.model.predict_action(
-            examples=examples_tk,
-            use_ddim=True,
-            num_ddim_steps=num_ddim_steps,
-            reset_inference_state=True,
-            feedback_tokens=feedback_tokens,
-        )
+        output_ext_none = _predict_temporal_tk(feedback_tokens_override=feedback_tokens)
         pred_ext_none = np.asarray(output_ext_none["normalized_actions"], dtype=np.float32)
         mse_ext_none = self._compute_masked_mse(pred_ext_none, actions_tk, valid_mask=valid_tk)
         metrics["debug/patha_sanity/mse_ext_feedback_none"] = float(mse_ext_none)
+        metrics["debug/patha_sanity/mse_temporal_ext_none"] = float(mse_ext_none)
 
         zero_feedback = np.zeros_like(feedback_tokens, dtype=np.float32)
-        output_ext_zero = self.model.predict_action(
-            examples=examples_tk,
-            use_ddim=True,
-            num_ddim_steps=num_ddim_steps,
-            reset_inference_state=True,
-            feedback_tokens=zero_feedback,
-        )
+        output_ext_zero = _predict_temporal_tk(feedback_tokens_override=zero_feedback)
         pred_ext_zero = np.asarray(output_ext_zero["normalized_actions"], dtype=np.float32)
         mse_ext_zero = self._compute_masked_mse(pred_ext_zero, actions_tk, valid_mask=valid_tk)
         metrics["debug/patha_sanity/mse_ext_feedback_zero"] = float(mse_ext_zero)
+        metrics["debug/patha_sanity/mse_temporal_ext_zero"] = float(mse_ext_zero)
 
         if feedback_tokens.shape[0] > 1:
-            seed_base = int(getattr(self.config, "seed", 0)) + int(self.completed_steps)
             perm = np.random.default_rng(seed_base).permutation(feedback_tokens.shape[0])
             shuffle_feedback = feedback_tokens[perm]
         else:
             shuffle_feedback = feedback_tokens
-        output_ext_shuffle = self.model.predict_action(
-            examples=examples_tk,
-            use_ddim=True,
-            num_ddim_steps=num_ddim_steps,
-            reset_inference_state=True,
-            feedback_tokens=shuffle_feedback,
-        )
+        output_ext_shuffle = _predict_temporal_tk(feedback_tokens_override=shuffle_feedback)
         pred_ext_shuffle = np.asarray(output_ext_shuffle["normalized_actions"], dtype=np.float32)
         mse_ext_shuffle = self._compute_masked_mse(pred_ext_shuffle, actions_tk, valid_mask=valid_tk)
         metrics["debug/patha_sanity/mse_ext_feedback_shuffle"] = float(mse_ext_shuffle)
+        metrics["debug/patha_sanity/mse_temporal_ext_shuffle"] = float(mse_ext_shuffle)
 
         base = max(abs(mse_ext_none), 1e-12)
         metrics["debug/patha_sanity/mse_delta_zero_vs_ext_none"] = float(mse_ext_zero - mse_ext_none)
@@ -1007,7 +1009,7 @@ class VLATrainer(TrainerUtils):
             (mse_ext_shuffle - mse_ext_none) / base
         )
         metrics["debug/patha_sanity/mse_delta_auto_vs_ext_none"] = float(
-            metrics["mse_score_patha"] - mse_ext_none
+            mse_auto - mse_ext_none
         )
         return metrics
 
@@ -1028,22 +1030,27 @@ class VLATrainer(TrainerUtils):
         actions_tk = np.asarray([example.get("action_tk", example["action"]) for example in examples], dtype=np.float32)
         valid_tk = np.asarray([float(example.get("valid_tk", 1.0)) for example in examples], dtype=np.float32)
         num_ddim_steps = int(getattr(self.config.trainer, "eval_num_ddim_steps", 20))
+        seed_base = int(getattr(self.config, "seed", 0)) + int(self.completed_steps)
+        examples_t = self._clone_examples_for_temporal_view(examples, use_tk=False)
 
         was_training = bool(getattr(self.model, "training", False))
         self.model.eval()
         try:
             # Legacy baseline (reset state every eval call).
             output_dict = self.model.predict_action(
-                examples=examples,
+                examples=examples_t,
                 use_ddim=True,
                 num_ddim_steps=num_ddim_steps,
                 reset_inference_state=True,
+                deterministic_seed=seed_base,
             )
 
             if self.accelerator.is_main_process:
                 normalized_actions = np.asarray(output_dict["normalized_actions"], dtype=np.float32)  # B, T, D
                 mse_score = self._compute_masked_mse(normalized_actions, actions)
                 step_metrics["mse_score"] = mse_score
+                step_metrics["debug/patha_sanity/mse_stateless_t"] = mse_score
+                step_metrics["debug/patha_sanity/eval_seed_base"] = float(seed_base)
 
             try:
                 infer_metrics = self._run_inference_feedback_sanity(

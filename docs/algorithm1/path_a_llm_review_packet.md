@@ -5,6 +5,12 @@
 本资料用于让外部大模型对当前 `Path A`（几何残差反馈 token）实现做系统复核。  
 当前现象：`Path A` 已接入且训练稳定，但相较 baseline 没有表现出“更快收敛/更明显 loss 优势”。
 
+版本口径（重要）：
+
+- `v3/v4(旧)`：Path A residual 主要来自 pooled `delta_z`（`[B,K,H] -> [B,H]`）。
+- `v4-1`：在 action 输出端增加 `Δa` 残差动作头（有 gate + clip 上界）。
+- `v4-1-1`（本次新增方案）：residual 不再依赖旧的 pooled `delta_z` 主路径，改为 **token-level 几何残差 `Δgeo` + soft mask 过滤**，再接 `v4-1` 的 `Δa` 注入。
+
 你需要重点回答：
 
 1. `Path A` 的信息构造是否有效（几何残差定义是否保真）。  
@@ -30,7 +36,7 @@
 - `/Users/bazinga/code/my-starvla/starVLA/mapanything_llava3d/model/modeling_mapanything_llava3d_vlm.py:585`  
   `extract_task_tokens(...)`（tk fast path）
 
-### 2.2 Path A 训练链路
+### 2.2 Path A 训练链路（旧 residual 主路径：v3/v4）
 
 1. `t` 帧跑主 VLM 前向，取 `task_tokens`。  
 2. `t+k` 帧跑第二次前向（优先 `extract_task_tokens`），取 `task_tokens_next`。  
@@ -118,6 +124,33 @@
 - 若 `causal_feedback_detach_delta=true`，则 `delta_z` 反传被切断，Path A 对上游 token/pooling 的驱动明显变弱。
 - 若 `causal_feedback_aux_detach_target=true`，则 `loss_fb` 不反推 `delta_z_target` 分支，只训练预测侧。
 
+### 2.7 v4-1（当前已落地）动作侧注入口径
+
+`v4-1` 的核心是把 Path-A 从“强改 context”改成“有上界的后置纠偏”：
+
+- `a_out = a_base + gate * clip(DeltaA(mean(feedback_tokens)))`
+- `clip` 使用 `tanh` 限幅；`gate` 由 `alpha schedule * valid_tk` 构成。
+- 该路径不新增 VLM forward，只增加 action head 轻量计算。
+
+关键实现：
+
+- `/Users/bazinga/code/my-starvla/starVLA/model/modules/action_model/LayerwiseFM_ActionHeader.py:1253`  
+  `_apply_feedback_delta_action(...)`
+- `/Users/bazinga/code/my-starvla/starVLA/model/modules/action_model/LayerwiseFM_ActionHeader.py:1303`  
+  `feedback_vec = feedback_tokens.mean(dim=1)`
+- `/Users/bazinga/code/my-starvla/starVLA/model/modules/action_model/LayerwiseFM_ActionHeader.py:1309`  
+  `clip_value * tanh(raw_delta/clip)`
+- `/Users/bazinga/code/my-starvla/starVLA/model/modules/action_model/LayerwiseFM_ActionHeader.py:1337`  
+  `effective_delta = gate * clipped_delta`
+
+`v4-1` 已有关键监控（低成本）：
+
+- `debug/sagr/delta_action_raw_norm_mean`
+- `debug/sagr/delta_action_clip_saturation_frac`
+- `debug/sagr/delta_action_last_layer_weight_rms`
+- `debug/sagr/delta_action_gate_mean`
+- `debug/sagr/delta_action_effective_norm_mean`
+
 ---
 
 ## 3. 关键配置项（Path A）
@@ -158,6 +191,8 @@
 ### B2. 信息压缩可能过强
 
 `delta_z` 先从 `[B,K,H]` 聚合成 `[B,H]`，再映射为少量 feedback tokens；关键 slot 差异可能被稀释。
+
+补充：这也是 `v4-1-1` 的直接改动动机，即把 residual 从 pooled 向量升级为 token-level `Δgeo`。
 
 证据入口：
 
@@ -366,3 +401,143 @@
 3. detach 策略的推荐调度曲线是什么（按 step 分段）？  
 4. concat 注入是否应升级为 gated 注入？何时值得做？  
 5. 在不增加太多训练时间的前提下，最优的三项改动是什么？
+
+---
+
+## 9. 新增方案：v4-1-1（token-level 几何残差 residual）
+
+本节是当前建议的主线改造方案，作为 `v4-1` 的增量升级。
+
+### 9.1 原理
+
+旧方案的主要瓶颈在 residual 构造阶段：`[B,K,H] -> [B,H]` 的 pooled `delta_z` 容易丢失空间位置差异。  
+`v4-1-1` 改为在 token 级别构造 residual，再由语言条件产生 soft mask 过滤，最后才汇聚成动作纠偏向量。
+
+核心思想：
+
+1. 先保留空间残差：`r_tokens = geo_after - geo_before`，形状 `[B, N, H]`。  
+2. 再做条件筛选：`alpha`（soft mask，`[B,N]`）强调与语言相关的 token。  
+3. 最后汇聚注入：`fb_vec = LN(sum(alpha * r_tokens))`，接 `v4-1` 的 `Δa` 头。
+
+### 9.2 目标
+
+`v4-1-1` 目标是同时解决两个问题：
+
+1. 模块2（residual 构造）噪声大、信息被压缩。  
+2. 模块3（注入与利用）容易“过强但不稳”或“过弱被忽略”。
+
+具体期望：
+
+- 提高 residual 的语义-空间对齐性（减少无关残差注入）。
+- 保持注入有上界（继续沿用 `gate + clip`）。
+- 在不增加额外 VLM forward 的前提下，提高 Path-A 的有效利用率。
+
+### 9.3 想法（结构抽象）
+
+把 Path-A 统一成三模块：
+
+1. 模块1：`z_t`（融合表征）  
+   来源于当前多模态链路（vision + geo + language），提供 query 与 token 特征。
+2. 模块2：`r_t`（残差构造）  
+   由 token-level `Δgeo` 构成：`r_tokens = geo_after - geo_before`。
+3. 模块3：注入与利用  
+   `a_out = a_base + gate * clip(DeltaA(fb_vec))`，其中 `fb_vec` 来自 masked residual。
+
+关系说明：
+
+- `v4-1` 解决模块3稳定性（注入方式）。
+- `v4-1-1` 重点升级模块2质量（residual 来源与筛选）。
+
+### 9.4 实现（建议落点与张量形状）
+
+#### A. 输入张量（对齐口径）
+
+- `vision_tokens`: `[B, N=512, H]`（2 视角，单视角 `16x16=256`，拼接后 512）。
+- `geo_tokens_before`: `[B, 512, H]`
+- `geo_tokens_after`: `[B, 512, H]`
+- `language_queries`: `[B, Lq, H]`，`Lq <= semantic_query_max_tokens`（默认 64）。
+
+注：`vision/geo` token 顺序必须保持同 patch 对齐（同一 index 对应同一视角同一 patch）。
+
+#### B. soft mask 构造
+
+双通道注意力（语言 query 到 token）：
+
+- `alpha_vis`: 由 `Q=language_queries, K/V=vision_tokens` 得到 `[B,512]`
+- `alpha_geo`: 由 `Q=language_queries, K/V=geo_tokens_before` 得到 `[B,512]`
+- 融合：`alpha = normalize((1-lambda)*alpha_vis + lambda*alpha_geo)`
+- 可选稳定：`alpha_ema = (1-beta)*alpha_ema + beta*alpha`
+
+建议初值：
+
+- `lambda = 0.3`
+- `beta = 0.2`
+
+#### C. residual 构造（替换旧 pooled 主路径）
+
+- `r_tokens = geo_tokens_after - geo_tokens_before`，`[B,512,H]`
+- `r_tokens_weighted = alpha[...,None] * r_tokens`
+- `fb_vec = LN(sum(r_tokens_weighted, dim=1))`，`[B,H]`
+- 与现有 action head 接口兼容：`feedback_tokens = fb_vec.unsqueeze(1)`（或 repeat 到 `Kf`）
+
+#### D. 模块3注入（复用 v4-1）
+
+保持现有：
+
+- `raw_delta = DeltaA(fb_vec)`
+- `delta = clip * tanh(raw_delta / clip)`
+- `a_out = a_base + gate * delta`
+- `gate = alpha_schedule * valid_tk`（先不引入复杂置信门控）
+
+### 9.5 配置建议（v4-1-1）
+
+建议新增/整理配置（命名可按工程风格微调）：
+
+- `patha_residual_mode: token_delta_geo`（旧值可为 `pooled_delta_z`）
+- `soft_mask_enabled: true`
+- `soft_mask_lambda: 0.3`
+- `soft_mask_ema_beta: 0.2`
+- `soft_mask_query_agg: mean`
+- `soft_mask_temperature: 1.0`
+
+继续沿用 `v4-1` 关键项：
+
+- `feedback_delta_action_enabled: true`
+- `feedback_in_context_enabled: false`（建议先关闭 context 拼接，减少混杂变量）
+- `feedback_delta_action_alpha_mode: schedule`
+- `feedback_delta_action_alpha_init: 0.0`
+- `feedback_delta_action_alpha_target: 0.05~0.2`（做 sweep）
+- `feedback_delta_action_clip: 0.05`（先固定）
+
+### 9.6 验证与验收
+
+必须看三类证据：
+
+1. 注入强度是否可控  
+   - `delta_action_gate_mean`
+   - `delta_action_effective_norm_mean`
+   - `hidden_perturb_ratio`
+2. 纠偏净贡献是否稳定  
+   - `ΔL_probe_light = L_with_fb - L_zero_fb`
+   - 统计“负值占比”与方差
+3. residual 质量是否改善  
+   - `delta_norm_p50/p95`（before/after mask）
+   - `mask_entropy`
+   - `topk_mass@32`
+   - `mask_cos_prev`（时序稳定）
+
+建议通过阈值（可按任务再调）：
+
+- `ΔL_probe_light` 负值占比 > 70%
+- `hidden_perturb_ratio` 不回到高扰动区（例如长期 > 0.6）
+- `mse_score_patha` 不再长期劣于 base
+
+### 9.7 回滚与兼容
+
+为确保可快速回退，保留双路径开关：
+
+- `token_delta_geo`（新）
+- `pooled_delta_z`（旧）
+
+并维持 action 注入路径一致（`v4-1` 不变）。  
+这样可以把“residual 构造改动”的收益与风险单独归因，不和模块3改动混淆。

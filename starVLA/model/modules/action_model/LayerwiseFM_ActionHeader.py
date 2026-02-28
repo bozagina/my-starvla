@@ -320,6 +320,38 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         default=2000,
         metadata={"help": "Ramp steps from alpha_init to alpha_target for delta-action schedule."},
     )
+    patha_residual_mode: str = field(
+        default="pooled_delta_z",
+        metadata={"help": "Path-A residual source: pooled_delta_z or token_delta_geo."},
+    )
+    soft_mask_enabled: bool = field(
+        default=False,
+        metadata={"help": "Enable v4-1-1 soft mask for token-level residual."},
+    )
+    soft_mask_lambda: float = field(
+        default=0.3,
+        metadata={"help": "Fusion weight between visual and geometric soft-mask channels."},
+    )
+    soft_mask_ema_beta: float = field(
+        default=0.2,
+        metadata={"help": "EMA beta for soft-mask smoothing."},
+    )
+    soft_mask_query_agg: str = field(
+        default="mean",
+        metadata={"help": "Soft-mask query aggregation: mean or max."},
+    )
+    soft_mask_temperature: float = field(
+        default=1.0,
+        metadata={"help": "Temperature for soft-mask attention logits."},
+    )
+    soft_mask_use_ema_inference: bool = field(
+        default=True,
+        metadata={"help": "Apply soft-mask EMA smoothing during inference."},
+    )
+    soft_mask_use_ema_training: bool = field(
+        default=False,
+        metadata={"help": "Apply soft-mask EMA smoothing during training."},
+    )
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -1265,7 +1297,20 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         metrics: Dict[str, float] = {
             "delta_action_enabled": 1.0 if self.feedback_delta_action_enabled else 0.0,
             "delta_action_applied": 0.0,
+            # Clip diagnostics (minimal): pre-clip norm and saturation ratio.
+            "delta_action_raw_norm_mean": 0.0,
+            "delta_action_clip_saturation_frac": 0.0,
+            # Delta-head learning status (minimal): last linear layer weight RMS.
+            "delta_action_last_layer_weight_rms": 0.0,
         }
+        if isinstance(self.feedback_delta_action_head, nn.Sequential) and len(self.feedback_delta_action_head) > 0:
+            last_linear = self.feedback_delta_action_head[-1]
+            if isinstance(last_linear, nn.Linear):
+                with torch.no_grad():
+                    weight = last_linear.weight.detach().float()
+                    metrics["delta_action_last_layer_weight_rms"] = float(
+                        weight.pow(2).mean().sqrt().item()
+                    )
         if (
             (not self.feedback_delta_action_enabled)
             or (not enable_delta_action)
@@ -1289,14 +1334,19 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         feedback_vec = feedback_tokens.mean(dim=1)
         feedback_vec = self._apply_feedback_delta_action_norm(feedback_vec)
         raw_delta_action = self.feedback_delta_action_head(feedback_vec)  # [B, A]
+        raw_delta_norm = raw_delta_action.detach().norm(dim=-1)
 
         clip_value = float(max(self.feedback_delta_action_clip, 0.0))
         if clip_value > 0.0:
             clipped_delta_action = clip_value * torch.tanh(
                 raw_delta_action / max(clip_value, 1e-8)
             )
+            clip_saturation_frac = float(
+                (raw_delta_action.detach().abs() > clip_value).float().mean().item()
+            )
         else:
             clipped_delta_action = raw_delta_action
+            clip_saturation_frac = 0.0
 
         alpha_tensor, alpha_value = self._compute_feedback_delta_action_alpha(
             device=pred_velocity_base.device,
@@ -1333,6 +1383,8 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 "delta_action_applied": 1.0,
                 "delta_action_gate_mean": float(gate.detach().float().mean().item()),
                 "delta_action_alpha": float(alpha_value),
+                "delta_action_raw_norm_mean": float(raw_delta_norm.mean().item()),
+                "delta_action_clip_saturation_frac": float(clip_saturation_frac),
                 "delta_action_norm_mean": float(delta_norm.mean().item()),
                 "delta_action_norm_p95": float(p95 if p95 is not None else 0.0),
                 "delta_action_effective_norm_mean": float(effective_delta_norm.mean().item()),
@@ -1914,6 +1966,8 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         encoder_attention_mask: torch.Tensor = None,
         task_tokens: Optional[torch.Tensor] = None,
         feedback_tokens: Optional[torch.Tensor] = None,
+        valid_tk: Optional[torch.Tensor] = None,
+        num_inference_timesteps: Optional[int] = None,
         force_replan: bool = False,
         rrr_threshold: Optional[float] = None,
         return_info: bool = False,
@@ -1960,11 +2014,22 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 generator=generator,
             )
 
-        num_steps = self.num_inference_timesteps
+        if num_inference_timesteps is None:
+            num_steps = int(self.num_inference_timesteps)
+        else:
+            num_steps = max(1, int(num_inference_timesteps))
         dt = 1.0 / num_steps
 
         state_features = self.state_encoder(state) if state is not None else None
         threshold = float(self.rrr_threshold if rrr_threshold is None else rrr_threshold)
+        valid_tk_mask = None
+        if isinstance(valid_tk, torch.Tensor):
+            valid_tk_mask = valid_tk.to(device=device, dtype=vl_embs_list[0].dtype).view(-1)
+            if valid_tk_mask.shape[0] != batch_size:
+                raise ValueError(
+                    f"`valid_tk` batch mismatch: got {valid_tk_mask.shape[0]}, expected {batch_size}"
+                )
+            valid_tk_mask = valid_tk_mask.clamp(0.0, 1.0)
         task_tokens = self._normalize_task_tokens(
             task_tokens=task_tokens,
             batch_size=batch_size,
@@ -2053,6 +2118,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 temb=temb,
                 timestep_bucket=timesteps_tensor,
                 observed_next_task_tokens=task_tokens,
+                valid_tk_mask=valid_tk_mask,
             )
             drift = world_guidance["drift"]
             if isinstance(drift, torch.Tensor):
@@ -2060,7 +2126,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             pred_velocity, delta_action_metrics, _ = self._apply_feedback_delta_action(
                 pred_velocity_base=pred_velocity,
                 feedback_tokens=feedback_tokens,
-                valid_tk_mask=None,
+                valid_tk_mask=valid_tk_mask,
                 enable_delta_action=bool(self.feedback_delta_action_enable_inference),
             )
             gate_val = delta_action_metrics.get("delta_action_gate_mean", None)
@@ -2204,6 +2270,12 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 if len(delta_action_effective_norm_trace) > 0
                 else 0.0
             ),
+            "feedback/valid_tk_ratio": (
+                float((valid_tk_mask > 0.5).float().mean().item())
+                if isinstance(valid_tk_mask, torch.Tensor)
+                else 1.0
+            ),
+            "feedback/num_inference_timesteps_used": int(num_steps),
         }
         return actions, info
 
