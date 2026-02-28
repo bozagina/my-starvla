@@ -150,6 +150,15 @@ class MapAnythingLlava3D_PI(baseframework):
         )
         if self.soft_mask_logit_scale <= 0.0:
             self.soft_mask_logit_scale = 1.0
+        self.soft_mask_score_norm = str(
+            getattr(action_cfg, "soft_mask_score_norm", "l2_only")
+        ).strip().lower()
+        if self.soft_mask_score_norm not in ("l2_only", "sqrt_only"):
+            logger.warning(
+                "[causal_feedback] invalid soft_mask_score_norm=%s, fallback to l2_only",
+                self.soft_mask_score_norm,
+            )
+            self.soft_mask_score_norm = "l2_only"
         self.soft_mask_temperature = float(
             getattr(action_cfg, "soft_mask_temperature", 1.0)
         )
@@ -513,6 +522,12 @@ class MapAnythingLlava3D_PI(baseframework):
             "debug/causal_feedback/soft_mask_lambda": float(self.soft_mask_lambda),
             "debug/causal_feedback/soft_mask_logit_scale": float(self.soft_mask_logit_scale),
             "debug/causal_feedback/soft_mask_temperature": float(self.soft_mask_temperature),
+            "debug/causal_feedback/soft_mask_score_norm_l2_only": 1.0
+            if self.soft_mask_score_norm == "l2_only"
+            else 0.0,
+            "debug/causal_feedback/soft_mask_score_norm_sqrt_only": 1.0
+            if self.soft_mask_score_norm == "sqrt_only"
+            else 0.0,
         }
         if not self.soft_mask_enabled:
             return None, stats
@@ -546,9 +561,13 @@ class MapAnythingLlava3D_PI(baseframework):
         lam = float(max(0.0, min(1.0, self.soft_mask_lambda)))
         logit_scale = float(max(self.soft_mask_logit_scale, 1e-6)) / temp
 
-        q = F.normalize(language_queries.to(dtype=dtype), dim=-1)
-        v = F.normalize(vision_tokens.to(device=device, dtype=dtype), dim=-1)
-        g = F.normalize(geometric_tokens.to(device=device, dtype=dtype), dim=-1)
+        q = language_queries.to(dtype=dtype)
+        v = vision_tokens.to(device=device, dtype=dtype)
+        g = geometric_tokens.to(device=device, dtype=dtype)
+        if self.soft_mask_score_norm == "l2_only":
+            q = F.normalize(q, dim=-1)
+            v = F.normalize(v, dim=-1)
+            g = F.normalize(g, dim=-1)
 
         query_mask = None
         if isinstance(language_query_mask, torch.Tensor):
@@ -588,7 +607,10 @@ class MapAnythingLlava3D_PI(baseframework):
         qh = _to_heads(q)
         vh = _to_heads(v)
         gh = _to_heads(g)
-        scale = logit_scale / max(math.sqrt(float(head_dim)), 1e-6)
+        if self.soft_mask_score_norm == "sqrt_only":
+            scale = logit_scale / max(math.sqrt(float(head_dim)), 1e-6)
+        else:
+            scale = logit_scale
         logits_vis = torch.einsum("bhqd,bhkd->bhqk", qh, vh) * scale
         logits_geo = torch.einsum("bhqd,bhkd->bhqk", qh, gh) * scale
         attn_vis = torch.softmax(logits_vis, dim=-1)
@@ -691,7 +713,7 @@ class MapAnythingLlava3D_PI(baseframework):
             stats["debug/causal_feedback/soft_mask_applied"] = 1.0
             stats["debug/causal_feedback/soft_mask_token_num"] = float(token_n)
             stats["debug/causal_feedback/language_query_count_mean"] = query_count_mean
-            stats["debug/causal_feedback/soft_mask_logit_scale_effective"] = float(logit_scale)
+            stats["debug/causal_feedback/soft_mask_logit_scale_effective"] = float(scale)
             stats["debug/causal_feedback/soft_mask_logits_std_vis"] = logits_vis_std
             stats["debug/causal_feedback/soft_mask_logits_std_geo"] = logits_geo_std
             stats["debug/causal_feedback/soft_mask_logits_maxmin_vis"] = logits_vis_rng

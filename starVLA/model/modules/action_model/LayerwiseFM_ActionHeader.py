@@ -352,6 +352,10 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         default=4.0,
         metadata={"help": "Multiplicative scale on soft-mask logits before softmax (higher => sharper)."},
     )
+    soft_mask_score_norm: str = field(
+        default="l2_only",
+        metadata={"help": "Soft-mask score normalization: l2_only or sqrt_only (mutually exclusive)."},
+    )
     soft_mask_temperature: float = field(
         default=1.0,
         metadata={"help": "Divisor temperature for soft-mask attention logits (kept for compatibility)."},
