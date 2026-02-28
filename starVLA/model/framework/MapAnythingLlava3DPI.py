@@ -1529,6 +1529,23 @@ class MapAnythingLlava3D_PI(baseframework):
                     for key, value in lang_filter_stats.items():
                         if isinstance(value, (int, float)):
                             debug_metrics[f"debug/causal_feedback/query_filter_{key}"] = float(value)
+                semantic_query_select_mode = getattr(vlm_core, "semantic_query_select_mode", None)
+                if isinstance(semantic_query_select_mode, str):
+                    debug_metrics["debug/causal_feedback/semantic_query_mode_uniform"] = (
+                        1.0 if semantic_query_select_mode == "uniform" else 0.0
+                    )
+                    debug_metrics["debug/causal_feedback/semantic_query_mode_topk_norm"] = (
+                        1.0 if semantic_query_select_mode == "topk_norm" else 0.0
+                    )
+                    debug_metrics["debug/causal_feedback/semantic_query_mode_summary_topk"] = (
+                        1.0 if semantic_query_select_mode == "summary_topk" else 0.0
+                    )
+                semantic_query_max_tokens = getattr(vlm_core, "semantic_query_max_tokens", None)
+                if isinstance(semantic_query_max_tokens, int):
+                    debug_metrics["debug/causal_feedback/semantic_query_max_tokens"] = float(semantic_query_max_tokens)
+                semantic_topk_tokens = getattr(vlm_core, "semantic_topk_tokens", None)
+                if isinstance(semantic_topk_tokens, int):
+                    debug_metrics["debug/causal_feedback/semantic_topk_tokens"] = float(semantic_topk_tokens)
                 geom_stats = getattr(vlm_core, "geom_feature_stats", None)
                 geom_model_forward_ms = getattr(vlm_core, "debug_last_geom_model_forward_ms", None)
                 geom_feature_extract_ms = getattr(vlm_core, "debug_last_geom_feature_extract_ms", None)

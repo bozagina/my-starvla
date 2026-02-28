@@ -78,6 +78,9 @@ class _MapAnythingLlava3D_Interface(nn.Module):
         strip_instruction = True
         instruction_log_interval = 0
         task_token_num = 32
+        semantic_query_select_mode = "summary_topk"
+        semantic_query_max_tokens = 64
+        semantic_topk_tokens = 16
         algorithm_version = "v3"
         fusion_version = None
         base_vlm_path = None
@@ -110,6 +113,12 @@ class _MapAnythingLlava3D_Interface(nn.Module):
                     am_cfg = getattr(fw_cfg, "action_model", None) if fw_cfg is not None else None
                     if am_cfg is not None and hasattr(am_cfg, "num_task_tokens"):
                         task_token_num = int(getattr(am_cfg, "num_task_tokens"))
+                if hasattr(ma_cfg, "semantic_query_select_mode"):
+                    semantic_query_select_mode = str(getattr(ma_cfg, "semantic_query_select_mode"))
+                if hasattr(ma_cfg, "semantic_query_max_tokens"):
+                    semantic_query_max_tokens = int(getattr(ma_cfg, "semantic_query_max_tokens"))
+                if hasattr(ma_cfg, "semantic_topk_tokens"):
+                    semantic_topk_tokens = int(getattr(ma_cfg, "semantic_topk_tokens"))
                 if hasattr(ma_cfg, "algorithm_version"):
                     algorithm_version = str(getattr(ma_cfg, "algorithm_version"))
                 elif hasattr(ma_cfg, "task_token_pipeline_version"):
@@ -125,10 +134,18 @@ class _MapAnythingLlava3D_Interface(nn.Module):
             strip_instruction = True
             instruction_log_interval = 0
             task_token_num = 32
+            semantic_query_select_mode = "summary_topk"
+            semantic_query_max_tokens = 64
+            semantic_topk_tokens = 16
             algorithm_version = "v3"
             fusion_version = None
         if task_token_num < 1:
             task_token_num = 1
+        semantic_query_max_tokens = max(1, int(semantic_query_max_tokens))
+        semantic_topk_tokens = max(1, int(semantic_topk_tokens))
+        semantic_query_select_mode = str(semantic_query_select_mode).strip().lower()
+        if semantic_query_select_mode not in ("uniform", "topk_norm", "summary_topk"):
+            semantic_query_select_mode = "summary_topk"
         algorithm_version = str(algorithm_version).lower()
         if algorithm_version not in ("v3", "v4"):
             algorithm_version = "v3"
@@ -140,6 +157,9 @@ class _MapAnythingLlava3D_Interface(nn.Module):
         print(f"prefix_image_dropout_prob: {prefix_image_dropout_prob}")
         print(f"prefix_lang_dropout_prob: {prefix_lang_dropout_prob}")
         print(f"task_token_num: {task_token_num}")
+        print(f"semantic_query_select_mode: {semantic_query_select_mode}")
+        print(f"semantic_query_max_tokens: {semantic_query_max_tokens}")
+        print(f"semantic_topk_tokens: {semantic_topk_tokens}")
         print(f"algorithm_version: {algorithm_version}")
         print(f"fusion_version: {fusion_version}")
 
@@ -162,9 +182,18 @@ class _MapAnythingLlava3D_Interface(nn.Module):
                 mapanything_cfg.prefix_lang_dropout_prob = prefix_lang_dropout_prob
                 setattr(mapanything_cfg, "use_geometric_branch", use_geom)
                 setattr(mapanything_cfg, "task_token_num", int(task_token_num))
+                setattr(mapanything_cfg, "semantic_query_select_mode", str(semantic_query_select_mode))
+                setattr(mapanything_cfg, "semantic_query_max_tokens", int(semantic_query_max_tokens))
+                setattr(mapanything_cfg, "semantic_topk_tokens", int(semantic_topk_tokens))
                 setattr(mapanything_cfg, "algorithm_version", str(algorithm_version))
                 setattr(mapanything_cfg, "task_token_pipeline_version", str(algorithm_version))
                 setattr(mapanything_cfg, "fusion_version", str(fusion_version))
+                if hasattr(model, "semantic_query_select_mode"):
+                    model.semantic_query_select_mode = str(semantic_query_select_mode)
+                if hasattr(model, "semantic_query_max_tokens"):
+                    model.semantic_query_max_tokens = int(semantic_query_max_tokens)
+                if hasattr(model, "semantic_topk_tokens"):
+                    model.semantic_topk_tokens = int(semantic_topk_tokens)
                 cfg_vision = getattr(mapanything_cfg, "vision_model_name_or_path", None)
                 cfg_language = getattr(mapanything_cfg, "language_model_name_or_path", None)
                 if isinstance(cfg_vision, str) and cfg_vision:
@@ -189,6 +218,9 @@ class _MapAnythingLlava3D_Interface(nn.Module):
                 prefix_image_dropout_prob=prefix_image_dropout_prob,
                 prefix_lang_dropout_prob=prefix_lang_dropout_prob,
                 task_token_num=int(task_token_num),
+                semantic_query_select_mode=str(semantic_query_select_mode),
+                semantic_query_max_tokens=int(semantic_query_max_tokens),
+                semantic_topk_tokens=int(semantic_topk_tokens),
                 algorithm_version=str(algorithm_version),
                 task_token_pipeline_version=str(algorithm_version),
                 fusion_version=str(fusion_version),
