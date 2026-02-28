@@ -337,12 +337,24 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         metadata={"help": "EMA beta for soft-mask smoothing."},
     )
     soft_mask_query_agg: str = field(
-        default="mean",
-        metadata={"help": "Soft-mask query aggregation: mean or max."},
+        default="max",
+        metadata={"help": "Soft-mask query aggregation over language queries: mean or max."},
+    )
+    soft_mask_head_agg: str = field(
+        default="max",
+        metadata={"help": "Soft-mask head aggregation: mean or max."},
+    )
+    soft_mask_num_heads: int = field(
+        default=4,
+        metadata={"help": "Number of heads for soft-mask attention (Q/K only)."},
+    )
+    soft_mask_logit_scale: float = field(
+        default=4.0,
+        metadata={"help": "Multiplicative scale on soft-mask logits before softmax (higher => sharper)."},
     )
     soft_mask_temperature: float = field(
         default=1.0,
-        metadata={"help": "Temperature for soft-mask attention logits."},
+        metadata={"help": "Divisor temperature for soft-mask attention logits (kept for compatibility)."},
     )
     soft_mask_use_ema_inference: bool = field(
         default=True,

@@ -461,17 +461,30 @@
 
 #### B. soft mask 构造
 
-双通道注意力（语言 query 到 token）：
+当前实现已升级为 **多头 Q/K soft-mask**（仅计算注意力权重，不引入 V）：
 
-- `alpha_vis`: 由 `Q=language_queries, K/V=vision_tokens` 得到 `[B,512]`
-- `alpha_geo`: 由 `Q=language_queries, K/V=geo_tokens_before` 得到 `[B,512]`
-- 融合：`alpha = normalize((1-lambda)*alpha_vis + lambda*alpha_geo)`
+- 输入：  
+  - `Q = language_queries`，`[B, Lq, H]`
+  - `K_vis = vision_tokens`，`[B, N, H]`
+  - `K_geo = geo_tokens_before`，`[B, N, H]`
+- 多头拆分：`H -> (h, dh)`，其中 `dh = H / h`（若不可整除自动降级到单头）。
+- 计算：  
+  - `logits_vis = (Q_h @ K_vis_h^T) * (soft_mask_logit_scale / soft_mask_temperature) / sqrt(dh)`  
+  - `logits_geo = (Q_h @ K_geo_h^T) * (soft_mask_logit_scale / soft_mask_temperature) / sqrt(dh)`  
+  - `A_vis/A_geo = softmax(logits, dim=token)`，形状 `[B, h, Lq, N]`
+- 聚合（默认抗抹平）：  
+  - query 维：`max`（`soft_mask_query_agg=max`）  
+  - head 维：`max`（`soft_mask_head_agg=max`）  
+  - 得到 `alpha_vis/alpha_geo`，形状 `[B, N]`
+- 双通道融合：`alpha = normalize((1-lambda)*alpha_vis + lambda*alpha_geo)`
 - 可选稳定：`alpha_ema = (1-beta)*alpha_ema + beta*alpha`
 
 建议初值：
 
 - `lambda = 0.3`
 - `beta = 0.2`
+- `soft_mask_num_heads = 4`
+- `soft_mask_logit_scale = 4.0`（先做 sharper mask）
 
 #### C. residual 构造（替换旧 pooled 主路径）
 
@@ -497,7 +510,10 @@
 - `soft_mask_enabled: true`
 - `soft_mask_lambda: 0.3`
 - `soft_mask_ema_beta: 0.2`
-- `soft_mask_query_agg: mean`
+- `soft_mask_num_heads: 4`（可做 4/8 sweep）
+- `soft_mask_query_agg: max`
+- `soft_mask_head_agg: max`
+- `soft_mask_logit_scale: 4.0`
 - `soft_mask_temperature: 1.0`
 
 继续沿用 `v4-1` 关键项：
@@ -524,6 +540,9 @@
    - `delta_norm_p50/p95`（before/after mask）
    - `mask_entropy`
    - `topk_mass@32`
+   - `alpha_max_mean`
+   - `mask_logits_std_vis/geo`
+   - `head_diversity_vis/geo`
    - `mask_cos_prev`（时序稳定）
 
 建议通过阈值（可按任务再调）：
@@ -531,6 +550,9 @@
 - `ΔL_probe_light` 负值占比 > 70%
 - `hidden_perturb_ratio` 不回到高扰动区（例如长期 > 0.6）
 - `mse_score_patha` 不再长期劣于 base
+- `mask_entropy` 显著低于 `ln(512)=6.238`
+- `topk_mass@32` 明显高于 `0.0625`
+- `alpha_max_mean` 明显高于 `1/512≈0.00195`
 
 ### 9.7 回滚与兼容
 

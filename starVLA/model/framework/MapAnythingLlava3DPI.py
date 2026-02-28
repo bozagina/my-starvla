@@ -125,14 +125,31 @@ class MapAnythingLlava3D_PI(baseframework):
             getattr(action_cfg, "soft_mask_ema_beta", 0.2)
         )
         self.soft_mask_query_agg = str(
-            getattr(action_cfg, "soft_mask_query_agg", "mean")
+            getattr(action_cfg, "soft_mask_query_agg", "max")
         ).strip().lower()
         if self.soft_mask_query_agg not in ("mean", "max"):
             logger.warning(
-                "[causal_feedback] invalid soft_mask_query_agg=%s, fallback to mean",
+                "[causal_feedback] invalid soft_mask_query_agg=%s, fallback to max",
                 self.soft_mask_query_agg,
             )
-            self.soft_mask_query_agg = "mean"
+            self.soft_mask_query_agg = "max"
+        self.soft_mask_head_agg = str(
+            getattr(action_cfg, "soft_mask_head_agg", "max")
+        ).strip().lower()
+        if self.soft_mask_head_agg not in ("mean", "max"):
+            logger.warning(
+                "[causal_feedback] invalid soft_mask_head_agg=%s, fallback to max",
+                self.soft_mask_head_agg,
+            )
+            self.soft_mask_head_agg = "max"
+        self.soft_mask_num_heads = max(
+            1, int(getattr(action_cfg, "soft_mask_num_heads", 4))
+        )
+        self.soft_mask_logit_scale = float(
+            getattr(action_cfg, "soft_mask_logit_scale", 4.0)
+        )
+        if self.soft_mask_logit_scale <= 0.0:
+            self.soft_mask_logit_scale = 1.0
         self.soft_mask_temperature = float(
             getattr(action_cfg, "soft_mask_temperature", 1.0)
         )
@@ -494,6 +511,7 @@ class MapAnythingLlava3D_PI(baseframework):
             "debug/causal_feedback/soft_mask_enabled": float(self.soft_mask_enabled),
             "debug/causal_feedback/soft_mask_applied": 0.0,
             "debug/causal_feedback/soft_mask_lambda": float(self.soft_mask_lambda),
+            "debug/causal_feedback/soft_mask_logit_scale": float(self.soft_mask_logit_scale),
             "debug/causal_feedback/soft_mask_temperature": float(self.soft_mask_temperature),
         }
         if not self.soft_mask_enabled:
@@ -526,14 +544,11 @@ class MapAnythingLlava3D_PI(baseframework):
         device = language_queries.device
         temp = float(max(self.soft_mask_temperature, 1e-6))
         lam = float(max(0.0, min(1.0, self.soft_mask_lambda)))
+        logit_scale = float(max(self.soft_mask_logit_scale, 1e-6)) / temp
 
         q = F.normalize(language_queries.to(dtype=dtype), dim=-1)
         v = F.normalize(vision_tokens.to(device=device, dtype=dtype), dim=-1)
         g = F.normalize(geometric_tokens.to(device=device, dtype=dtype), dim=-1)
-        logits_vis = torch.einsum("blh,bnh->bln", q, v) / temp
-        logits_geo = torch.einsum("blh,bnh->bln", q, g) / temp
-        attn_vis = torch.softmax(logits_vis, dim=-1)
-        attn_geo = torch.softmax(logits_geo, dim=-1)
 
         query_mask = None
         if isinstance(language_query_mask, torch.Tensor):
@@ -552,16 +567,54 @@ class MapAnythingLlava3D_PI(baseframework):
             query_weight = query_mask.to(dtype=dtype)
             query_weight = query_weight / query_weight.sum(dim=1, keepdim=True).clamp_min(1.0)
 
+        num_heads_cfg = max(1, int(self.soft_mask_num_heads))
+        hidden = int(language_queries.shape[-1])
+        if hidden % num_heads_cfg != 0:
+            stats["debug/causal_feedback/soft_mask_head_mismatch"] = 1.0
+            num_heads = 1
+        else:
+            num_heads = num_heads_cfg
+        head_dim = max(1, hidden // num_heads)
+        stats["debug/causal_feedback/soft_mask_num_heads_config"] = float(num_heads_cfg)
+        stats["debug/causal_feedback/soft_mask_num_heads"] = float(num_heads)
+        stats["debug/causal_feedback/soft_mask_head_dim"] = float(head_dim)
+        stats["debug/causal_feedback/soft_mask_query_agg_max"] = 1.0 if self.soft_mask_query_agg == "max" else 0.0
+        stats["debug/causal_feedback/soft_mask_head_agg_max"] = 1.0 if self.soft_mask_head_agg == "max" else 0.0
+
+        def _to_heads(x: torch.Tensor) -> torch.Tensor:
+            # [B, T, H] -> [B, h, T, dh]
+            return x.view(bsz, x.shape[1], num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
+
+        qh = _to_heads(q)
+        vh = _to_heads(v)
+        gh = _to_heads(g)
+        scale = logit_scale / max(math.sqrt(float(head_dim)), 1e-6)
+        logits_vis = torch.einsum("bhqd,bhkd->bhqk", qh, vh) * scale
+        logits_geo = torch.einsum("bhqd,bhkd->bhqk", qh, gh) * scale
+        attn_vis = torch.softmax(logits_vis, dim=-1)
+        attn_geo = torch.softmax(logits_geo, dim=-1)
+
         if self.soft_mask_query_agg == "max":
             if query_mask is not None:
-                mask_expand = query_mask.unsqueeze(-1)
-                attn_vis = attn_vis.masked_fill(~mask_expand, 0.0)
-                attn_geo = attn_geo.masked_fill(~mask_expand, 0.0)
-            alpha_vis = attn_vis.max(dim=1).values
-            alpha_geo = attn_geo.max(dim=1).values
+                mask_expand = query_mask.unsqueeze(1).unsqueeze(-1)  # [B,1,Lq,1]
+                attn_vis_for_reduce = attn_vis.masked_fill(~mask_expand, 0.0)
+                attn_geo_for_reduce = attn_geo.masked_fill(~mask_expand, 0.0)
+            else:
+                attn_vis_for_reduce = attn_vis
+                attn_geo_for_reduce = attn_geo
+            alpha_vis_head = attn_vis_for_reduce.max(dim=2).values  # [B,h,N]
+            alpha_geo_head = attn_geo_for_reduce.max(dim=2).values
         else:
-            alpha_vis = torch.sum(attn_vis * query_weight.unsqueeze(-1), dim=1)
-            alpha_geo = torch.sum(attn_geo * query_weight.unsqueeze(-1), dim=1)
+            q_w = query_weight.unsqueeze(1).unsqueeze(-1)  # [B,1,Lq,1]
+            alpha_vis_head = torch.sum(attn_vis * q_w, dim=2)  # [B,h,N]
+            alpha_geo_head = torch.sum(attn_geo * q_w, dim=2)
+
+        if self.soft_mask_head_agg == "max":
+            alpha_vis = alpha_vis_head.max(dim=1).values  # [B,N]
+            alpha_geo = alpha_geo_head.max(dim=1).values
+        else:
+            alpha_vis = alpha_vis_head.mean(dim=1)
+            alpha_geo = alpha_geo_head.mean(dim=1)
 
         alpha = (1.0 - lam) * alpha_vis + lam * alpha_geo
         alpha = alpha.clamp_min(0.0)
@@ -579,20 +632,38 @@ class MapAnythingLlava3D_PI(baseframework):
                 else torch.full((bsz,), float(language_queries.shape[1]), device=device, dtype=torch.float32)
             )
             query_count_mean = float(query_count.mean().item())
-            logits_vis_std_q = logits_vis.detach().float().std(dim=-1, unbiased=False)
+            logits_vis_std_q = logits_vis.detach().float().std(dim=-1, unbiased=False)  # [B,h,Lq]
             logits_geo_std_q = logits_geo.detach().float().std(dim=-1, unbiased=False)
-            logits_vis_rng_q = (logits_vis.detach().float().amax(dim=-1) - logits_vis.detach().float().amin(dim=-1))
-            logits_geo_rng_q = (logits_geo.detach().float().amax(dim=-1) - logits_geo.detach().float().amin(dim=-1))
+            logits_vis_rng_q = (
+                logits_vis.detach().float().amax(dim=-1) - logits_vis.detach().float().amin(dim=-1)
+            )
+            logits_geo_rng_q = (
+                logits_geo.detach().float().amax(dim=-1) - logits_geo.detach().float().amin(dim=-1)
+            )
             query_weight_f = query_weight.detach().float()
-            logits_vis_std = float((logits_vis_std_q * query_weight_f).sum(dim=1).mean().item())
-            logits_geo_std = float((logits_geo_std_q * query_weight_f).sum(dim=1).mean().item())
-            logits_vis_rng = float((logits_vis_rng_q * query_weight_f).sum(dim=1).mean().item())
-            logits_geo_rng = float((logits_geo_rng_q * query_weight_f).sum(dim=1).mean().item())
+            logits_vis_std = float(
+                ((logits_vis_std_q * query_weight_f.unsqueeze(1)).sum(dim=-1).mean(dim=1)).mean().item()
+            )
+            logits_geo_std = float(
+                ((logits_geo_std_q * query_weight_f.unsqueeze(1)).sum(dim=-1).mean(dim=1)).mean().item()
+            )
+            logits_vis_rng = float(
+                ((logits_vis_rng_q * query_weight_f.unsqueeze(1)).sum(dim=-1).mean(dim=1)).mean().item()
+            )
+            logits_geo_rng = float(
+                ((logits_geo_rng_q * query_weight_f.unsqueeze(1)).sum(dim=-1).mean(dim=1)).mean().item()
+            )
 
-            ent_vis_q = -torch.sum(attn_vis.detach().float() * torch.log(attn_vis.detach().float().clamp_min(1e-9)), dim=-1)
-            ent_geo_q = -torch.sum(attn_geo.detach().float() * torch.log(attn_geo.detach().float().clamp_min(1e-9)), dim=-1)
-            ent_vis_q_mean = float((ent_vis_q * query_weight_f).sum(dim=1).mean().item())
-            ent_geo_q_mean = float((ent_geo_q * query_weight_f).sum(dim=1).mean().item())
+            attn_vis_f = attn_vis.detach().float()
+            attn_geo_f = attn_geo.detach().float()
+            ent_vis_q = -torch.sum(attn_vis_f * torch.log(attn_vis_f.clamp_min(1e-9)), dim=-1)  # [B,h,Lq]
+            ent_geo_q = -torch.sum(attn_geo_f * torch.log(attn_geo_f.clamp_min(1e-9)), dim=-1)
+            ent_vis_q_mean = float(
+                ((ent_vis_q * query_weight_f.unsqueeze(1)).sum(dim=-1).mean(dim=1)).mean().item()
+            )
+            ent_geo_q_mean = float(
+                ((ent_geo_q * query_weight_f.unsqueeze(1)).sum(dim=-1).mean(dim=1)).mean().item()
+            )
 
             alpha_vis_norm = alpha_vis.detach().float().clamp_min(0.0)
             alpha_geo_norm = alpha_geo.detach().float().clamp_min(0.0)
@@ -607,9 +678,20 @@ class MapAnythingLlava3D_PI(baseframework):
             topk_mass = alpha_topk_vals.sum(dim=-1)
             alpha_max = alpha.amax(dim=-1)
             alpha_top1_over_top32 = alpha_topk_vals[:, 0] / topk_mass.clamp_min(1e-9)
+            argmax_vis = alpha_vis_head.detach().float().argmax(dim=-1)  # [B,h]
+            argmax_geo = alpha_geo_head.detach().float().argmax(dim=-1)
+            head_div_vis = 0.0
+            head_div_geo = 0.0
+            if num_heads > 0:
+                for bid in range(bsz):
+                    head_div_vis += float(argmax_vis[bid].unique().numel()) / float(num_heads)
+                    head_div_geo += float(argmax_geo[bid].unique().numel()) / float(num_heads)
+                head_div_vis /= float(max(bsz, 1))
+                head_div_geo /= float(max(bsz, 1))
             stats["debug/causal_feedback/soft_mask_applied"] = 1.0
             stats["debug/causal_feedback/soft_mask_token_num"] = float(token_n)
             stats["debug/causal_feedback/language_query_count_mean"] = query_count_mean
+            stats["debug/causal_feedback/soft_mask_logit_scale_effective"] = float(logit_scale)
             stats["debug/causal_feedback/soft_mask_logits_std_vis"] = logits_vis_std
             stats["debug/causal_feedback/soft_mask_logits_std_geo"] = logits_geo_std
             stats["debug/causal_feedback/soft_mask_logits_maxmin_vis"] = logits_vis_rng
@@ -624,6 +706,8 @@ class MapAnythingLlava3D_PI(baseframework):
             stats["debug/causal_feedback/soft_mask_alpha_top1_over_top32"] = float(
                 alpha_top1_over_top32.mean().item()
             )
+            stats["debug/causal_feedback/soft_mask_head_diversity_vis"] = float(head_div_vis)
+            stats["debug/causal_feedback/soft_mask_head_diversity_geo"] = float(head_div_geo)
             try:
                 curr_mean = alpha.detach().float().mean(dim=0)
                 prev_mean = self._patha_prev_soft_mask_mean
