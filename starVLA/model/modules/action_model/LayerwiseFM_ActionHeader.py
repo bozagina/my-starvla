@@ -344,6 +344,10 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         default="max",
         metadata={"help": "Soft-mask head aggregation: mean or max."},
     )
+    soft_mask_channel_mode: str = field(
+        default="fused",
+        metadata={"help": "Soft-mask channel mode: fused, vision_only, or geo_only."},
+    )
     soft_mask_num_heads: int = field(
         default=4,
         metadata={"help": "Number of heads for soft-mask attention (Q/K only)."},

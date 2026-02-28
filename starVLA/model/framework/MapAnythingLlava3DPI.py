@@ -142,6 +142,15 @@ class MapAnythingLlava3D_PI(baseframework):
                 self.soft_mask_head_agg,
             )
             self.soft_mask_head_agg = "max"
+        self.soft_mask_channel_mode = str(
+            getattr(action_cfg, "soft_mask_channel_mode", "fused")
+        ).strip().lower()
+        if self.soft_mask_channel_mode not in ("fused", "vision_only", "geo_only"):
+            logger.warning(
+                "[causal_feedback] invalid soft_mask_channel_mode=%s, fallback to fused",
+                self.soft_mask_channel_mode,
+            )
+            self.soft_mask_channel_mode = "fused"
         self.soft_mask_num_heads = max(
             1, int(getattr(action_cfg, "soft_mask_num_heads", 4))
         )
@@ -522,6 +531,15 @@ class MapAnythingLlava3D_PI(baseframework):
             "debug/causal_feedback/soft_mask_lambda": float(self.soft_mask_lambda),
             "debug/causal_feedback/soft_mask_logit_scale": float(self.soft_mask_logit_scale),
             "debug/causal_feedback/soft_mask_temperature": float(self.soft_mask_temperature),
+            "debug/causal_feedback/soft_mask_channel_mode_fused": 1.0
+            if self.soft_mask_channel_mode == "fused"
+            else 0.0,
+            "debug/causal_feedback/soft_mask_channel_mode_vision_only": 1.0
+            if self.soft_mask_channel_mode == "vision_only"
+            else 0.0,
+            "debug/causal_feedback/soft_mask_channel_mode_geo_only": 1.0
+            if self.soft_mask_channel_mode == "geo_only"
+            else 0.0,
             "debug/causal_feedback/soft_mask_score_norm_l2_only": 1.0
             if self.soft_mask_score_norm == "l2_only"
             else 0.0,
@@ -638,9 +656,14 @@ class MapAnythingLlava3D_PI(baseframework):
             alpha_vis = alpha_vis_head.mean(dim=1)
             alpha_geo = alpha_geo_head.mean(dim=1)
 
-        alpha = (1.0 - lam) * alpha_vis + lam * alpha_geo
-        alpha = alpha.clamp_min(0.0)
-        alpha = alpha / alpha.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        if self.soft_mask_channel_mode == "vision_only":
+            alpha_pre = alpha_vis
+        elif self.soft_mask_channel_mode == "geo_only":
+            alpha_pre = alpha_geo
+        else:
+            alpha_pre = (1.0 - lam) * alpha_vis + lam * alpha_geo
+        alpha_pre = alpha_pre.clamp_min(0.0)
+        alpha = alpha_pre / alpha_pre.sum(dim=-1, keepdim=True).clamp_min(1e-6)
         alpha = self._maybe_apply_soft_mask_ema(alpha)
 
         with torch.no_grad():
@@ -678,6 +701,14 @@ class MapAnythingLlava3D_PI(baseframework):
 
             attn_vis_f = attn_vis.detach().float()
             attn_geo_f = attn_geo.detach().float()
+            attn_top1_vis_q = attn_vis_f.amax(dim=-1)  # [B,h,Lq]
+            attn_top1_geo_q = attn_geo_f.amax(dim=-1)
+            attn_top1_vis_mean = float(
+                ((attn_top1_vis_q * query_weight_f.unsqueeze(1)).sum(dim=-1).mean(dim=1)).mean().item()
+            )
+            attn_top1_geo_mean = float(
+                ((attn_top1_geo_q * query_weight_f.unsqueeze(1)).sum(dim=-1).mean(dim=1)).mean().item()
+            )
             ent_vis_q = -torch.sum(attn_vis_f * torch.log(attn_vis_f.clamp_min(1e-9)), dim=-1)  # [B,h,Lq]
             ent_geo_q = -torch.sum(attn_geo_f * torch.log(attn_geo_f.clamp_min(1e-9)), dim=-1)
             ent_vis_q_mean = float(
@@ -687,18 +718,27 @@ class MapAnythingLlava3D_PI(baseframework):
                 ((ent_geo_q * query_weight_f.unsqueeze(1)).sum(dim=-1).mean(dim=1)).mean().item()
             )
 
-            alpha_vis_norm = alpha_vis.detach().float().clamp_min(0.0)
-            alpha_geo_norm = alpha_geo.detach().float().clamp_min(0.0)
-            alpha_vis_norm = alpha_vis_norm / alpha_vis_norm.sum(dim=-1, keepdim=True).clamp_min(1e-9)
-            alpha_geo_norm = alpha_geo_norm / alpha_geo_norm.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+            alpha_vis_pre = alpha_vis.detach().float().clamp_min(0.0)
+            alpha_geo_pre = alpha_geo.detach().float().clamp_min(0.0)
+            alpha_mix_pre = alpha_pre.detach().float().clamp_min(0.0)
+            alpha_vis_norm = alpha_vis_pre / alpha_vis_pre.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+            alpha_geo_norm = alpha_geo_pre / alpha_geo_pre.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+            alpha_pre_norm = alpha_mix_pre / alpha_mix_pre.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+            alpha_post_norm = alpha.detach().float().clamp_min(0.0)
+            alpha_post_norm = alpha_post_norm / alpha_post_norm.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+
             ent_alpha_vis = -torch.sum(alpha_vis_norm * torch.log(alpha_vis_norm.clamp_min(1e-9)), dim=-1)
             ent_alpha_geo = -torch.sum(alpha_geo_norm * torch.log(alpha_geo_norm.clamp_min(1e-9)), dim=-1)
-
-            entropy = -torch.sum(alpha * torch.log(alpha.clamp_min(1e-9)), dim=-1)
+            entropy_pre = -torch.sum(alpha_pre_norm * torch.log(alpha_pre_norm.clamp_min(1e-9)), dim=-1)
+            entropy_post = -torch.sum(alpha_post_norm * torch.log(alpha_post_norm.clamp_min(1e-9)), dim=-1)
             topk = min(int(token_n), 32)
-            alpha_topk_vals = alpha.topk(topk, dim=-1).values
+            alpha_topk_vals = alpha_post_norm.topk(topk, dim=-1).values
             topk_mass = alpha_topk_vals.sum(dim=-1)
-            alpha_max = alpha.amax(dim=-1)
+            alpha_max_pre_raw = alpha_mix_pre.amax(dim=-1)
+            alpha_max_pre_norm = alpha_pre_norm.amax(dim=-1)
+            alpha_max_post_norm = alpha_post_norm.amax(dim=-1)
+            alpha_max_vis = alpha_vis_norm.amax(dim=-1)
+            alpha_max_geo = alpha_geo_norm.amax(dim=-1)
             alpha_top1_over_top32 = alpha_topk_vals[:, 0] / topk_mass.clamp_min(1e-9)
             argmax_vis = alpha_vis_head.detach().float().argmax(dim=-1)  # [B,h]
             argmax_geo = alpha_geo_head.detach().float().argmax(dim=-1)
@@ -718,13 +758,22 @@ class MapAnythingLlava3D_PI(baseframework):
             stats["debug/causal_feedback/soft_mask_logits_std_geo"] = logits_geo_std
             stats["debug/causal_feedback/soft_mask_logits_maxmin_vis"] = logits_vis_rng
             stats["debug/causal_feedback/soft_mask_logits_maxmin_geo"] = logits_geo_rng
+            stats["debug/causal_feedback/soft_mask_attn_top1_mean_vis"] = attn_top1_vis_mean
+            stats["debug/causal_feedback/soft_mask_attn_top1_mean_geo"] = attn_top1_geo_mean
             stats["debug/causal_feedback/soft_mask_entropy_attn_vis_query"] = ent_vis_q_mean
             stats["debug/causal_feedback/soft_mask_entropy_attn_geo_query"] = ent_geo_q_mean
             stats["debug/causal_feedback/soft_mask_entropy_alpha_vis"] = float(ent_alpha_vis.mean().item())
             stats["debug/causal_feedback/soft_mask_entropy_alpha_geo"] = float(ent_alpha_geo.mean().item())
-            stats["debug/causal_feedback/soft_mask_entropy"] = float(entropy.mean().item())
+            stats["debug/causal_feedback/soft_mask_entropy_pre_norm"] = float(entropy_pre.mean().item())
+            stats["debug/causal_feedback/soft_mask_entropy_post_norm"] = float(entropy_post.mean().item())
+            stats["debug/causal_feedback/soft_mask_entropy"] = float(entropy_post.mean().item())
             stats["debug/causal_feedback/soft_mask_topk_mass_32"] = float(topk_mass.mean().item())
-            stats["debug/causal_feedback/soft_mask_alpha_max_mean"] = float(alpha_max.mean().item())
+            stats["debug/causal_feedback/soft_mask_alpha_max_pre_raw"] = float(alpha_max_pre_raw.mean().item())
+            stats["debug/causal_feedback/soft_mask_alpha_max_pre_norm"] = float(alpha_max_pre_norm.mean().item())
+            stats["debug/causal_feedback/soft_mask_alpha_max_post_norm"] = float(alpha_max_post_norm.mean().item())
+            stats["debug/causal_feedback/soft_mask_alpha_max_mean"] = float(alpha_max_post_norm.mean().item())
+            stats["debug/causal_feedback/soft_mask_alpha_max_mean_vis"] = float(alpha_max_vis.mean().item())
+            stats["debug/causal_feedback/soft_mask_alpha_max_mean_geo"] = float(alpha_max_geo.mean().item())
             stats["debug/causal_feedback/soft_mask_alpha_top1_over_top32"] = float(
                 alpha_top1_over_top32.mean().item()
             )
