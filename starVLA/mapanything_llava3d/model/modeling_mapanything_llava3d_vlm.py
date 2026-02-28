@@ -391,6 +391,8 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
             attention_mask=attention_mask,
             image_token_index=image_token_index,
         )
+        self._last_language_queries = language_queries
+        self._last_language_query_mask = language_query_mask
         task_tokens = self._build_fixed_task_tokens(
             geometric_features=self._last_geometric_projected,
             vision_features=vision_features,
