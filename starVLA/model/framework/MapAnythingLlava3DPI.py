@@ -1524,6 +1524,11 @@ class MapAnythingLlava3D_PI(baseframework):
                     lang_qm_cached = getattr(vlm_core, "_last_language_query_mask", None)
                     if isinstance(lang_qm_cached, torch.Tensor):
                         language_query_mask = lang_qm_cached.to(device=base_hidden.device, dtype=torch.bool)
+                lang_filter_stats = getattr(vlm_core, "_last_language_filter_stats", None)
+                if isinstance(lang_filter_stats, dict):
+                    for key, value in lang_filter_stats.items():
+                        if isinstance(value, (int, float)):
+                            debug_metrics[f"debug/causal_feedback/query_filter_{key}"] = float(value)
                 geom_stats = getattr(vlm_core, "geom_feature_stats", None)
                 geom_model_forward_ms = getattr(vlm_core, "debug_last_geom_model_forward_ms", None)
                 geom_feature_extract_ms = getattr(vlm_core, "debug_last_geom_feature_extract_ms", None)
@@ -1620,6 +1625,41 @@ class MapAnythingLlava3D_PI(baseframework):
                         debug_metrics["debug/input/num_image_tokens_per_sample_mean"] = float(per_sample.float().mean().item())
                         debug_metrics["debug/input/num_image_tokens_per_sample_min"] = float(per_sample.min().item())
                         debug_metrics["debug/input/num_image_tokens_per_sample_max"] = float(per_sample.max().item())
+                    instruction_token_mask = vlm_inputs.get("instruction_token_mask", None)
+                    attention_mask_input = vlm_inputs.get("attention_mask", None)
+                    if (
+                        isinstance(input_ids, torch.Tensor)
+                        and input_ids.ndim == 2
+                        and isinstance(instruction_token_mask, torch.Tensor)
+                        and instruction_token_mask.ndim == 2
+                        and instruction_token_mask.shape == input_ids.shape
+                    ):
+                        if isinstance(attention_mask_input, torch.Tensor) and attention_mask_input.shape == input_ids.shape:
+                            active = attention_mask_input.to(device=input_ids.device, dtype=torch.bool)
+                        else:
+                            active = torch.ones_like(input_ids, dtype=torch.bool)
+                        if image_token_index is not None:
+                            lang_active = active & (input_ids != int(image_token_index))
+                        else:
+                            lang_active = active
+                        instr_mask = instruction_token_mask.to(device=input_ids.device, dtype=torch.bool) & active
+                        instr_lang = lang_active & instr_mask
+                        tmpl_lang = lang_active & (~instr_mask)
+                        lang_count = lang_active.sum(dim=1).to(dtype=torch.float32)
+                        instr_count = instr_lang.sum(dim=1).to(dtype=torch.float32)
+                        tmpl_count = tmpl_lang.sum(dim=1).to(dtype=torch.float32)
+                        debug_metrics["debug/input/cot_mask_present"] = 1.0
+                        debug_metrics["debug/input/cot_instr_tokens_per_sample_mean"] = float(instr_count.mean().item())
+                        debug_metrics["debug/input/cot_tmpl_tokens_per_sample_mean"] = float(tmpl_count.mean().item())
+                        debug_metrics["debug/input/cot_instr_frac_lang_mean"] = float(
+                            (instr_count / lang_count.clamp_min(1.0)).mean().item()
+                        )
+                        debug_metrics["debug/input/cot_tmpl_frac_lang_mean"] = float(
+                            (tmpl_count / lang_count.clamp_min(1.0)).mean().item()
+                        )
+                        debug_metrics["debug/input/cot_instr_zero_frac"] = float((instr_count <= 0).float().mean().item())
+                    elif isinstance(input_ids, torch.Tensor) and input_ids.ndim == 2:
+                        debug_metrics["debug/input/cot_mask_present"] = 0.0
                 except Exception:
                     debug_metrics = debug_metrics
             except Exception:

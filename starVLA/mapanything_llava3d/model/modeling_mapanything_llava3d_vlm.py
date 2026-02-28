@@ -265,6 +265,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
         input_ids: Optional[torch.LongTensor],
         attention_mask: Optional[torch.Tensor],
         image_token_index: Optional[int],
+        instruction_token_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         if not isinstance(inputs_embeds, torch.Tensor) or inputs_embeds.ndim != 3:
             return None, None
@@ -277,11 +278,36 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
         if isinstance(input_ids, torch.Tensor):
             input_ids = input_ids.to(device=device)
             if image_token_index is not None:
-                lang_mask = (input_ids != int(image_token_index)) & active
+                base_lang_mask = (input_ids != int(image_token_index)) & active
             else:
-                lang_mask = active
+                base_lang_mask = active
         else:
-            lang_mask = active
+            base_lang_mask = active
+        lang_mask = base_lang_mask
+        filter_enabled = False
+        fallback_mask = torch.zeros((bsz,), dtype=torch.bool, device=device)
+        if isinstance(instruction_token_mask, torch.Tensor):
+            instr_mask = instruction_token_mask.to(device=device, dtype=torch.bool)
+            if instr_mask.ndim == 2 and instr_mask.shape[0] == bsz and instr_mask.shape[1] == seq_len:
+                filter_enabled = True
+                filtered_mask = base_lang_mask & instr_mask
+                has_filtered = filtered_mask.any(dim=1, keepdim=True)
+                fallback_mask = ~has_filtered.squeeze(1)
+                lang_mask = torch.where(has_filtered, filtered_mask, base_lang_mask)
+        with torch.no_grad():
+            base_count = base_lang_mask.sum(dim=1).to(dtype=torch.float32)
+            kept_count = lang_mask.sum(dim=1).to(dtype=torch.float32)
+            removed_count = (base_count - kept_count).clamp_min(0.0)
+            self._last_language_filter_stats = {
+                "enabled": 1.0 if filter_enabled else 0.0,
+                "lang_tokens_base_mean": float(base_count.mean().item()),
+                "lang_tokens_after_filter_mean": float(kept_count.mean().item()),
+                "lang_tokens_removed_mean": float(removed_count.mean().item()),
+                "lang_tokens_removed_frac_mean": float(
+                    (removed_count / base_count.clamp_min(1.0)).mean().item()
+                ),
+                "lang_filter_fallback_frac": float(fallback_mask.float().mean().item()),
+            }
 
         max_tokens = max(1, int(self.semantic_query_max_tokens))
         select_mode = self.semantic_query_select_mode
@@ -377,6 +403,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
         input_ids: Optional[torch.LongTensor],
         attention_mask: Optional[torch.Tensor],
         image_token_index: Optional[int],
+        instruction_token_mask: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         if not isinstance(lm_hidden_states, torch.Tensor):
             return None
@@ -390,6 +417,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
             input_ids=input_ids,
             attention_mask=attention_mask,
             image_token_index=image_token_index,
+            instruction_token_mask=instruction_token_mask,
         )
         self._last_language_queries = language_queries
         self._last_language_query_mask = language_query_mask
@@ -747,6 +775,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
         pixel_values: Optional[torch.FloatTensor] = None,
         intrinsic: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        instruction_token_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_dict: Optional[bool] = None,
         image_token_index: Optional[int] = None,
@@ -763,6 +792,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
                 pixel_values=pixel_values,
                 intrinsic=intrinsic,
                 attention_mask=attention_mask,
+                instruction_token_mask=instruction_token_mask,
                 inputs_embeds=inputs_embeds,
                 labels=None,
                 use_cache=False,
@@ -822,6 +852,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 image_token_index=spatial_img_id,
+                instruction_token_mask=instruction_token_mask,
             )
             self._last_language_queries = language_queries
             self._last_language_query_mask = language_query_mask
@@ -861,6 +892,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
         intrinsic: Optional[torch.Tensor] = None,
         actions: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        instruction_token_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
@@ -914,6 +946,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 image_token_index=spatial_img_id,
+                instruction_token_mask=instruction_token_mask,
             )
             self._last_language_queries = language_queries
             self._last_language_query_mask = language_query_mask
@@ -1032,6 +1065,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 image_token_index=spatial_img_id if "spatial_img_id" in locals() else None,
+                instruction_token_mask=instruction_token_mask,
             )
             task_tokens = self._validate_task_tokens(task_tokens, context="forward-postlm")
             self._record_health("forward/task_tokens_post_lm", task_tokens)

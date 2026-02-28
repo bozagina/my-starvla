@@ -251,17 +251,34 @@ class _MapAnythingLlava3D_Interface(nn.Module):
     def build_mapanythingllava3d_inputs(self, images: List[List], instructions: List[str], unnorm_key: Optional[str] = None) -> Dict[str, torch.Tensor]:
         assert len(images) == len(instructions)
         cot_prompt = None
+        cot_prefix = ""
         datasets_cfg = getattr(self.runtime_config, "datasets", None) if self.runtime_config is not None else None
         vla_cfg = getattr(datasets_cfg, "vla_data", None) if datasets_cfg is not None else None
         if vla_cfg is not None and hasattr(vla_cfg, "CoT_prompt"):
             cot_prompt = getattr(vla_cfg, "CoT_prompt")
+            if isinstance(cot_prompt, str) and "{instruction}" in cot_prompt:
+                cot_prefix = cot_prompt.split("{instruction}", 1)[0]
         processed_instructions = []
+        instruction_char_spans = []
         for instruction in instructions:
             normalized_instruction = self._normalize_instruction(instruction)
             if cot_prompt:
-                processed_instructions.append(cot_prompt.replace("{instruction}", normalized_instruction))
+                prompt_text = cot_prompt.replace("{instruction}", normalized_instruction)
+                processed_instructions.append(prompt_text)
+                if "{instruction}" in cot_prompt:
+                    span_start = len(cot_prefix)
+                    span_end = span_start + len(normalized_instruction)
+                else:
+                    span_start = prompt_text.find(normalized_instruction)
+                    if span_start >= 0:
+                        span_end = span_start + len(normalized_instruction)
+                    else:
+                        span_start, span_end = 0, 0
             else:
                 processed_instructions.append(normalized_instruction)
+                span_start = 0
+                span_end = len(normalized_instruction)
+            instruction_char_spans.append((int(span_start), int(span_end)))
         if _is_rank0() and self.instruction_log_interval > 0:
             self._instruction_log_counter += 1
             if self._instruction_log_counter % self.instruction_log_interval == 0:
@@ -270,6 +287,7 @@ class _MapAnythingLlava3D_Interface(nn.Module):
             text=processed_instructions,
             images=images,
             unnorm_key=unnorm_key,
+            instruction_char_spans=instruction_char_spans,
             return_tensors="pt",
         )
         batch = dict(model_inputs.data)

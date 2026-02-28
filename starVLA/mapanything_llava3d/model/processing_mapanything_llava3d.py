@@ -34,6 +34,15 @@ from .action_tokenizer import SpatialActionTokenizer
 
 logger = logging.getLogger(__name__)
 
+
+def _is_rank0():
+    if not torch.distributed.is_available():
+        return True
+    if not torch.distributed.is_initialized():
+        return True
+    return torch.distributed.get_rank() == 0
+
+
 class MapAnythingLlava3DProcessor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
     valid_kwargs = ["chat_template"]
@@ -123,6 +132,8 @@ class MapAnythingLlava3DProcessor(ProcessorMixin):
             
         self.num_obs_steps = num_obs_steps
         self.action_chunk_size = action_chunk_size
+        self._cot_mask_log_counter = 0
+        self._cot_mask_log_first_n = 3
 
     @staticmethod
     def _extract_ids(tokenizer_output):
@@ -179,6 +190,7 @@ class MapAnythingLlava3DProcessor(ProcessorMixin):
         text: Union[TextInput, List[TextInput]] = None,
         images: ImageInput = None,
         unnorm_key: Optional[str] = None,
+        instruction_char_spans: Optional[List] = None,
         suffix_actions: Optional[np.array] = None,
         return_tensors: Optional[str] = "pt",
         **kwargs,
@@ -199,12 +211,34 @@ class MapAnythingLlava3DProcessor(ProcessorMixin):
 
         if isinstance(text, str):
             text = [text]
+
+        sample_count = len(text)
+        span_list = None
+        if instruction_char_spans is not None:
+            if len(instruction_char_spans) != sample_count:
+                logger.warning(
+                    "instruction_char_spans length mismatch: spans=%d text=%d, ignore spans.",
+                    len(instruction_char_spans),
+                    sample_count,
+                )
+            else:
+                span_list = []
+                for span in instruction_char_spans:
+                    try:
+                        s, e = int(span[0]), int(span[1])
+                    except Exception:
+                        s, e = 0, 0
+                    span_list.append([s, e])
         
         if images is not None:
             updated = []
-            for t in text:
+            prefix = f"{DEFAULT_IMAGE_TOKEN} "
+            for idx, t in enumerate(text):
                 if isinstance(t, str) and DEFAULT_IMAGE_TOKEN not in t:
-                    updated.append(f"{DEFAULT_IMAGE_TOKEN} {t}")
+                    updated.append(prefix + t)
+                    if span_list is not None:
+                        span_list[idx][0] += len(prefix)
+                        span_list[idx][1] += len(prefix)
                 else:
                     updated.append(t)
             text = updated
@@ -248,6 +282,17 @@ class MapAnythingLlava3DProcessor(ProcessorMixin):
         # --- 2. Expand Text with Image Tokens ---
         # Logic: Replace single <image> token with sequence of <image> tokens
         # to reserve slots for embeddings.
+        def _count_occ_before(text_str: str, token: str, end_pos: int) -> int:
+            count = 0
+            cursor = 0
+            while True:
+                pos = text_str.find(token, cursor)
+                if pos < 0 or pos >= end_pos:
+                    break
+                count += 1
+                cursor = pos + len(token)
+            return count
+
         expanded_text = []
         for idx, t in enumerate(text):
             if DEFAULT_IMAGE_TOKEN in t:
@@ -255,6 +300,13 @@ class MapAnythingLlava3DProcessor(ProcessorMixin):
                 if num_images_per_sample is not None and idx < len(num_images_per_sample):
                     num_images = num_images_per_sample[idx]
                 replacement = self.image_token_joiner.join([DEFAULT_IMAGE_TOKEN] * (self.image_seq_length * num_images))
+                if span_list is not None:
+                    span_start, span_end = span_list[idx]
+                    delta = len(replacement) - len(DEFAULT_IMAGE_TOKEN)
+                    if delta != 0 and span_start > 0:
+                        shift = _count_occ_before(t, DEFAULT_IMAGE_TOKEN, span_start) * delta
+                        span_list[idx][0] = span_start + shift
+                        span_list[idx][1] = span_end + shift
                 t_expanded = t.replace(DEFAULT_IMAGE_TOKEN, replacement)
                 expanded_text.append(t_expanded)
             else:
@@ -270,14 +322,81 @@ class MapAnythingLlava3DProcessor(ProcessorMixin):
             
         # Combine
         final_text = [t + suffix_str for t in expanded_text]
-        
+
+        use_offsets = bool(span_list is not None and getattr(self.tokenizer, "is_fast", False))
         model_inputs = self.tokenizer(
             final_text,
             return_tensors=return_tensors,
             padding=kwargs.get("padding", True),
             truncation=kwargs.get("truncation", True),
-            max_length=kwargs.get("max_length", None)
+            max_length=kwargs.get("max_length", None),
+            return_offsets_mapping=use_offsets,
         )
+
+        if span_list is not None and not use_offsets:
+            logger.warning(
+                "Tokenizer is not fast tokenizer; skip instruction_token_mask building."
+            )
+
+        if span_list is not None and use_offsets:
+            offsets = model_inputs.get("offset_mapping", None)
+            input_ids = model_inputs.get("input_ids", None)
+            attention_mask = model_inputs.get("attention_mask", None)
+            if (
+                isinstance(offsets, torch.Tensor)
+                and isinstance(input_ids, torch.Tensor)
+                and offsets.ndim == 3
+                and offsets.shape[:2] == input_ids.shape[:2]
+            ):
+                instruction_token_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+                for bid, (span_start, span_end) in enumerate(span_list):
+                    if span_end <= span_start:
+                        continue
+                    tok_start = offsets[bid, :, 0]
+                    tok_end = offsets[bid, :, 1]
+                    valid = tok_end > tok_start
+                    in_span = (tok_start < span_end) & (tok_end > span_start) & valid
+                    if isinstance(attention_mask, torch.Tensor):
+                        in_span = in_span & attention_mask[bid].to(dtype=torch.bool)
+                    instruction_token_mask[bid] = in_span
+                model_inputs["instruction_token_mask"] = instruction_token_mask
+
+                if _is_rank0() and self._cot_mask_log_counter < self._cot_mask_log_first_n:
+                    max_show = min(int(input_ids.shape[0]), 2)
+                    for bid in range(max_show):
+                        ids = input_ids[bid]
+                        if isinstance(attention_mask, torch.Tensor):
+                            active = attention_mask[bid].to(dtype=torch.bool)
+                        else:
+                            active = torch.ones_like(ids, dtype=torch.bool)
+                        lang_active = active & (ids != int(self.image_token_id))
+                        instr_sel = lang_active & instruction_token_mask[bid]
+                        tmpl_sel = lang_active & (~instruction_token_mask[bid])
+                        instr_ids = ids[instr_sel]
+                        tmpl_ids = ids[tmpl_sel]
+                        instr_text = self.tokenizer.decode(instr_ids.tolist(), skip_special_tokens=False)
+                        tmpl_text = self.tokenizer.decode(tmpl_ids.tolist(), skip_special_tokens=False)
+
+                        def _short_text(text_value: str, max_len: int = 220) -> str:
+                            text_value = text_value.replace("\n", " ").strip()
+                            if len(text_value) > max_len:
+                                return text_value[:max_len] + "..."
+                            return text_value
+
+                        logger.info(
+                            "[cot_query_mask] sample=%d lang=%d instr=%d tmpl=%d instr_ids_head=%s tmpl_ids_head=%s instr_text=%s tmpl_text=%s",
+                            bid,
+                            int(lang_active.sum().item()),
+                            int(instr_sel.sum().item()),
+                            int(tmpl_sel.sum().item()),
+                            instr_ids[:16].tolist(),
+                            tmpl_ids[:16].tolist(),
+                            _short_text(instr_text),
+                            _short_text(tmpl_text),
+                        )
+                    self._cot_mask_log_counter += 1
+
+            model_inputs.pop("offset_mapping", None)
         
         # --- 4. Add Extra Info ---
         if pixel_values is not None:
