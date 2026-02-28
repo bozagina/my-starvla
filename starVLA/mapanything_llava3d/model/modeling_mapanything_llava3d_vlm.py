@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import PreTrainedModel, AutoModel
 from transformers.utils import ModelOutput, logging
 from transformers.generation import GenerationMixin
