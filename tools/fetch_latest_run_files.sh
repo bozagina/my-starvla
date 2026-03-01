@@ -65,14 +65,37 @@ if [ -n "$RUN_FILTER" ]; then
 fi
 
 if [ -n "$RUN_ID" ]; then
-  LATEST_REL="$RUN_ID"
+  MATCHED_RUNS=$(
+    printf "%s\n" "$RUNS" \
+      | awk -v rid="$RUN_ID" '
+          $0 == rid { print; next }
+          index($0, rid "__") == 1 { print }
+        ' \
+      || true
+  )
+  if [ -n "${MATCHED_RUNS:-}" ]; then
+    LATEST_REL="$(printf "%s\n" "$MATCHED_RUNS" | sort | tail -n 1)"
+    if [ "$LATEST_REL" != "$RUN_ID" ]; then
+      echo "[fetch] INFO: RUN_ID matched by prefix, selected: $LATEST_REL"
+    fi
+  else
+    echo "[fetch] WARN: RUN_ID '$RUN_ID' not found in run directories; using it as-is."
+    LATEST_REL="$RUN_ID"
+  fi
 else
   LATEST_REL=$(
     printf "%s\n" "$RUNS" \
       | awk '
-          match($0, /_20[0-9]{6}_[0-9]{6}$/) {
-            ts = substr($0, RSTART + 1, RLENGTH - 1)
-            print ts "\t" $0
+          {
+            run = $0
+            # Allow run dir suffixes like "__ALG1-MASK-20260301-002-OC".
+            base = run
+            sub(/__.*/, "", base)
+            if (match(base, /_20[0-9]{6}_[0-9]{6}$/)) {
+              ts = substr(base, RSTART + 1, RLENGTH - 1)
+              gsub(/_/, "", ts)
+              print ts "\t" run
+            }
           }
         ' \
       | sort -k1,1 \

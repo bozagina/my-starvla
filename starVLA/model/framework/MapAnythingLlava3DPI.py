@@ -7,6 +7,11 @@ import torch.nn.functional as F
 import torch.nn as nn
 import numpy as np
 from PIL import Image
+try:
+    from transformers import AutoTokenizer, SiglipTextModel
+except Exception:  # pragma: no cover - optional dependency path
+    AutoTokenizer = None
+    SiglipTextModel = None
 
 from starVLA.training.trainer_utils import initialize_overwatch
 from starVLA.model.framework.base_framework import baseframework
@@ -200,6 +205,56 @@ class MapAnythingLlava3D_PI(baseframework):
         )
         if self.soft_mask_directed_self_scale <= 0.0:
             self.soft_mask_directed_self_scale = 1.0
+        self.soft_mask_teacher_enabled = bool(
+            getattr(action_cfg, "soft_mask_teacher_enabled", False)
+        )
+        self.soft_mask_teacher_type = str(
+            getattr(action_cfg, "soft_mask_teacher_type", "siglip_retrieval")
+        ).strip().lower()
+        if self.soft_mask_teacher_type not in ("siglip_retrieval",):
+            logger.warning(
+                "[causal_feedback] invalid soft_mask_teacher_type=%s, fallback to siglip_retrieval",
+                self.soft_mask_teacher_type,
+            )
+            self.soft_mask_teacher_type = "siglip_retrieval"
+        self.soft_mask_teacher_model_name_or_path = str(
+            getattr(action_cfg, "soft_mask_teacher_model_name_or_path", "")
+        ).strip()
+        self.soft_mask_teacher_weight = float(
+            getattr(action_cfg, "soft_mask_teacher_weight", 0.0)
+        )
+        if self.soft_mask_teacher_weight < 0.0:
+            self.soft_mask_teacher_weight = 0.0
+        self.soft_mask_teacher_temperature = float(
+            getattr(action_cfg, "soft_mask_teacher_temperature", 0.07)
+        )
+        if self.soft_mask_teacher_temperature <= 0.0:
+            self.soft_mask_teacher_temperature = 0.07
+        self.soft_mask_teacher_label_smoothing = float(
+            getattr(action_cfg, "soft_mask_teacher_label_smoothing", 0.0)
+        )
+        self.soft_mask_teacher_label_smoothing = float(
+            max(0.0, min(0.5, self.soft_mask_teacher_label_smoothing))
+        )
+        self.soft_mask_teacher_confidence_floor = float(
+            getattr(action_cfg, "soft_mask_teacher_confidence_floor", 0.0)
+        )
+        self.soft_mask_teacher_confidence_floor = float(
+            max(0.0, min(1.0, self.soft_mask_teacher_confidence_floor))
+        )
+        self.soft_mask_teacher_start_step = int(
+            getattr(action_cfg, "soft_mask_teacher_start_step", 0)
+        )
+        if self.soft_mask_teacher_start_step < 0:
+            self.soft_mask_teacher_start_step = 0
+        self.soft_mask_teacher_stop_step = int(
+            getattr(action_cfg, "soft_mask_teacher_stop_step", -1)
+        )
+        self.soft_mask_teacher_neg_control_interval = int(
+            getattr(action_cfg, "soft_mask_teacher_neg_control_interval", 50)
+        )
+        if self.soft_mask_teacher_neg_control_interval < 0:
+            self.soft_mask_teacher_neg_control_interval = 0
         # Low-frequency stability probe for Path-A residual direction:
         # cosine(mean(delta_t), mean(delta_{t-1})).
         self.causal_feedback_delta_cos_interval = max(
@@ -272,8 +327,17 @@ class MapAnythingLlava3D_PI(baseframework):
         self._patha_prev_language_query_mask = None
         self._patha_soft_mask_ema = None
         self._patha_prev_soft_mask_mean = None
+        self._patha_last_soft_mask_alpha = None
+        self._patha_last_soft_mask_token_num = 0
         self._causal_feedback_prev_delta_mean = None
         self._causal_feedback_delta_step = 0
+        self._soft_mask_teacher_forward_step = 0
+        self._soft_mask_teacher_ready = False
+        self._soft_mask_teacher_error = ""
+        self._soft_mask_teacher_source = ""
+        self._soft_mask_teacher_text_tokenizer = None
+        self.soft_mask_teacher_text_model = None
+        self._init_soft_mask_teacher()
         self._debug_last_feedback_tokens_for_grad = None
         self._debug_last_task_tokens_for_grad = None
         self.reset_inference_state()
@@ -298,6 +362,328 @@ class MapAnythingLlava3D_PI(baseframework):
         self._patha_prev_language_query_mask = None
         self._patha_soft_mask_ema = None
         self._patha_prev_soft_mask_mean = None
+        self._patha_last_soft_mask_alpha = None
+        self._patha_last_soft_mask_token_num = 0
+
+    def _resolve_soft_mask_teacher_sources(self) -> List[str]:
+        sources: List[str] = []
+        if isinstance(self.soft_mask_teacher_model_name_or_path, str) and self.soft_mask_teacher_model_name_or_path:
+            sources.append(self.soft_mask_teacher_model_name_or_path)
+        vlm_iface = getattr(self, "mapanythingllava3d_vlm_interface", None)
+        for cfg in (
+            getattr(vlm_iface, "config", None),
+            getattr(getattr(vlm_iface, "model", None), "config", None),
+        ):
+            if cfg is None:
+                continue
+            candidate = getattr(cfg, "vision_model_name_or_path", None)
+            if isinstance(candidate, str) and candidate:
+                sources.append(candidate)
+        uniq = []
+        seen = set()
+        for src in sources:
+            if src in seen:
+                continue
+            seen.add(src)
+            uniq.append(src)
+        return uniq
+
+    def _init_soft_mask_teacher(self) -> None:
+        self._soft_mask_teacher_ready = False
+        self._soft_mask_teacher_error = ""
+        self._soft_mask_teacher_source = ""
+        self._soft_mask_teacher_text_tokenizer = None
+        self.soft_mask_teacher_text_model = None
+        if not self.soft_mask_teacher_enabled or self.soft_mask_teacher_weight <= 0.0:
+            return
+        if self.soft_mask_teacher_type != "siglip_retrieval":
+            self._soft_mask_teacher_error = f"unsupported_teacher_type:{self.soft_mask_teacher_type}"
+            return
+        if AutoTokenizer is None or SiglipTextModel is None:
+            self._soft_mask_teacher_error = "transformers_siglip_text_unavailable"
+            logger.warning("[soft_mask_teacher] transformers SigLIP text components unavailable; teacher disabled.")
+            return
+        sources = self._resolve_soft_mask_teacher_sources()
+        if not sources:
+            self._soft_mask_teacher_error = "no_teacher_source"
+            logger.warning("[soft_mask_teacher] cannot resolve teacher model source; teacher disabled.")
+            return
+        failures: List[str] = []
+        for src in sources:
+            tokenizer = None
+            text_model = None
+            tok_err = None
+            model_err = None
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(src, trust_remote_code=True)
+            except Exception as e1:
+                tok_err = str(e1)
+                try:
+                    tokenizer = AutoTokenizer.from_pretrained(src)
+                    tok_err = None
+                except Exception as e2:
+                    tok_err = f"{tok_err} | fallback={e2}"
+            if tokenizer is None:
+                failures.append(f"{src}:tokenizer:{tok_err}")
+                continue
+            try:
+                text_model = SiglipTextModel.from_pretrained(src, subfolder="text_model")
+            except Exception as e1:
+                model_err = str(e1)
+                try:
+                    text_model = SiglipTextModel.from_pretrained(src)
+                    model_err = None
+                except Exception as e2:
+                    model_err = f"{model_err} | fallback={e2}"
+            if text_model is None:
+                failures.append(f"{src}:text_model:{model_err}")
+                continue
+            text_model.eval()
+            for p in text_model.parameters():
+                p.requires_grad_(False)
+            self._soft_mask_teacher_text_tokenizer = tokenizer
+            self.soft_mask_teacher_text_model = text_model
+            self._soft_mask_teacher_ready = True
+            self._soft_mask_teacher_source = src
+            logger.info("[soft_mask_teacher] loaded SigLIP text teacher from %s", src)
+            return
+        self._soft_mask_teacher_error = "; ".join(failures[-4:]) if failures else "teacher_init_failed"
+        logger.warning("[soft_mask_teacher] failed to initialize teacher: %s", self._soft_mask_teacher_error)
+
+    @staticmethod
+    def _distribution_stats(dist: torch.Tensor, topk: int = 32) -> Dict[str, float]:
+        if not isinstance(dist, torch.Tensor) or dist.ndim != 2 or dist.numel() == 0:
+            return {}
+        dist_f = dist.detach().float()
+        token_n = int(dist_f.shape[1])
+        topk = max(1, min(token_n, int(topk)))
+        entropy = -torch.sum(dist_f * torch.log(dist_f.clamp_min(1e-9)), dim=-1)
+        top1 = dist_f.amax(dim=-1)
+        topk_mass = dist_f.topk(topk, dim=-1).values.sum(dim=-1)
+        return {
+            "entropy": float(entropy.mean().item()),
+            "top1": float(top1.mean().item()),
+            "topk_mass_32": float(topk_mass.mean().item()),
+            "token_n": float(token_n),
+        }
+
+    def _compute_soft_mask_teacher_distribution(
+        self,
+        *,
+        instructions: List[str],
+        vision_tokens_raw: Optional[torch.Tensor],
+        token_n: int,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, float]]:
+        stats: Dict[str, float] = {}
+        if not self._soft_mask_teacher_ready:
+            stats["debug/causal_feedback/soft_mask_teacher_not_ready"] = 1.0
+            return None, None, stats
+        if not isinstance(vision_tokens_raw, torch.Tensor) or vision_tokens_raw.ndim != 3:
+            stats["debug/causal_feedback/soft_mask_teacher_missing_vision_tokens_raw"] = 1.0
+            return None, None, stats
+        if token_n <= 0:
+            stats["debug/causal_feedback/soft_mask_teacher_invalid_token_n"] = 1.0
+            return None, None, stats
+        batch_size = int(vision_tokens_raw.shape[0])
+        if batch_size <= 0:
+            stats["debug/causal_feedback/soft_mask_teacher_empty_batch"] = 1.0
+            return None, None, stats
+        if not isinstance(instructions, list) or len(instructions) != batch_size:
+            stats["debug/causal_feedback/soft_mask_teacher_instruction_batch_mismatch"] = 1.0
+            return None, None, stats
+        tokenizer = self._soft_mask_teacher_text_tokenizer
+        text_model = self.soft_mask_teacher_text_model
+        if tokenizer is None or text_model is None:
+            stats["debug/causal_feedback/soft_mask_teacher_missing_components"] = 1.0
+            return None, None, stats
+        device = vision_tokens_raw.device
+        model_device = None
+        try:
+            model_device = next(text_model.parameters()).device
+        except Exception:
+            model_device = device
+        if model_device != device:
+            text_model = text_model.to(device=device)
+            self.soft_mask_teacher_text_model = text_model
+        token_n = min(int(token_n), int(vision_tokens_raw.shape[1]))
+        if token_n <= 0:
+            stats["debug/causal_feedback/soft_mask_teacher_token_n_after_clip_zero"] = 1.0
+            return None, None, stats
+        try:
+            text_inputs = tokenizer(
+                [str(x) for x in instructions],
+                padding=True,
+                truncation=True,
+                return_tensors="pt",
+            )
+        except Exception:
+            stats["debug/causal_feedback/soft_mask_teacher_tokenize_error"] = 1.0
+            return None, None, stats
+        text_inputs = {
+            k: v.to(device=device) if isinstance(v, torch.Tensor) else v
+            for k, v in text_inputs.items()
+        }
+        with torch.no_grad():
+            text_outputs = text_model(**text_inputs, return_dict=True)
+            if hasattr(text_outputs, "pooler_output") and isinstance(text_outputs.pooler_output, torch.Tensor):
+                text_embed = text_outputs.pooler_output
+            else:
+                hidden = text_outputs.last_hidden_state
+                attn_mask = text_inputs.get("attention_mask", None)
+                if isinstance(attn_mask, torch.Tensor) and attn_mask.ndim == 2 and attn_mask.shape[0] == hidden.shape[0]:
+                    weights = attn_mask.to(device=hidden.device, dtype=hidden.dtype).unsqueeze(-1)
+                    text_embed = (hidden * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+                else:
+                    text_embed = hidden.mean(dim=1)
+            text_embed = text_embed.float()
+            vision_embed = vision_tokens_raw[:, :token_n, :].to(device=device, dtype=torch.float32)
+            if text_embed.shape[-1] != vision_embed.shape[-1]:
+                stats["debug/causal_feedback/soft_mask_teacher_dim_mismatch"] = 1.0
+                stats["debug/causal_feedback/soft_mask_teacher_text_dim"] = float(text_embed.shape[-1])
+                stats["debug/causal_feedback/soft_mask_teacher_vision_dim"] = float(vision_embed.shape[-1])
+                return None, None, stats
+            text_embed = F.normalize(text_embed, dim=-1)
+            vision_embed = F.normalize(vision_embed, dim=-1)
+            temp = max(float(self.soft_mask_teacher_temperature), 1e-6)
+            logits = torch.einsum("bd,bnd->bn", text_embed, vision_embed) / temp
+            teacher_dist = torch.softmax(logits, dim=-1)
+            smooth = float(self.soft_mask_teacher_label_smoothing)
+            if smooth > 0.0:
+                teacher_dist = (1.0 - smooth) * teacher_dist + smooth / float(token_n)
+                teacher_dist = teacher_dist / teacher_dist.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+            confidence = teacher_dist.amax(dim=-1)
+            conf_floor = float(self.soft_mask_teacher_confidence_floor)
+            if conf_floor > 0.0:
+                sample_weight = (confidence >= conf_floor).to(dtype=teacher_dist.dtype)
+            else:
+                sample_weight = torch.ones_like(confidence, dtype=teacher_dist.dtype)
+            dist_stats = self._distribution_stats(teacher_dist, topk=32)
+            stats["debug/causal_feedback/soft_mask_teacher_entropy"] = float(dist_stats.get("entropy", 0.0))
+            stats["debug/causal_feedback/soft_mask_teacher_top1_mean"] = float(dist_stats.get("top1", 0.0))
+            stats["debug/causal_feedback/soft_mask_teacher_topk_mass_32"] = float(
+                dist_stats.get("topk_mass_32", 0.0)
+            )
+            stats["debug/causal_feedback/soft_mask_teacher_token_num"] = float(dist_stats.get("token_n", token_n))
+            stats["debug/causal_feedback/soft_mask_teacher_confidence_mean"] = float(confidence.mean().item())
+            stats["debug/causal_feedback/soft_mask_teacher_sample_weight_mean"] = float(sample_weight.mean().item())
+        return teacher_dist, sample_weight, stats
+
+    def _compute_soft_mask_teacher_loss(
+        self,
+        *,
+        alpha_pred: Optional[torch.Tensor],
+        instructions: List[str],
+        vision_tokens_raw: Optional[torch.Tensor],
+        forward_step: int,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
+        stats: Dict[str, float] = {
+            "debug/causal_feedback/soft_mask_teacher_enabled": float(self.soft_mask_teacher_enabled),
+            "debug/causal_feedback/soft_mask_teacher_ready": float(self._soft_mask_teacher_ready),
+            "debug/causal_feedback/soft_mask_teacher_weight": float(self.soft_mask_teacher_weight),
+            "debug/causal_feedback/soft_mask_teacher_temperature": float(self.soft_mask_teacher_temperature),
+            "debug/causal_feedback/soft_mask_teacher_step": float(forward_step),
+            "debug/causal_feedback/soft_mask_teacher_active": 0.0,
+        }
+        if isinstance(self._soft_mask_teacher_error, str) and self._soft_mask_teacher_error:
+            stats["debug/causal_feedback/soft_mask_teacher_error"] = 1.0
+        if (
+            not self.soft_mask_teacher_enabled
+            or self.soft_mask_teacher_weight <= 0.0
+            or not isinstance(alpha_pred, torch.Tensor)
+            or alpha_pred.ndim != 2
+        ):
+            return None, stats
+        if not self._soft_mask_teacher_ready:
+            return None, stats
+        if forward_step < self.soft_mask_teacher_start_step:
+            stats["debug/causal_feedback/soft_mask_teacher_before_start_step"] = 1.0
+            return None, stats
+        if self.soft_mask_teacher_stop_step >= 0 and forward_step > self.soft_mask_teacher_stop_step:
+            stats["debug/causal_feedback/soft_mask_teacher_after_stop_step"] = 1.0
+            return None, stats
+        token_n = min(
+            int(alpha_pred.shape[1]),
+            int(vision_tokens_raw.shape[1]) if isinstance(vision_tokens_raw, torch.Tensor) and vision_tokens_raw.ndim == 3 else 0,
+        )
+        teacher_dist, sample_weight, dist_stats = self._compute_soft_mask_teacher_distribution(
+            instructions=instructions,
+            vision_tokens_raw=vision_tokens_raw,
+            token_n=token_n,
+        )
+        stats.update(dist_stats)
+        if not isinstance(teacher_dist, torch.Tensor) or teacher_dist.ndim != 2:
+            return None, stats
+        if alpha_pred.shape != teacher_dist.shape:
+            stats["debug/causal_feedback/soft_mask_teacher_shape_mismatch"] = 1.0
+            return None, stats
+        alpha_norm = alpha_pred.clamp_min(1e-9)
+        alpha_norm = alpha_norm / alpha_norm.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+        teacher = teacher_dist.detach()
+        per_sample_kl = torch.sum(
+            teacher * (torch.log(teacher.clamp_min(1e-9)) - torch.log(alpha_norm.clamp_min(1e-9))),
+            dim=-1,
+        )
+        mask = sample_weight if isinstance(sample_weight, torch.Tensor) else None
+        loss_kl = self._masked_mean(per_sample_kl, mask)
+        cos_sim = F.cosine_similarity(alpha_norm, teacher, dim=-1)
+        l1_dist = torch.sum((alpha_norm - teacher).abs(), dim=-1)
+        stats["debug/causal_feedback/soft_mask_teacher_kl"] = float(loss_kl.detach().item())
+        stats["debug/causal_feedback/soft_mask_teacher_alpha_cos"] = float(
+            self._masked_mean(cos_sim, mask).detach().item()
+        )
+        stats["debug/causal_feedback/soft_mask_teacher_alpha_l1"] = float(
+            self._masked_mean(l1_dist, mask).detach().item()
+        )
+        stats["debug/causal_feedback/soft_mask_teacher_active"] = 1.0
+        interval = int(self.soft_mask_teacher_neg_control_interval)
+        if interval > 0 and forward_step % interval == 0 and len(instructions) > 1:
+            shuffled = instructions[1:] + instructions[:1]
+            shuffled_dist, _, shuffled_stats = self._compute_soft_mask_teacher_distribution(
+                instructions=shuffled,
+                vision_tokens_raw=vision_tokens_raw,
+                token_n=token_n,
+            )
+            stats["debug/causal_feedback/soft_mask_teacher_neg_control_active"] = 1.0
+            if isinstance(shuffled_dist, torch.Tensor) and shuffled_dist.shape == teacher.shape:
+                mix = 0.5 * (teacher + shuffled_dist)
+                kl_p_m = torch.sum(
+                    teacher * (torch.log(teacher.clamp_min(1e-9)) - torch.log(mix.clamp_min(1e-9))),
+                    dim=-1,
+                )
+                kl_q_m = torch.sum(
+                    shuffled_dist * (torch.log(shuffled_dist.clamp_min(1e-9)) - torch.log(mix.clamp_min(1e-9))),
+                    dim=-1,
+                )
+                js_div = 0.5 * (kl_p_m + kl_q_m)
+                kl_p_q = torch.sum(
+                    teacher * (torch.log(teacher.clamp_min(1e-9)) - torch.log(shuffled_dist.clamp_min(1e-9))),
+                    dim=-1,
+                )
+                top1_gap = teacher.amax(dim=-1) - shuffled_dist.amax(dim=-1)
+                ent_teacher = -torch.sum(teacher * torch.log(teacher.clamp_min(1e-9)), dim=-1)
+                ent_shuffle = -torch.sum(shuffled_dist * torch.log(shuffled_dist.clamp_min(1e-9)), dim=-1)
+                stats["debug/causal_feedback/soft_mask_teacher_neg_shuffle_kl"] = float(
+                    self._masked_mean(kl_p_q, mask).detach().item()
+                )
+                stats["debug/causal_feedback/soft_mask_teacher_neg_shuffle_js"] = float(
+                    self._masked_mean(js_div, mask).detach().item()
+                )
+                stats["debug/causal_feedback/soft_mask_teacher_neg_top1_gap"] = float(
+                    self._masked_mean(top1_gap, mask).detach().item()
+                )
+                stats["debug/causal_feedback/soft_mask_teacher_neg_entropy_gap"] = float(
+                    self._masked_mean(ent_shuffle - ent_teacher, mask).detach().item()
+                )
+            else:
+                stats["debug/causal_feedback/soft_mask_teacher_neg_control_error"] = 1.0
+                stats.update(
+                    {
+                        k.replace("soft_mask_teacher_", "soft_mask_teacher_neg_"): v
+                        for k, v in shuffled_stats.items()
+                        if isinstance(k, str) and isinstance(v, (int, float))
+                    }
+                )
+        return loss_kl, stats
 
     @staticmethod
     def _set_module_use_cache(module, use_cache: bool, module_name: str):
@@ -579,6 +965,8 @@ class MapAnythingLlava3D_PI(baseframework):
             else 0.0,
             "debug/causal_feedback/soft_mask_directed_self_scale": float(self.soft_mask_directed_self_scale),
         }
+        self._patha_last_soft_mask_alpha = None
+        self._patha_last_soft_mask_token_num = 0
         if not self.soft_mask_enabled:
             return None, stats
         if not (
@@ -903,6 +1291,8 @@ class MapAnythingLlava3D_PI(baseframework):
                 self._patha_prev_soft_mask_mean = curr_mean.detach().cpu()
             except Exception:
                 stats["debug/causal_feedback/soft_mask_cos_prev_error"] = 1.0
+        self._patha_last_soft_mask_alpha = alpha
+        self._patha_last_soft_mask_token_num = int(token_n)
         return alpha, stats
 
     def _pool_task_tokens_with_action_context(
@@ -1480,6 +1870,10 @@ class MapAnythingLlava3D_PI(baseframework):
     ) -> Tuple:
         self._debug_last_feedback_tokens_for_grad = None
         self._debug_last_task_tokens_for_grad = None
+        self._patha_last_soft_mask_alpha = None
+        self._patha_last_soft_mask_token_num = 0
+        self._soft_mask_teacher_forward_step += 1
+        soft_mask_teacher_step = int(self._soft_mask_teacher_forward_step)
         feedback_ablation_mode = self._resolve_feedback_ablation_mode(
             kwargs.get("feedback_ablation_mode", "none")
         )
@@ -1549,6 +1943,7 @@ class MapAnythingLlava3D_PI(baseframework):
         geometric_tokens = None
         geometric_tokens_next = None
         vision_tokens = None
+        vision_tokens_raw = None
         vision_tokens_next = None
         language_queries = None
         language_query_mask = None
@@ -1591,6 +1986,9 @@ class MapAnythingLlava3D_PI(baseframework):
             vis_out = getattr(vlm_outputs, "vision_hidden_states", None)
             if isinstance(vis_out, torch.Tensor):
                 vision_tokens = vis_out.to(device=base_hidden.device, dtype=base_hidden.dtype)
+            vis_raw_out = getattr(vlm_outputs, "vision_hidden_states_raw", None)
+            if isinstance(vis_raw_out, torch.Tensor):
+                vision_tokens_raw = vis_raw_out.to(device=base_hidden.device, dtype=base_hidden.dtype)
             lang_q_out = getattr(vlm_outputs, "language_queries", None)
             if isinstance(lang_q_out, torch.Tensor):
                 language_queries = lang_q_out.to(device=base_hidden.device, dtype=base_hidden.dtype)
@@ -1624,6 +2022,10 @@ class MapAnythingLlava3D_PI(baseframework):
                     vis_cached = getattr(vlm_core, "_last_vision_features", None)
                     if isinstance(vis_cached, torch.Tensor):
                         vision_tokens = vis_cached.to(device=base_hidden.device, dtype=base_hidden.dtype)
+                if vision_tokens_raw is None:
+                    vis_raw_cached = getattr(vlm_core, "_last_vision_features_raw", None)
+                    if isinstance(vis_raw_cached, torch.Tensor):
+                        vision_tokens_raw = vis_raw_cached.to(device=base_hidden.device, dtype=base_hidden.dtype)
                 if language_queries is None:
                     lang_q_cached = getattr(vlm_core, "_last_language_queries", None)
                     if isinstance(lang_q_cached, torch.Tensor):
@@ -1910,6 +2312,9 @@ class MapAnythingLlava3D_PI(baseframework):
             debug_metrics["debug/temporal/vision_tokens_available"] = float(
                 isinstance(vision_tokens, torch.Tensor)
             )
+            debug_metrics["debug/temporal/vision_tokens_raw_available"] = float(
+                isinstance(vision_tokens_raw, torch.Tensor)
+            )
             debug_metrics["debug/temporal/language_queries_available"] = float(
                 isinstance(language_queries, torch.Tensor)
             )
@@ -1969,6 +2374,9 @@ class MapAnythingLlava3D_PI(baseframework):
             vision_tokens_repeated = None
             if isinstance(vision_tokens, torch.Tensor):
                 vision_tokens_repeated = vision_tokens.repeat(repeated_diffusion_steps, 1, 1)
+            vision_tokens_raw_repeated = None
+            if isinstance(vision_tokens_raw, torch.Tensor):
+                vision_tokens_raw_repeated = vision_tokens_raw.repeat(repeated_diffusion_steps, 1, 1)
             language_queries_repeated = None
             if isinstance(language_queries, torch.Tensor):
                 language_queries_repeated = language_queries.repeat(repeated_diffusion_steps, 1, 1)
@@ -2008,6 +2416,8 @@ class MapAnythingLlava3D_PI(baseframework):
             feedback_stats = {}
             feedback_aux_loss = None
             feedback_aux_stats = {}
+            soft_mask_teacher_loss = None
+            soft_mask_teacher_stats = {}
             debug_metrics["debug/causal_feedback/ablation_mode_none"] = (
                 1.0 if feedback_ablation_mode == "none" else 0.0
             )
@@ -2078,6 +2488,14 @@ class MapAnythingLlava3D_PI(baseframework):
                     residual_target=residual_target_repeated,
                 )
                 debug_metrics.update(feedback_aux_stats)
+            instructions_repeated = instructions * repeated_diffusion_steps
+            soft_mask_teacher_loss, soft_mask_teacher_stats = self._compute_soft_mask_teacher_loss(
+                alpha_pred=self._patha_last_soft_mask_alpha,
+                instructions=instructions_repeated,
+                vision_tokens_raw=vision_tokens_raw_repeated,
+                forward_step=soft_mask_teacher_step,
+            )
+            debug_metrics.update(soft_mask_teacher_stats)
 
             state_repeated = None
             if state is not None:
@@ -2118,6 +2536,15 @@ class MapAnythingLlava3D_PI(baseframework):
                 else:
                     debug_metrics["debug/causal_feedback/loss_fb_weighted"] = 0.0
                     debug_metrics["debug/causal_feedback/action_loss_total"] = float(action_loss.detach().item())
+            if isinstance(soft_mask_teacher_loss, torch.Tensor):
+                weighted_teacher = float(self.soft_mask_teacher_weight) * soft_mask_teacher_loss
+                debug_metrics["debug/causal_feedback/soft_mask_teacher_loss_weighted"] = float(
+                    weighted_teacher.detach().item()
+                )
+                action_loss = action_loss + weighted_teacher
+                debug_metrics["debug/causal_feedback/action_loss_total"] = float(action_loss.detach().item())
+            else:
+                debug_metrics["debug/causal_feedback/soft_mask_teacher_loss_weighted"] = 0.0
             try:
                 layer_means = getattr(self.action_model, "_last_dit_layer_means", None)
                 layer_vars = getattr(self.action_model, "_last_dit_layer_vars", None)

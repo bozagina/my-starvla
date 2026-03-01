@@ -32,6 +32,7 @@ class MapAnythingLlava3DOutput(ModelOutput):
     task_hidden_states: Optional[torch.FloatTensor] = None
     geometric_hidden_states: Optional[torch.FloatTensor] = None
     vision_hidden_states: Optional[torch.FloatTensor] = None
+    vision_hidden_states_raw: Optional[torch.FloatTensor] = None
     language_queries: Optional[torch.FloatTensor] = None
     language_query_mask: Optional[torch.Tensor] = None
 
@@ -198,6 +199,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
         self.fusion_version = fusion_version
         self._last_geometric_projected: Optional[torch.Tensor] = None
         self._last_vision_features: Optional[torch.Tensor] = None
+        self._last_vision_features_raw: Optional[torch.Tensor] = None
         self._last_fused_features: Optional[torch.Tensor] = None
         self._last_image_features: Optional[torch.Tensor] = None
         self._last_task_tokens: Optional[torch.Tensor] = None
@@ -565,6 +567,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
             vision_feats = vision_outputs.last_hidden_state
             if getattr(self, "geom_feature_hook_enabled", False):
                 self._record_geom_stats("vision_raw", vision_feats)
+        vision_feats_raw = vision_feats
 
         if vision_feats is not None and vision_feats.shape[-1] != self.hidden_size:
             vision_feats = self.vision_projector(vision_feats)
@@ -573,8 +576,11 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
         self._record_health("vision_feats", vision_feats)
         if multi_view and vision_feats is not None:
             vision_feats = vision_feats.view(b, v * vision_feats.shape[1], vision_feats.shape[2])
+        if multi_view and vision_feats_raw is not None:
+            vision_feats_raw = vision_feats_raw.view(b, v * vision_feats_raw.shape[1], vision_feats_raw.shape[2])
         self._maybe_log_tensor_shape("vision_feats", vision_feats)
         self._last_vision_features = vision_feats
+        self._last_vision_features_raw = vision_feats_raw
         self._last_geometric_projected = None
         self._last_fused_features = None
 
@@ -815,6 +821,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
                 task_hidden_states=outputs.task_hidden_states,
                 geometric_hidden_states=outputs.geometric_hidden_states,
                 vision_hidden_states=outputs.vision_hidden_states,
+                vision_hidden_states_raw=outputs.vision_hidden_states_raw,
                 language_queries=outputs.language_queries,
                 language_query_mask=outputs.language_query_mask,
             )
@@ -880,6 +887,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
             task_hidden_states=task_tokens if pixel_values is not None else None,
             geometric_hidden_states=self._last_geometric_projected if pixel_values is not None else None,
             vision_hidden_states=self._last_vision_features if pixel_values is not None else None,
+            vision_hidden_states_raw=self._last_vision_features_raw if pixel_values is not None else None,
             language_queries=self._last_language_queries if pixel_values is not None else None,
             language_query_mask=self._last_language_query_mask if pixel_values is not None else None,
         )
@@ -1087,6 +1095,7 @@ class MapAnythingLlava3DForConditionalGeneration(MapAnythingLlava3DPreTrainedMod
             task_hidden_states=task_tokens if pixel_values is not None else None,
             geometric_hidden_states=self._last_geometric_projected if pixel_values is not None else None,
             vision_hidden_states=self._last_vision_features if pixel_values is not None else None,
+            vision_hidden_states_raw=self._last_vision_features_raw if pixel_values is not None else None,
             language_queries=self._last_language_queries if pixel_values is not None else None,
             language_query_mask=self._last_language_query_mask if pixel_values is not None else None,
         )

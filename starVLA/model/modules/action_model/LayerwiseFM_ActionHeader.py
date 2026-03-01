@@ -420,6 +420,46 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         default=1.0,
         metadata={"help": "Extra scale factor for directed self-attn token-token logits."},
     )
+    soft_mask_teacher_enabled: bool = field(
+        default=False,
+        metadata={"help": "Enable SigLIP/CLIP-style teacher supervision for soft mask."},
+    )
+    soft_mask_teacher_type: str = field(
+        default="siglip_retrieval",
+        metadata={"help": "Teacher type for soft-mask supervision. Currently supports: siglip_retrieval."},
+    )
+    soft_mask_teacher_model_name_or_path: str = field(
+        default="",
+        metadata={"help": "Optional override path for teacher model/tokenizer. Empty means using VLM vision model path."},
+    )
+    soft_mask_teacher_weight: float = field(
+        default=0.0,
+        metadata={"help": "Weight for teacher KL loss on soft mask."},
+    )
+    soft_mask_teacher_temperature: float = field(
+        default=0.07,
+        metadata={"help": "Temperature for teacher retrieval logits."},
+    )
+    soft_mask_teacher_label_smoothing: float = field(
+        default=0.0,
+        metadata={"help": "Label smoothing epsilon applied to teacher distribution."},
+    )
+    soft_mask_teacher_confidence_floor: float = field(
+        default=0.0,
+        metadata={"help": "Ignore teacher supervision for samples with top1 confidence below this threshold."},
+    )
+    soft_mask_teacher_start_step: int = field(
+        default=0,
+        metadata={"help": "Start step (framework forward step) for enabling teacher supervision."},
+    )
+    soft_mask_teacher_stop_step: int = field(
+        default=-1,
+        metadata={"help": "Stop step (inclusive). Negative means never stop."},
+    )
+    soft_mask_teacher_neg_control_interval: int = field(
+        default=50,
+        metadata={"help": "Run shuffled-text negative-control every N forward steps. <=0 disables it."},
+    )
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
