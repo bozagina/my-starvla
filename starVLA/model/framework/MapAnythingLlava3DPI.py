@@ -924,6 +924,48 @@ class MapAnythingLlava3D_PI(baseframework):
             self._patha_soft_mask_ema = cached.detach()
         return self._patha_soft_mask_ema.to(device=alpha.device, dtype=alpha.dtype)
 
+    @staticmethod
+    def _resample_tokens_for_alignment(
+        tokens: torch.Tensor,
+        target_len: int,
+    ) -> Tuple[torch.Tensor, bool]:
+        if not isinstance(tokens, torch.Tensor) or tokens.ndim != 3:
+            return tokens, False
+        src_len = int(tokens.shape[1])
+        target_len = int(max(0, target_len))
+        if target_len == src_len:
+            return tokens, False
+        if target_len <= 0:
+            return tokens[:, :0, :], bool(src_len > 0)
+        if src_len <= 0:
+            return tokens[:, :0, :], False
+        if target_len == 1:
+            index = torch.tensor([max(src_len // 2, 0)], device=tokens.device, dtype=torch.long)
+            return tokens.index_select(1, index), True
+        if target_len < src_len:
+            # Keep full-sequence spatial coverage by selecting evenly spaced tokens
+            # instead of prefix truncation.
+            index_f = torch.linspace(
+                0.0,
+                float(src_len),
+                steps=target_len + 1,
+                device=tokens.device,
+                dtype=torch.float32,
+            )[:-1]
+            index = torch.floor(index_f).to(dtype=torch.long).clamp_(0, src_len - 1)
+            index[-1] = src_len - 1
+            return tokens.index_select(1, index), True
+        # Rare fallback path when requested target exceeds source length.
+        index_f = torch.linspace(
+            0.0,
+            float(src_len - 1),
+            steps=target_len,
+            device=tokens.device,
+            dtype=torch.float32,
+        )
+        index = torch.round(index_f).to(dtype=torch.long).clamp_(0, src_len - 1)
+        return tokens.index_select(1, index), True
+
     def _build_soft_mask(
         self,
         *,
@@ -986,12 +1028,21 @@ class MapAnythingLlava3D_PI(baseframework):
             stats["debug/causal_feedback/soft_mask_hidden_mismatch"] = 1.0
             return None, stats
         bsz = int(vision_tokens.shape[0])
-        token_n = int(min(vision_tokens.shape[1], geometric_tokens.shape[1]))
+        vision_src_n = int(vision_tokens.shape[1])
+        geometric_src_n = int(geometric_tokens.shape[1])
+        token_n = int(min(vision_src_n, geometric_src_n))
+        stats["debug/causal_feedback/soft_mask_token_num_vis_src"] = float(vision_src_n)
+        stats["debug/causal_feedback/soft_mask_token_num_geo_src"] = float(geometric_src_n)
+        stats["debug/causal_feedback/soft_mask_token_num_mismatch"] = 1.0 if vision_src_n != geometric_src_n else 0.0
         if token_n <= 0:
             stats["debug/causal_feedback/soft_mask_empty_tokens"] = 1.0
             return None, stats
-        vision_tokens = vision_tokens[:, :token_n, :]
-        geometric_tokens = geometric_tokens[:, :token_n, :]
+        vision_tokens, vision_resampled = self._resample_tokens_for_alignment(vision_tokens, token_n)
+        geometric_tokens, geo_resampled = self._resample_tokens_for_alignment(geometric_tokens, token_n)
+        stats["debug/causal_feedback/soft_mask_token_truncated_vis"] = float(max(vision_src_n - token_n, 0))
+        stats["debug/causal_feedback/soft_mask_token_truncated_geo"] = float(max(geometric_src_n - token_n, 0))
+        stats["debug/causal_feedback/soft_mask_token_align_resampled_vis"] = 1.0 if vision_resampled else 0.0
+        stats["debug/causal_feedback/soft_mask_token_align_resampled_geo"] = 1.0 if geo_resampled else 0.0
 
         dtype = language_queries.dtype
         device = language_queries.device
@@ -1563,9 +1614,52 @@ class MapAnythingLlava3D_PI(baseframework):
                     and vision_tokens.shape[2] == hidden
                 ):
                     token_n = min(token_n, int(vision_tokens.shape[1]))
+                stats["debug/causal_feedback/residual_token_num_geo_src"] = float(geometric_tokens.shape[1])
+                stats["debug/causal_feedback/residual_token_num_geo_next_src"] = float(
+                    geometric_tokens_next.shape[1]
+                )
+                if isinstance(vision_tokens, torch.Tensor) and vision_tokens.ndim == 3:
+                    stats["debug/causal_feedback/residual_token_num_vis_src"] = float(vision_tokens.shape[1])
                 if token_n > 0:
-                    geo_before = geometric_tokens[:, :token_n, :].to(device=task_tokens.device, dtype=module_dtype)
-                    geo_after = geometric_tokens_next[:, :token_n, :].to(device=task_tokens.device, dtype=module_dtype)
+                    stats["debug/causal_feedback/residual_token_align_range_resample"] = 1.0
+                    geo_before, geo_before_resampled = self._resample_tokens_for_alignment(
+                        geometric_tokens, token_n
+                    )
+                    geo_after, geo_after_resampled = self._resample_tokens_for_alignment(
+                        geometric_tokens_next, token_n
+                    )
+                    vision_for_soft_mask = None
+                    vision_resampled = False
+                    if (
+                        isinstance(vision_tokens, torch.Tensor)
+                        and vision_tokens.ndim == 3
+                        and vision_tokens.shape[0] == batch_size
+                        and vision_tokens.shape[2] == hidden
+                    ):
+                        vision_for_soft_mask, vision_resampled = self._resample_tokens_for_alignment(
+                            vision_tokens, token_n
+                        )
+                    stats["debug/causal_feedback/residual_token_truncated_geo"] = float(
+                        max(int(geometric_tokens.shape[1]) - token_n, 0)
+                    )
+                    stats["debug/causal_feedback/residual_token_truncated_geo_next"] = float(
+                        max(int(geometric_tokens_next.shape[1]) - token_n, 0)
+                    )
+                    if isinstance(vision_tokens, torch.Tensor) and vision_tokens.ndim == 3:
+                        stats["debug/causal_feedback/residual_token_truncated_vis"] = float(
+                            max(int(vision_tokens.shape[1]) - token_n, 0)
+                        )
+                    stats["debug/causal_feedback/residual_token_align_resampled_geo"] = (
+                        1.0 if geo_before_resampled else 0.0
+                    )
+                    stats["debug/causal_feedback/residual_token_align_resampled_geo_next"] = (
+                        1.0 if geo_after_resampled else 0.0
+                    )
+                    stats["debug/causal_feedback/residual_token_align_resampled_vis"] = (
+                        1.0 if vision_resampled else 0.0
+                    )
+                    geo_before = geo_before.to(device=task_tokens.device, dtype=module_dtype)
+                    geo_after = geo_after.to(device=task_tokens.device, dtype=module_dtype)
                     delta_tokens = geo_after - geo_before
                     if self.causal_feedback_detach_delta:
                         delta_tokens = delta_tokens.detach()
@@ -1579,9 +1673,7 @@ class MapAnythingLlava3D_PI(baseframework):
                         )
                     else:
                         alpha, soft_stats = self._build_soft_mask(
-                            vision_tokens=vision_tokens[:, :token_n, :]
-                            if isinstance(vision_tokens, torch.Tensor) and vision_tokens.ndim == 3
-                            else None,
+                            vision_tokens=vision_for_soft_mask,
                             geometric_tokens=geo_before,
                             language_queries=language_queries,
                             language_query_mask=language_query_mask,
