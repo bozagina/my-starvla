@@ -563,3 +563,95 @@
 
 并维持 action 注入路径一致（`v4-1` 不变）。  
 这样可以把“residual 构造改动”的收益与风险单独归因，不和模块3改动混淆。
+
+---
+
+## 10. 最新补充：m_clip teacher 监督（ALG1-MASK-20260301-002-OC）
+
+> 截至 **2026-03-01**，代码已加入 `m_clip` soft label 监督链路（默认可关），用于提升 `directed_self_cross` soft mask 的可辨识度。
+
+### 10.1 设计动机
+
+当前 `alpha` 来自语言 hidden 与 token 的内部注意力，存在“可训练但对区域不够尖锐”的风险。  
+引入 SigLIP/CLIP 检索空间 teacher，目标是给 `alpha` 提供一个外部 soft label 参考分布：
+
+- `m_clip[j] = softmax(cos(t_emb, p_emb[j]) / temperature)`
+- 以 `KL(m_clip || alpha_pred)` 约束 `alpha_pred`
+
+其中：
+
+- `t_emb`：指令文本 embedding（SigLIP text encoder）
+- `p_emb[j]`：第 `j` 个 vision patch embedding（来自 `vision_hidden_states_raw`）
+
+### 10.2 实现要点（已落地）
+
+实现位置：
+
+- `/Users/bazinga/code/my-starvla/starVLA/model/framework/MapAnythingLlava3DPI.py`
+- `/Users/bazinga/code/my-starvla/starVLA/mapanything_llava3d/model/modeling_mapanything_llava3d_vlm.py`
+- `/Users/bazinga/code/my-starvla/starVLA/model/modules/action_model/LayerwiseFM_ActionHeader.py`
+
+核心流程：
+
+1. 由 teacher 生成 `teacher_dist (=m_clip)`，形状对齐 `alpha_pred`（`[B,N]`）。
+2. 可选平滑：`teacher = (1-s)*teacher + s/N`（`label_smoothing=s`）。
+3. 计算置信度：`confidence = max_j teacher[j]`。
+4. 门控样本权重：`sample_weight = 1(confidence >= confidence_floor)`。
+5. 监督项：`L_teacher = masked_mean(KL(teacher || alpha_pred), sample_weight)`。
+6. 合并主损失：`action_loss += soft_mask_teacher_weight * L_teacher`。
+7. 周期性负对照（shuffle 文本）输出 `neg_shuffle_kl/js/top1_gap/entropy_gap`，用于验证 teacher 是否具有可辨识信号。
+
+### 10.3 配置补充（建议纳入 v4-1-1 口径）
+
+除原有配置外，建议明确新增以下项：
+
+- `soft_mask_generator: directed_self_cross`
+- `patha_residual_mode: token_delta_geo`
+- `soft_mask_teacher_enabled: true|false`
+- `soft_mask_teacher_type: siglip_retrieval`
+- `soft_mask_teacher_model_name_or_path: ""`（可空，按默认源解析）
+- `soft_mask_teacher_weight: 0.02`（推荐起点）
+- `soft_mask_teacher_temperature: 0.07`
+- `soft_mask_teacher_label_smoothing: 0.0~0.02`
+- `soft_mask_teacher_confidence_floor: 0.0`（首轮 smoke 推荐；后续再上调）
+- `soft_mask_teacher_start_step: 100`
+- `soft_mask_teacher_stop_step: -1`
+- `soft_mask_teacher_neg_control_interval: 50`
+
+### 10.4 诊断口径（必须新增）
+
+teacher 生效判据（step >= `soft_mask_teacher_start_step`）：
+
+- `debug/causal_feedback/soft_mask_teacher_ready == 1`
+- `debug/causal_feedback/soft_mask_teacher_active == 1`
+- `debug/causal_feedback/soft_mask_teacher_sample_weight_mean > 0`
+- `debug/causal_feedback/soft_mask_teacher_kl > 0`
+- `debug/causal_feedback/soft_mask_teacher_loss_weighted > 0`
+
+teacher 可信度判据（负对照）：
+
+- `debug/causal_feedback/soft_mask_teacher_neg_shuffle_kl > 0`
+- `debug/causal_feedback/soft_mask_teacher_neg_top1_gap > 0`
+- `debug/causal_feedback/soft_mask_teacher_neg_entropy_gap > 0`
+
+已观测案例（2026-03-01，run: `...133009__ALG1-MASK-20260301-002-OC`）：
+
+- `teacher_ready=1`、`teacher_active=1`
+- 但 `confidence_mean≈0.0045~0.005`，低于 `confidence_floor=0.02`
+- 导致 `sample_weight_mean=0`、`teacher_kl=0`、`teacher_loss_weighted=0`
+
+结论：代码链路已接通，但该次运行里 teacher 因门控阈值过高被“静默关闭”。
+
+### 10.5 验证工具与最小流程
+
+验证脚本：
+
+- `/Users/bazinga/code/my-starvla/tools/handoff/validate_mclip_reliability.py`
+
+最小验证流程：
+
+1. 先在训练配置中将 `soft_mask_teacher_confidence_floor` 设为 `0.0`（或 `0.002`）。
+2. 运行 200~500 step smoke。
+3. 执行：
+   `python /Users/bazinga/code/my-starvla/tools/handoff/validate_mclip_reliability.py --metrics-jsonl <RUN_DIR>/metrics.jsonl --min-step 120 --tail 200 --require-neg-control --strict`
+4. 确认 teacher loss 与负对照指标均为非零，再进入长跑。

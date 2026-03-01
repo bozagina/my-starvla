@@ -1002,10 +1002,6 @@ class MapAnythingLlava3D_PI(baseframework):
         q = language_queries.to(dtype=dtype)
         v = vision_tokens.to(device=device, dtype=dtype)
         g = geometric_tokens.to(device=device, dtype=dtype)
-        if self.soft_mask_score_norm == "l2_only":
-            q = F.normalize(q, dim=-1)
-            v = F.normalize(v, dim=-1)
-            g = F.normalize(g, dim=-1)
 
         query_mask = None
         if isinstance(language_query_mask, torch.Tensor):
@@ -1045,6 +1041,13 @@ class MapAnythingLlava3D_PI(baseframework):
         qh = _to_heads(q)
         vh = _to_heads(v)
         gh = _to_heads(g)
+        if self.soft_mask_score_norm == "l2_only":
+            # Normalize per head (not on the full hidden vector before splitting).
+            # Full-vector L2 followed by head split shrinks each head norm by ~1/sqrt(num_heads),
+            # which effectively flattens logits and hurts mask selectivity.
+            qh = F.normalize(qh.float(), dim=-1).to(dtype=dtype)
+            vh = F.normalize(vh.float(), dim=-1).to(dtype=dtype)
+            gh = F.normalize(gh.float(), dim=-1).to(dtype=dtype)
         if self.soft_mask_score_norm == "sqrt_only":
             scale = logit_scale / max(math.sqrt(float(head_dim)), 1e-6)
         else:
