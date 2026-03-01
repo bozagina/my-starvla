@@ -3,6 +3,8 @@ import argparse
 import importlib.util
 import json
 import math
+import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, Optional, Tuple
@@ -63,7 +65,9 @@ def _inspect_llava_vision_tower(model: MapAnythingLlava3DForConditionalGeneratio
     out["has_base_model"] = True
     out["has_get_vision_tower"] = bool(hasattr(base_model, "get_vision_tower"))
     out["has_encode_images"] = bool(hasattr(base_model, "encode_images"))
-    out["has_mm_projector"] = bool(hasattr(base_model, "mm_projector"))
+    mm_proj, mm_proj_path = _find_mm_projector(base_model)
+    out["has_mm_projector"] = bool(mm_proj is not None)
+    out["mm_projector_attr_path"] = mm_proj_path
     if hasattr(base_model, "get_vision_tower"):
         try:
             vt = base_model.get_vision_tower()
@@ -76,6 +80,27 @@ def _inspect_llava_vision_tower(model: MapAnythingLlava3DForConditionalGeneratio
         except Exception as e:
             out["vision_tower_error"] = str(e)
     return out
+
+
+def _find_mm_projector(base_model) -> Tuple[Optional[torch.nn.Module], Optional[str]]:
+    if base_model is None:
+        return None, None
+    candidates = [
+        (base_model, "base_model"),
+        (getattr(base_model, "model", None), "base_model.model"),
+    ]
+    if hasattr(base_model, "get_model"):
+        try:
+            candidates.append((base_model.get_model(), "base_model.get_model()"))
+        except Exception:
+            pass
+    for obj, prefix in candidates:
+        if obj is None:
+            continue
+        mm_proj = getattr(obj, "mm_projector", None)
+        if mm_proj is not None:
+            return mm_proj, f"{prefix}.mm_projector"
+    return None, None
 
 
 def _reshape_multiview(pixel_values: torch.Tensor) -> Tuple[torch.Tensor, Optional[Tuple[int, int]]]:
@@ -149,9 +174,14 @@ def _encode_llava_vision_tokens_with_local_repo(
     image: Image.Image,
     llava_repo: Path,
     device: torch.device,
+    llava_pretrained_path_override: Optional[str] = None,
 ) -> Tuple[torch.Tensor, Dict[str, object]]:
     info: Dict[str, object] = {"mode": "local_repo_rebuild"}
-    llava_pretrained_path = _resolve_llava_pretrained_path(model)
+    llava_pretrained_path = (
+        llava_pretrained_path_override
+        if isinstance(llava_pretrained_path_override, str) and llava_pretrained_path_override
+        else _resolve_llava_pretrained_path(model)
+    )
     info["llava_pretrained_path"] = llava_pretrained_path
     if llava_pretrained_path is None:
         raise RuntimeError("Cannot resolve llava3d_pretrained_path from current model config.")
@@ -180,9 +210,10 @@ def _encode_llava_vision_tokens_with_local_repo(
     info["raw_vision_feats_shape"] = tuple(feats.shape)
 
     base_model = getattr(getattr(model, "language_model", None), "model", None)
-    if base_model is None or not hasattr(base_model, "mm_projector"):
+    mm_projector, mm_proj_path = _find_mm_projector(base_model)
+    info["mm_projector_attr_path"] = mm_proj_path
+    if mm_projector is None:
         raise RuntimeError("Current language base model does not provide mm_projector.")
-    mm_projector = getattr(base_model, "mm_projector")
     if mm_projector is None:
         raise RuntimeError("mm_projector is None.")
     projector_dtype = None
@@ -196,6 +227,223 @@ def _encode_llava_vision_tokens_with_local_repo(
     info["projected_vision_feats_shape"] = tuple(feats.shape)
     info["projected_hidden"] = int(feats.shape[-1])
     return feats, info
+
+
+def _import_official_llava_modules(llava_repo: Path):
+    if not llava_repo.exists():
+        raise FileNotFoundError(f"LLaVA-3D repo does not exist: {llava_repo}")
+    repo_str = str(llava_repo.resolve())
+    if repo_str not in sys.path:
+        sys.path.insert(0, repo_str)
+
+    loaded_llava = sys.modules.get("llava", None)
+    if loaded_llava is not None:
+        loaded_file = getattr(loaded_llava, "__file__", "") or ""
+        if loaded_file and not loaded_file.startswith(repo_str):
+            drop_keys = [k for k in sys.modules.keys() if k == "llava" or k.startswith("llava.")]
+            for k in drop_keys:
+                sys.modules.pop(k, None)
+
+    from llava.constants import (  # noqa: WPS433
+        DEFAULT_IMAGE_TOKEN,
+        DEFAULT_IM_END_TOKEN,
+        DEFAULT_IM_START_TOKEN,
+        IGNORE_INDEX,
+        IMAGE_TOKEN_INDEX,
+    )
+    from llava.mm_utils import get_model_name_from_path, process_images, tokenizer_image_token  # noqa: WPS433
+    from llava.model.builder import load_pretrained_model  # noqa: WPS433
+
+    return {
+        "DEFAULT_IMAGE_TOKEN": DEFAULT_IMAGE_TOKEN,
+        "DEFAULT_IM_START_TOKEN": DEFAULT_IM_START_TOKEN,
+        "DEFAULT_IM_END_TOKEN": DEFAULT_IM_END_TOKEN,
+        "IGNORE_INDEX": IGNORE_INDEX,
+        "IMAGE_TOKEN_INDEX": IMAGE_TOKEN_INDEX,
+        "get_model_name_from_path": get_model_name_from_path,
+        "process_images": process_images,
+        "tokenizer_image_token": tokenizer_image_token,
+        "load_pretrained_model": load_pretrained_model,
+    }
+
+
+def _build_language_queries_from_hidden(
+    *,
+    hidden_states: torch.Tensor,
+    language_mask: torch.Tensor,
+    select_mode: str,
+    max_tokens: int,
+    topk_tokens: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if hidden_states.ndim != 3 or language_mask.ndim != 2:
+        raise ValueError("hidden_states must be [B,S,H], language_mask must be [B,S]")
+    bsz, seq_len, hidden = hidden_states.shape
+    if language_mask.shape[0] != bsz or language_mask.shape[1] != seq_len:
+        raise ValueError("language_mask shape mismatch")
+
+    max_tokens = max(1, int(max_tokens))
+    topk_tokens = max(1, int(topk_tokens))
+    select_mode = str(select_mode).strip().lower()
+    if select_mode not in ("uniform", "topk_norm", "summary_topk"):
+        select_mode = "summary_topk"
+
+    query_lens = []
+    valid_indices = []
+    for bid in range(bsz):
+        idx = torch.nonzero(language_mask[bid], as_tuple=False).flatten()
+        if idx.numel() == 0:
+            idx = torch.tensor([0], device=hidden_states.device, dtype=torch.long)
+        valid_indices.append(idx)
+        if select_mode == "uniform":
+            query_lens.append(min(max_tokens, int(idx.numel())))
+        else:
+            query_lens.append(min(min(max_tokens, topk_tokens), int(idx.numel())))
+    qlen = max(1, max(query_lens))
+    queries = hidden_states.new_zeros((bsz, qlen, hidden))
+    qmask = torch.zeros((bsz, qlen), dtype=torch.bool, device=hidden_states.device)
+
+    for bid in range(bsz):
+        idx = valid_indices[bid]
+        pool = hidden_states[bid, idx]
+        if select_mode == "uniform":
+            if idx.numel() > qlen:
+                sample_pos = torch.linspace(0, float(idx.numel() - 1), steps=qlen, device=hidden_states.device).long()
+                idx = idx[sample_pos]
+            token_query = hidden_states[bid, idx]
+        elif select_mode == "topk_norm":
+            take_n = min(qlen, int(pool.shape[0]))
+            score = pool.float().norm(dim=-1)
+            sel = torch.topk(score, k=take_n, largest=True).indices
+            token_query = pool.index_select(0, sel)
+        else:
+            take_n = min(qlen, int(pool.shape[0]))
+            summary = pool.float().mean(dim=0, keepdim=True)
+            score = torch.matmul(F.normalize(pool.float(), dim=-1), F.normalize(summary, dim=-1).squeeze(0))
+            sel = torch.topk(score, k=take_n, largest=True).indices
+            token_query = pool.index_select(0, sel)
+        n_take = token_query.shape[0]
+        queries[bid, :n_take] = token_query
+        qmask[bid, :n_take] = True
+    return queries, qmask
+
+
+def _run_official_llava_branch(
+    *,
+    llava_repo: Path,
+    llava_ckpt: Path,
+    image: Image.Image,
+    instruction: str,
+    cot_prompt: Optional[str],
+    device: torch.device,
+    select_mode: str,
+    max_tokens: int,
+    topk_tokens: int,
+) -> Dict[str, object]:
+    mods = _import_official_llava_modules(llava_repo)
+    model_name = mods["get_model_name_from_path"](str(llava_ckpt))
+    tokenizer, llava_model, image_processor, _ = mods["load_pretrained_model"](
+        model_path=str(llava_ckpt),
+        model_base=None,
+        model_name=model_name,
+        device_map="auto" if str(device).startswith("cuda") else str(device),
+        device=str(device),
+        torch_dtype=torch.float16 if str(device).startswith("cuda") else torch.float32,
+    )
+    llava_model.eval()
+
+    mm_use_im_start_end = bool(getattr(llava_model.config, "mm_use_im_start_end", False))
+    image_token = (
+        f"{mods['DEFAULT_IM_START_TOKEN']}{mods['DEFAULT_IMAGE_TOKEN']}{mods['DEFAULT_IM_END_TOKEN']}"
+        if mm_use_im_start_end
+        else mods["DEFAULT_IMAGE_TOKEN"]
+    )
+    prompt_core, _ = _build_prompt_and_span(instruction, cot_prompt)
+    prompt = f"{image_token}\n{prompt_core}"
+
+    input_ids = mods["tokenizer_image_token"](
+        prompt,
+        tokenizer,
+        mods["IMAGE_TOKEN_INDEX"],
+        return_tensors="pt",
+    ).unsqueeze(0).to(device=device)
+    attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=device)
+    labels = input_ids.clone()
+
+    image_tensor = mods["process_images"]([image], image_processor, llava_model.config)
+    if isinstance(image_tensor, list):
+        image_tensor = torch.stack(image_tensor, dim=0)
+    image_tensor = image_tensor.to(device=device, dtype=torch.float16 if str(device).startswith("cuda") else torch.float32)
+
+    with torch.no_grad():
+        (
+            _,
+            position_ids2,
+            attn2,
+            _,
+            inputs_embeds2,
+            labels2,
+        ) = llava_model.prepare_inputs_labels_for_multimodal(
+            input_ids=input_ids,
+            position_ids=None,
+            attention_mask=attention_mask,
+            past_key_values=None,
+            labels=labels,
+            images=image_tensor,
+            depths=None,
+            poses=None,
+            intrinsics=None,
+            lengths=None,
+            clicks=None,
+            image_sizes=[list(image.size)],
+        )
+        out = llava_model(
+            input_ids=None,
+            attention_mask=attn2,
+            position_ids=position_ids2,
+            inputs_embeds=inputs_embeds2,
+            labels=None,
+            use_cache=False,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        hidden_last = out.hidden_states[-1]
+        vis_tokens = llava_model.encode_images(image_tensor)
+
+    if not isinstance(hidden_last, torch.Tensor):
+        raise RuntimeError("Official LLaVA hidden states unavailable.")
+    if not isinstance(vis_tokens, torch.Tensor):
+        raise RuntimeError("Official LLaVA vision tokens unavailable.")
+    if attn2 is None:
+        attn_mask_lang = torch.ones(hidden_last.shape[:2], dtype=torch.bool, device=hidden_last.device)
+    else:
+        attn_mask_lang = attn2.to(device=hidden_last.device, dtype=torch.bool)
+    if labels2 is None:
+        raise RuntimeError("labels2 is None, cannot build language mask for official branch.")
+    ignore_index = int(mods["IGNORE_INDEX"])
+    lang_mask = (labels2.to(device=hidden_last.device) != ignore_index) & attn_mask_lang
+    q_official, qmask_official = _build_language_queries_from_hidden(
+        hidden_states=hidden_last,
+        language_mask=lang_mask,
+        select_mode=select_mode,
+        max_tokens=max_tokens,
+        topk_tokens=topk_tokens,
+    )
+
+    info = {
+        "official_model_name": model_name,
+        "official_mm_use_im_start_end": float(mm_use_im_start_end),
+        "official_prompt_len": float(len(prompt)),
+        "official_hidden_shape": tuple(hidden_last.shape),
+        "official_vis_shape": tuple(vis_tokens.shape),
+        "official_lang_tokens_mean": float(lang_mask.float().sum(dim=1).mean().item()),
+        "official_query_count_mean": float(qmask_official.float().sum(dim=1).mean().item()),
+    }
+    return {
+        "vision_tokens": vis_tokens.to(dtype=torch.float32),
+        "language_queries": q_official.to(dtype=torch.float32),
+        "language_query_mask": qmask_official,
+        "info": info,
+    }
 
 
 def _build_soft_mask(
@@ -350,6 +598,18 @@ def main() -> None:
         default="/Users/bazinga/code/my-starvla/LLaVA-3D",
         help="Path to local cloned LLaVA-3D repo for rebuilding CLIP vision tower path.",
     )
+    parser.add_argument(
+        "--official-llava-ckpt",
+        type=str,
+        default="",
+        help="Path to official LLaVA-3D checkpoint for full language+vision branch comparison.",
+    )
+    parser.add_argument(
+        "--llava-pretrained-path",
+        type=str,
+        default="",
+        help="Optional override path to original LLaVA-3D checkpoint/config (contains mm_vision_tower).",
+    )
     parser.add_argument("--device", type=str, default="cuda", help="Device, e.g. cuda or cpu.")
     parser.add_argument("--output-json", type=str, default="", help="Optional output json path.")
     args = parser.parse_args()
@@ -471,6 +731,7 @@ def main() -> None:
                 image=image,
                 llava_repo=llava_repo,
                 device=device,
+                llava_pretrained_path_override=args.llava_pretrained_path,
             )
             alpha_llava_rebuild, llava_rebuild_stats = _build_soft_mask(
                 vision_tokens=llava_vis_rebuild,
@@ -490,6 +751,44 @@ def main() -> None:
                 result["llava_alt_error"] = str(e)
             else:
                 result["llava_alt_error_rebuild"] = str(e)
+
+    official_ckpt = str(args.official_llava_ckpt).strip()
+    if official_ckpt:
+        try:
+            official_branch = _run_official_llava_branch(
+                llava_repo=Path(args.llava_repo),
+                llava_ckpt=Path(official_ckpt),
+                image=image,
+                instruction=args.instruction,
+                cot_prompt=cot_prompt,
+                device=device,
+                select_mode=str(ma_cfg.get("semantic_query_select_mode", "summary_topk")),
+                max_tokens=int(ma_cfg.get("semantic_query_max_tokens", 8)),
+                topk_tokens=int(ma_cfg.get("semantic_topk_tokens", 8)),
+            )
+            vis_official = official_branch["vision_tokens"].to(device=lang_q.device, dtype=lang_q.dtype)
+            q_official = official_branch["language_queries"].to(device=lang_q.device, dtype=lang_q.dtype)
+            qmask_official = official_branch["language_query_mask"].to(device=lang_q.device)
+
+            geo_for_official = geo
+            if not (isinstance(geo_for_official, torch.Tensor) and geo_for_official.shape[-1] == vis_official.shape[-1]):
+                geo_for_official = vis_official
+
+            alpha_official, official_mask_stats = _build_soft_mask(
+                vision_tokens=vis_official,
+                geometric_tokens=geo_for_official,
+                language_queries=q_official,
+                language_query_mask=qmask_official,
+                **mask_cfg,
+            )
+            result["official_llava_branch_info"] = official_branch["info"]
+            result["official_llava_mask_stats"] = official_mask_stats
+            result["current_vs_official_alpha_diff"] = _compare_alpha(alpha_current, alpha_official)
+        except Exception as e:
+            result["official_llava_branch_info"] = None
+            result["official_llava_mask_stats"] = None
+            result["current_vs_official_alpha_diff"] = None
+            result["official_llava_error"] = str(e)
 
     result["llava_alt_available"] = llava_alt_ok
     print(json.dumps(result, ensure_ascii=False, indent=2))
