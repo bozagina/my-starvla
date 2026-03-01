@@ -8,12 +8,13 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, Optional, Tuple
+import types
 
 import torch
 import torch.nn.functional as F
 import yaml
 from PIL import Image
-from transformers import AutoConfig, AutoImageProcessor, AutoTokenizer
+from transformers import AutoConfig, AutoImageProcessor, AutoModelForCausalLM, AutoTokenizer
 
 from starVLA.mapanything_llava3d.model.modeling_mapanything_llava3d_vlm import (
     MapAnythingLlava3DForConditionalGeneration,
@@ -244,27 +245,70 @@ def _import_official_llava_modules(llava_repo: Path):
             for k in drop_keys:
                 sys.modules.pop(k, None)
 
+    _ensure_torch_scatter_stub()
+
     from llava.constants import (  # noqa: WPS433
         DEFAULT_IMAGE_TOKEN,
+        DEFAULT_IMAGE_PATCH_TOKEN,
         DEFAULT_IM_END_TOKEN,
         DEFAULT_IM_START_TOKEN,
         IGNORE_INDEX,
         IMAGE_TOKEN_INDEX,
     )
-    from llava.mm_utils import get_model_name_from_path, process_images, tokenizer_image_token  # noqa: WPS433
-    from llava.model.builder import load_pretrained_model  # noqa: WPS433
+    from llava.mm_utils import process_images, tokenizer_image_token  # noqa: WPS433
 
     return {
         "DEFAULT_IMAGE_TOKEN": DEFAULT_IMAGE_TOKEN,
+        "DEFAULT_IMAGE_PATCH_TOKEN": DEFAULT_IMAGE_PATCH_TOKEN,
         "DEFAULT_IM_START_TOKEN": DEFAULT_IM_START_TOKEN,
         "DEFAULT_IM_END_TOKEN": DEFAULT_IM_END_TOKEN,
         "IGNORE_INDEX": IGNORE_INDEX,
         "IMAGE_TOKEN_INDEX": IMAGE_TOKEN_INDEX,
-        "get_model_name_from_path": get_model_name_from_path,
         "process_images": process_images,
         "tokenizer_image_token": tokenizer_image_token,
-        "load_pretrained_model": load_pretrained_model,
     }
+
+
+def _ensure_torch_scatter_stub() -> None:
+    if "torch_scatter" in sys.modules:
+        return
+    try:
+        import torch_scatter  # noqa: F401,WPS433
+        return
+    except Exception:
+        pass
+
+    stub = types.ModuleType("torch_scatter")
+
+    def scatter_mean(src: torch.Tensor, index: torch.Tensor, dim: int = 0, dim_size: Optional[int] = None):
+        if not isinstance(src, torch.Tensor) or not isinstance(index, torch.Tensor):
+            raise TypeError("scatter_mean expects tensor inputs.")
+        if index.ndim != 1:
+            index = index.reshape(-1)
+        if dim < 0:
+            dim += src.ndim
+        if dim != 0:
+            transposed = src.transpose(0, dim).contiguous()
+            out_t = scatter_mean(transposed, index, dim=0, dim_size=dim_size)
+            return out_t.transpose(0, dim).contiguous()
+        if src.shape[0] != index.shape[0]:
+            raise ValueError(f"scatter_mean shape mismatch: src0={src.shape[0]}, index={index.shape[0]}")
+        if dim_size is None:
+            dim_size = int(index.max().item()) + 1 if index.numel() > 0 else 0
+        out_shape = (dim_size,) + tuple(src.shape[1:])
+        out = torch.zeros(out_shape, device=src.device, dtype=src.dtype)
+        if index.numel() == 0:
+            return out
+        expand_index = index.view(-1, *([1] * (src.ndim - 1))).expand_as(src)
+        out.scatter_add_(0, expand_index, src)
+        cnt = torch.bincount(index, minlength=dim_size).to(device=src.device, dtype=src.dtype).clamp_min(1.0)
+        if src.ndim > 1:
+            cnt = cnt.view(dim_size, *([1] * (src.ndim - 1)))
+        return out / cnt
+
+    stub.scatter_mean = scatter_mean  # type: ignore[attr-defined]
+    stub.__dict__["_is_stub"] = True
+    sys.modules["torch_scatter"] = stub
 
 
 def _build_language_queries_from_hidden(
@@ -340,18 +384,40 @@ def _run_official_llava_branch(
     topk_tokens: int,
 ) -> Dict[str, object]:
     mods = _import_official_llava_modules(llava_repo)
-    model_name = mods["get_model_name_from_path"](str(llava_ckpt))
-    tokenizer, llava_model, image_processor, _ = mods["load_pretrained_model"](
-        model_path=str(llava_ckpt),
-        model_base=None,
-        model_name=model_name,
-        device_map="auto" if str(device).startswith("cuda") else str(device),
-        device=str(device),
+    llava_cfg = AutoConfig.from_pretrained(str(llava_ckpt), trust_remote_code=True)
+    if hasattr(llava_cfg, "mm_video_tower"):
+        setattr(llava_cfg, "mm_video_tower", None)
+    if hasattr(llava_cfg, "video_tower"):
+        setattr(llava_cfg, "video_tower", None)
+
+    tokenizer = AutoTokenizer.from_pretrained(str(llava_ckpt), use_fast=False, trust_remote_code=True)
+    llava_model = AutoModelForCausalLM.from_pretrained(
+        str(llava_ckpt),
+        config=llava_cfg,
+        low_cpu_mem_usage=True,
+        trust_remote_code=True,
         torch_dtype=torch.float16 if str(device).startswith("cuda") else torch.float32,
+        device_map={"": str(device)} if str(device).startswith("cuda") else {"": "cpu"},
     )
     llava_model.eval()
 
     mm_use_im_start_end = bool(getattr(llava_model.config, "mm_use_im_start_end", False))
+    mm_use_im_patch_token = bool(getattr(llava_model.config, "mm_use_im_patch_token", True))
+    if mm_use_im_patch_token:
+        tokenizer.add_tokens([mods["DEFAULT_IMAGE_PATCH_TOKEN"]], special_tokens=True)
+    if mm_use_im_start_end:
+        tokenizer.add_tokens([mods["DEFAULT_IM_START_TOKEN"], mods["DEFAULT_IM_END_TOKEN"]], special_tokens=True)
+    llava_model.resize_token_embeddings(len(tokenizer))
+
+    vision_tower = llava_model.get_vision_tower()
+    if vision_tower is None:
+        raise RuntimeError("Official LLaVA model has no vision_tower.")
+    if hasattr(vision_tower, "is_loaded") and (not vision_tower.is_loaded):
+        vision_tower.load_model(device_map=str(device) if str(device).startswith("cuda") else "cpu")
+    if str(device).startswith("cuda"):
+        vision_tower.to(device=str(device), dtype=torch.float16)
+    image_processor = vision_tower.image_processor
+
     image_token = (
         f"{mods['DEFAULT_IM_START_TOKEN']}{mods['DEFAULT_IMAGE_TOKEN']}{mods['DEFAULT_IM_END_TOKEN']}"
         if mm_use_im_start_end
