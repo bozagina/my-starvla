@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 import argparse
+import importlib.util
 import json
 import math
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 import yaml
 from PIL import Image
-from transformers import AutoImageProcessor, AutoTokenizer
+from transformers import AutoConfig, AutoImageProcessor, AutoTokenizer
 
 from starVLA.mapanything_llava3d.model.modeling_mapanything_llava3d_vlm import (
     MapAnythingLlava3DForConditionalGeneration,
@@ -46,22 +48,31 @@ def _inspect_llava_vision_tower(model: MapAnythingLlava3DForConditionalGeneratio
         "has_base_model": False,
         "has_get_vision_tower": False,
         "has_encode_images": False,
+        "has_mm_projector": False,
         "vision_tower_path": None,
         "vision_tower_is_loaded": None,
+        "llava3d_pretrained_path": None,
     }
-    base_model = getattr(getattr(model, "language_model", None), "model", None)
+    lang_model = getattr(model, "language_model", None)
+    base_model = getattr(lang_model, "model", None)
+    llava_cfg = getattr(lang_model, "config", None)
+    if llava_cfg is not None:
+        out["llava3d_pretrained_path"] = getattr(llava_cfg, "llava3d_pretrained_path", None)
     if base_model is None:
         return out
     out["has_base_model"] = True
     out["has_get_vision_tower"] = bool(hasattr(base_model, "get_vision_tower"))
     out["has_encode_images"] = bool(hasattr(base_model, "encode_images"))
+    out["has_mm_projector"] = bool(hasattr(base_model, "mm_projector"))
     if hasattr(base_model, "get_vision_tower"):
         try:
             vt = base_model.get_vision_tower()
-            vt_path = getattr(vt, "vision_tower", None)
+            vt_path = getattr(vt, "vision_tower", None) if vt is not None else None
             out["vision_tower_path"] = vt_path
-            if hasattr(vt, "is_loaded"):
+            if vt is not None and hasattr(vt, "is_loaded"):
                 out["vision_tower_is_loaded"] = bool(vt.is_loaded)
+            elif vt is None:
+                out["vision_tower_is_loaded"] = False
         except Exception as e:
             out["vision_tower_error"] = str(e)
     return out
@@ -97,6 +108,94 @@ def _encode_llava_vision_tokens(
         b, v = mv_shape
         vision_feats = vision_feats.view(b, v * vision_feats.shape[1], vision_feats.shape[2])
     return vision_feats
+
+
+def _load_clip_vision_tower_class(llava_repo: Path):
+    clip_file = llava_repo / "llava" / "model" / "multimodal_encoder" / "clip_encoder.py"
+    if not clip_file.exists():
+        raise FileNotFoundError(f"Cannot find clip_encoder.py under repo: {clip_file}")
+    spec = importlib.util.spec_from_file_location("llava3d_clip_encoder_local", str(clip_file))
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to create import spec for {clip_file}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    cls = getattr(module, "CLIPVisionTower", None)
+    if cls is None:
+        raise RuntimeError("CLIPVisionTower class not found in local LLaVA-3D clip_encoder.py")
+    return cls
+
+
+def _resolve_llava_pretrained_path(model: MapAnythingLlava3DForConditionalGeneration) -> Optional[str]:
+    candidates = []
+    lang_model = getattr(model, "language_model", None)
+    if lang_model is not None:
+        cfg = getattr(lang_model, "config", None)
+        if cfg is not None:
+            candidates.append(getattr(cfg, "llava3d_pretrained_path", None))
+        base_model = getattr(lang_model, "model", None)
+        if base_model is not None:
+            bcfg = getattr(base_model, "config", None)
+            if bcfg is not None:
+                candidates.append(getattr(bcfg, "llava3d_pretrained_path", None))
+    candidates.append(getattr(model.config, "language_model_name_or_path", None))
+    for c in candidates:
+        if isinstance(c, str) and c:
+            return c
+    return None
+
+
+def _encode_llava_vision_tokens_with_local_repo(
+    model: MapAnythingLlava3DForConditionalGeneration,
+    image: Image.Image,
+    llava_repo: Path,
+    device: torch.device,
+) -> Tuple[torch.Tensor, Dict[str, object]]:
+    info: Dict[str, object] = {"mode": "local_repo_rebuild"}
+    llava_pretrained_path = _resolve_llava_pretrained_path(model)
+    info["llava_pretrained_path"] = llava_pretrained_path
+    if llava_pretrained_path is None:
+        raise RuntimeError("Cannot resolve llava3d_pretrained_path from current model config.")
+
+    llava_cfg = AutoConfig.from_pretrained(llava_pretrained_path, trust_remote_code=True)
+    vision_tower_name = getattr(llava_cfg, "mm_vision_tower", getattr(llava_cfg, "vision_tower", None))
+    info["resolved_vision_tower_name"] = vision_tower_name
+    if not isinstance(vision_tower_name, str) or not vision_tower_name:
+        raise RuntimeError(f"Invalid mm_vision_tower in {llava_pretrained_path}: {vision_tower_name}")
+
+    CLIPVisionTower = _load_clip_vision_tower_class(llava_repo)
+    tower_args = SimpleNamespace(
+        mm_vision_select_layer=int(getattr(llava_cfg, "mm_vision_select_layer", -2)),
+        mm_vision_select_feature=str(getattr(llava_cfg, "mm_vision_select_feature", "patch")),
+        unfreeze_mm_vision_tower=False,
+    )
+    tower = CLIPVisionTower(vision_tower_name, args=tower_args, delay_load=False)
+    tower = tower.to(device=device)
+    tower.eval()
+
+    pixel_values = tower.image_processor.preprocess(images=image, return_tensors="pt")["pixel_values"].to(device=device)
+    with torch.no_grad():
+        feats = tower(pixel_values)
+    if not isinstance(feats, torch.Tensor):
+        raise RuntimeError("Local CLIPVisionTower did not return tensor features.")
+    info["raw_vision_feats_shape"] = tuple(feats.shape)
+
+    base_model = getattr(getattr(model, "language_model", None), "model", None)
+    if base_model is None or not hasattr(base_model, "mm_projector"):
+        raise RuntimeError("Current language base model does not provide mm_projector.")
+    mm_projector = getattr(base_model, "mm_projector")
+    if mm_projector is None:
+        raise RuntimeError("mm_projector is None.")
+    projector_dtype = None
+    try:
+        projector_dtype = next(mm_projector.parameters()).dtype
+    except StopIteration:
+        projector_dtype = feats.dtype
+    with torch.no_grad():
+        feats = mm_projector(feats.to(dtype=projector_dtype))
+    feats = feats.to(dtype=torch.float32)
+    info["projected_vision_feats_shape"] = tuple(feats.shape)
+    info["projected_hidden"] = int(feats.shape[-1])
+    return feats, info
 
 
 def _build_soft_mask(
@@ -245,6 +344,12 @@ def main() -> None:
     parser.add_argument("--run-config", type=str, required=True, help="Path to training yaml config.")
     parser.add_argument("--image", type=str, required=True, help="Path to a test RGB image.")
     parser.add_argument("--instruction", type=str, required=True, help="Raw instruction text (without CoT template).")
+    parser.add_argument(
+        "--llava-repo",
+        type=str,
+        default="/Users/bazinga/code/my-starvla/LLaVA-3D",
+        help="Path to local cloned LLaVA-3D repo for rebuilding CLIP vision tower path.",
+    )
     parser.add_argument("--device", type=str, default="cuda", help="Device, e.g. cuda or cpu.")
     parser.add_argument("--output-json", type=str, default="", help="Optional output json path.")
     args = parser.parse_args()
@@ -357,6 +462,34 @@ def main() -> None:
         result["llava_vision_mask_stats"] = None
         result["current_vs_llava_alpha_diff"] = None
         result["llava_alt_error"] = str(e)
+
+    if not llava_alt_ok:
+        try:
+            llava_repo = Path(args.llava_repo)
+            llava_vis_rebuild, rebuild_info = _encode_llava_vision_tokens_with_local_repo(
+                model=model,
+                image=image,
+                llava_repo=llava_repo,
+                device=device,
+            )
+            alpha_llava_rebuild, llava_rebuild_stats = _build_soft_mask(
+                vision_tokens=llava_vis_rebuild,
+                geometric_tokens=geo,
+                language_queries=lang_q,
+                language_query_mask=lang_q_mask,
+                **mask_cfg,
+            )
+            result["llava_rebuild_info"] = rebuild_info
+            result["llava_vision_mask_stats"] = llava_rebuild_stats
+            result["current_vs_llava_alpha_diff"] = _compare_alpha(alpha_current, alpha_llava_rebuild)
+            result["llava_alt_error"] = None
+            llava_alt_ok = True
+        except Exception as e:
+            result["llava_rebuild_info"] = None
+            if "llava_alt_error" not in result:
+                result["llava_alt_error"] = str(e)
+            else:
+                result["llava_alt_error_rebuild"] = str(e)
 
     result["llava_alt_available"] = llava_alt_ok
     print(json.dumps(result, ensure_ascii=False, indent=2))
