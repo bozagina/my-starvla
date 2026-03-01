@@ -404,6 +404,22 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         default=False,
         metadata={"help": "Apply soft-mask EMA smoothing during training."},
     )
+    soft_mask_generator: str = field(
+        default="similarity",
+        metadata={"help": "Soft-mask generator mode: similarity or directed_self_cross."},
+    )
+    soft_mask_directed_mix: float = field(
+        default=0.5,
+        metadata={"help": "Blend ratio between base cross-attn mask and directed self-attn refined mask."},
+    )
+    soft_mask_directed_causal: bool = field(
+        default=True,
+        metadata={"help": "If true, directed self-attn uses a causal (left-to-right) mask."},
+    )
+    soft_mask_directed_self_scale: float = field(
+        default=1.0,
+        metadata={"help": "Extra scale factor for directed self-attn token-token logits."},
+    )
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)

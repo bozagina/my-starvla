@@ -179,6 +179,27 @@ class MapAnythingLlava3D_PI(baseframework):
         self.soft_mask_use_ema_training = bool(
             getattr(action_cfg, "soft_mask_use_ema_training", False)
         )
+        self.soft_mask_generator = str(
+            getattr(action_cfg, "soft_mask_generator", "similarity")
+        ).strip().lower()
+        if self.soft_mask_generator not in ("similarity", "directed_self_cross"):
+            logger.warning(
+                "[causal_feedback] invalid soft_mask_generator=%s, fallback to similarity",
+                self.soft_mask_generator,
+            )
+            self.soft_mask_generator = "similarity"
+        self.soft_mask_directed_mix = float(
+            getattr(action_cfg, "soft_mask_directed_mix", 0.5)
+        )
+        self.soft_mask_directed_mix = float(max(0.0, min(1.0, self.soft_mask_directed_mix)))
+        self.soft_mask_directed_causal = bool(
+            getattr(action_cfg, "soft_mask_directed_causal", True)
+        )
+        self.soft_mask_directed_self_scale = float(
+            getattr(action_cfg, "soft_mask_directed_self_scale", 1.0)
+        )
+        if self.soft_mask_directed_self_scale <= 0.0:
+            self.soft_mask_directed_self_scale = 1.0
         # Low-frequency stability probe for Path-A residual direction:
         # cosine(mean(delta_t), mean(delta_{t-1})).
         self.causal_feedback_delta_cos_interval = max(
@@ -546,6 +567,17 @@ class MapAnythingLlava3D_PI(baseframework):
             "debug/causal_feedback/soft_mask_score_norm_sqrt_only": 1.0
             if self.soft_mask_score_norm == "sqrt_only"
             else 0.0,
+            "debug/causal_feedback/soft_mask_generator_similarity": 1.0
+            if self.soft_mask_generator == "similarity"
+            else 0.0,
+            "debug/causal_feedback/soft_mask_generator_directed_self_cross": 1.0
+            if self.soft_mask_generator == "directed_self_cross"
+            else 0.0,
+            "debug/causal_feedback/soft_mask_directed_mix": float(self.soft_mask_directed_mix),
+            "debug/causal_feedback/soft_mask_directed_causal": 1.0
+            if self.soft_mask_directed_causal
+            else 0.0,
+            "debug/causal_feedback/soft_mask_directed_self_scale": float(self.soft_mask_directed_self_scale),
         }
         if not self.soft_mask_enabled:
             return None, stats
@@ -634,20 +666,62 @@ class MapAnythingLlava3D_PI(baseframework):
         attn_vis = torch.softmax(logits_vis, dim=-1)
         attn_geo = torch.softmax(logits_geo, dim=-1)
 
-        if self.soft_mask_query_agg == "max":
-            if query_mask is not None:
-                mask_expand = query_mask.unsqueeze(1).unsqueeze(-1)  # [B,1,Lq,1]
-                attn_vis_for_reduce = attn_vis.masked_fill(~mask_expand, 0.0)
-                attn_geo_for_reduce = attn_geo.masked_fill(~mask_expand, 0.0)
-            else:
-                attn_vis_for_reduce = attn_vis
-                attn_geo_for_reduce = attn_geo
-            alpha_vis_head = attn_vis_for_reduce.max(dim=2).values  # [B,h,N]
-            alpha_geo_head = attn_geo_for_reduce.max(dim=2).values
-        else:
+        def _aggregate_query(attn: torch.Tensor) -> torch.Tensor:
+            if self.soft_mask_query_agg == "max":
+                if query_mask is not None:
+                    mask_expand = query_mask.unsqueeze(1).unsqueeze(-1)  # [B,1,Lq,1]
+                    attn_for_reduce = attn.masked_fill(~mask_expand, 0.0)
+                else:
+                    attn_for_reduce = attn
+                return attn_for_reduce.max(dim=2).values  # [B,h,N]
             q_w = query_weight.unsqueeze(1).unsqueeze(-1)  # [B,1,Lq,1]
-            alpha_vis_head = torch.sum(attn_vis * q_w, dim=2)  # [B,h,N]
-            alpha_geo_head = torch.sum(attn_geo * q_w, dim=2)
+            return torch.sum(attn * q_w, dim=2)  # [B,h,N]
+
+        alpha_vis_head = _aggregate_query(attn_vis)
+        alpha_geo_head = _aggregate_query(attn_geo)
+        alpha_vis_head_base = alpha_vis_head
+        alpha_geo_head_base = alpha_geo_head
+
+        logits_vis_used = logits_vis
+        logits_geo_used = logits_geo
+        attn_vis_used = attn_vis
+        attn_geo_used = attn_geo
+        directed_self_attn_vis = None
+        directed_self_attn_geo = None
+        directed_self_scale_effective = 0.0
+        if self.soft_mask_generator == "directed_self_cross":
+            directed_mix = float(max(0.0, min(1.0, self.soft_mask_directed_mix)))
+            self_scale = float(scale) * float(max(self.soft_mask_directed_self_scale, 1e-6))
+            directed_self_scale_effective = float(self_scale)
+
+            def _directed_refine(
+                token_heads: torch.Tensor,
+                alpha_head_base: torch.Tensor,
+            ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                tt_logits = torch.einsum("bhid,bhjd->bhij", token_heads, token_heads) * self_scale
+                if self.soft_mask_directed_causal:
+                    causal_mask = torch.triu(
+                        torch.ones(token_n, token_n, device=tt_logits.device, dtype=torch.bool),
+                        diagonal=1,
+                    )
+                    tt_logits = tt_logits.masked_fill(
+                        causal_mask.view(1, 1, token_n, token_n),
+                        torch.finfo(tt_logits.dtype).min,
+                    )
+                tt_attn = torch.softmax(tt_logits, dim=-1)
+                token_ctx = torch.matmul(tt_attn, token_heads)
+                logits_ctx = torch.einsum("bhqd,bhkd->bhqk", qh, token_ctx) * scale
+                attn_ctx = torch.softmax(logits_ctx, dim=-1)
+                alpha_head_ctx = _aggregate_query(attn_ctx)
+                alpha_head = (1.0 - directed_mix) * alpha_head_base + directed_mix * alpha_head_ctx
+                return alpha_head, logits_ctx, attn_ctx, tt_attn
+
+            alpha_vis_head, logits_vis_used, attn_vis_used, directed_self_attn_vis = _directed_refine(
+                vh, alpha_vis_head
+            )
+            alpha_geo_head, logits_geo_used, attn_geo_used, directed_self_attn_geo = _directed_refine(
+                gh, alpha_geo_head
+            )
 
         if self.soft_mask_head_agg == "max":
             alpha_vis = alpha_vis_head.max(dim=1).values  # [B,N]
@@ -677,13 +751,13 @@ class MapAnythingLlava3D_PI(baseframework):
                 else torch.full((bsz,), float(language_queries.shape[1]), device=device, dtype=torch.float32)
             )
             query_count_mean = float(query_count.mean().item())
-            logits_vis_std_q = logits_vis.detach().float().std(dim=-1, unbiased=False)  # [B,h,Lq]
-            logits_geo_std_q = logits_geo.detach().float().std(dim=-1, unbiased=False)
+            logits_vis_std_q = logits_vis_used.detach().float().std(dim=-1, unbiased=False)  # [B,h,Lq]
+            logits_geo_std_q = logits_geo_used.detach().float().std(dim=-1, unbiased=False)
             logits_vis_rng_q = (
-                logits_vis.detach().float().amax(dim=-1) - logits_vis.detach().float().amin(dim=-1)
+                logits_vis_used.detach().float().amax(dim=-1) - logits_vis_used.detach().float().amin(dim=-1)
             )
             logits_geo_rng_q = (
-                logits_geo.detach().float().amax(dim=-1) - logits_geo.detach().float().amin(dim=-1)
+                logits_geo_used.detach().float().amax(dim=-1) - logits_geo_used.detach().float().amin(dim=-1)
             )
             query_weight_f = query_weight.detach().float()
             logits_vis_std = float(
@@ -699,8 +773,8 @@ class MapAnythingLlava3D_PI(baseframework):
                 ((logits_geo_rng_q * query_weight_f.unsqueeze(1)).sum(dim=-1).mean(dim=1)).mean().item()
             )
 
-            attn_vis_f = attn_vis.detach().float()
-            attn_geo_f = attn_geo.detach().float()
+            attn_vis_f = attn_vis_used.detach().float()
+            attn_geo_f = attn_geo_used.detach().float()
             attn_top1_vis_q = attn_vis_f.amax(dim=-1)  # [B,h,Lq]
             attn_top1_geo_q = attn_geo_f.amax(dim=-1)
             attn_top1_vis_mean = float(
@@ -750,10 +824,38 @@ class MapAnythingLlava3D_PI(baseframework):
                     head_div_geo += float(argmax_geo[bid].unique().numel()) / float(num_heads)
                 head_div_vis /= float(max(bsz, 1))
                 head_div_geo /= float(max(bsz, 1))
+            directed_self_top1_vis = 0.0
+            directed_self_top1_geo = 0.0
+            directed_self_entropy_vis = 0.0
+            directed_self_entropy_geo = 0.0
+            directed_refine_delta_vis = 0.0
+            directed_refine_delta_geo = 0.0
+            if self.soft_mask_generator == "directed_self_cross":
+                directed_refine_delta_vis = float(
+                    (alpha_vis_head.detach().float() - alpha_vis_head_base.detach().float()).abs().mean().item()
+                )
+                directed_refine_delta_geo = float(
+                    (alpha_geo_head.detach().float() - alpha_geo_head_base.detach().float()).abs().mean().item()
+                )
+                if isinstance(directed_self_attn_vis, torch.Tensor):
+                    ds_vis = directed_self_attn_vis.detach().float()
+                    directed_self_top1_vis = float(ds_vis.amax(dim=-1).mean().item())
+                    directed_self_entropy_vis = float(
+                        (-torch.sum(ds_vis * torch.log(ds_vis.clamp_min(1e-9)), dim=-1)).mean().item()
+                    )
+                if isinstance(directed_self_attn_geo, torch.Tensor):
+                    ds_geo = directed_self_attn_geo.detach().float()
+                    directed_self_top1_geo = float(ds_geo.amax(dim=-1).mean().item())
+                    directed_self_entropy_geo = float(
+                        (-torch.sum(ds_geo * torch.log(ds_geo.clamp_min(1e-9)), dim=-1)).mean().item()
+                    )
             stats["debug/causal_feedback/soft_mask_applied"] = 1.0
             stats["debug/causal_feedback/soft_mask_token_num"] = float(token_n)
             stats["debug/causal_feedback/language_query_count_mean"] = query_count_mean
             stats["debug/causal_feedback/soft_mask_logit_scale_effective"] = float(scale)
+            stats["debug/causal_feedback/soft_mask_directed_self_scale_effective"] = float(
+                directed_self_scale_effective
+            )
             stats["debug/causal_feedback/soft_mask_logits_std_vis"] = logits_vis_std
             stats["debug/causal_feedback/soft_mask_logits_std_geo"] = logits_geo_std
             stats["debug/causal_feedback/soft_mask_logits_maxmin_vis"] = logits_vis_rng
@@ -779,6 +881,12 @@ class MapAnythingLlava3D_PI(baseframework):
             )
             stats["debug/causal_feedback/soft_mask_head_diversity_vis"] = float(head_div_vis)
             stats["debug/causal_feedback/soft_mask_head_diversity_geo"] = float(head_div_geo)
+            stats["debug/causal_feedback/soft_mask_directed_self_top1_vis"] = float(directed_self_top1_vis)
+            stats["debug/causal_feedback/soft_mask_directed_self_top1_geo"] = float(directed_self_top1_geo)
+            stats["debug/causal_feedback/soft_mask_directed_self_entropy_vis"] = float(directed_self_entropy_vis)
+            stats["debug/causal_feedback/soft_mask_directed_self_entropy_geo"] = float(directed_self_entropy_geo)
+            stats["debug/causal_feedback/soft_mask_directed_refine_delta_vis"] = float(directed_refine_delta_vis)
+            stats["debug/causal_feedback/soft_mask_directed_refine_delta_geo"] = float(directed_refine_delta_geo)
             try:
                 curr_mean = alpha.detach().float().mean(dim=0)
                 prev_mean = self._patha_prev_soft_mask_mean
