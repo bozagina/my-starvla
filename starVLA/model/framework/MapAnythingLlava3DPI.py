@@ -1255,6 +1255,18 @@ class MapAnythingLlava3D_PI(baseframework):
             alpha_max_post_norm = alpha_post_norm.amax(dim=-1)
             alpha_max_vis = alpha_vis_norm.amax(dim=-1)
             alpha_max_geo = alpha_geo_norm.amax(dim=-1)
+            first_half_mass = alpha_post_norm.new_full((bsz,), 0.5)
+            second_half_mass = alpha_post_norm.new_full((bsz,), 0.5)
+            front_quarter_mass = alpha_post_norm.new_full((bsz,), 0.25)
+            rear_quarter_mass = alpha_post_norm.new_full((bsz,), 0.25)
+            if token_n >= 2:
+                half = max(token_n // 2, 1)
+                first_half_mass = alpha_post_norm[:, :half].sum(dim=-1)
+                second_half_mass = alpha_post_norm[:, half:].sum(dim=-1)
+            if token_n >= 4:
+                quarter = max(token_n // 4, 1)
+                front_quarter_mass = alpha_post_norm[:, :quarter].sum(dim=-1)
+                rear_quarter_mass = alpha_post_norm[:, -quarter:].sum(dim=-1)
             alpha_top1_over_top32 = alpha_topk_vals[:, 0] / topk_mass.clamp_min(1e-9)
             argmax_vis = alpha_vis_head.detach().float().argmax(dim=-1)  # [B,h]
             argmax_geo = alpha_geo_head.detach().float().argmax(dim=-1)
@@ -1318,6 +1330,16 @@ class MapAnythingLlava3D_PI(baseframework):
             stats["debug/causal_feedback/soft_mask_alpha_max_mean"] = float(alpha_max_post_norm.mean().item())
             stats["debug/causal_feedback/soft_mask_alpha_max_mean_vis"] = float(alpha_max_vis.mean().item())
             stats["debug/causal_feedback/soft_mask_alpha_max_mean_geo"] = float(alpha_max_geo.mean().item())
+            stats["debug/causal_feedback/soft_mask_alpha_mass_first_half"] = float(first_half_mass.mean().item())
+            stats["debug/causal_feedback/soft_mask_alpha_mass_second_half"] = float(
+                second_half_mass.mean().item()
+            )
+            stats["debug/causal_feedback/soft_mask_alpha_mass_front_quarter"] = float(
+                front_quarter_mass.mean().item()
+            )
+            stats["debug/causal_feedback/soft_mask_alpha_mass_rear_quarter"] = float(
+                rear_quarter_mass.mean().item()
+            )
             stats["debug/causal_feedback/soft_mask_alpha_top1_over_top32"] = float(
                 alpha_top1_over_top32.mean().item()
             )
