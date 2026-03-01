@@ -5,6 +5,7 @@ import json
 import math
 import os
 import sys
+import traceback
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, Optional, Tuple
@@ -371,6 +372,44 @@ def _build_language_queries_from_hidden(
     return queries, qmask
 
 
+class _ZeroPositionalEncoder:
+    def __init__(self, hidden_size: int):
+        self.hidden_size = int(hidden_size)
+
+    def encode_pe(self, xyz: torch.Tensor) -> torch.Tensor:
+        if not isinstance(xyz, torch.Tensor) or xyz.ndim != 3:
+            raise ValueError("xyz must be a [B, N, 3] tensor.")
+        return xyz.new_zeros((xyz.shape[0], xyz.shape[1], self.hidden_size))
+
+
+class _ZeroPromptEncoder:
+    def __init__(self, hidden_size: int):
+        self.hidden_size = int(hidden_size)
+
+    def __call__(self, clicks: torch.Tensor) -> torch.Tensor:
+        if not isinstance(clicks, torch.Tensor):
+            raise TypeError(f"clicks must be torch.Tensor, got: {type(clicks)}")
+        if clicks.ndim == 1:
+            clicks = clicks.unsqueeze(0)
+        if clicks.ndim != 2:
+            raise ValueError(f"clicks must be [N, D], got: {tuple(clicks.shape)}")
+        return clicks.new_zeros((clicks.shape[0], self.hidden_size))
+
+
+class _DummyVideoTower:
+    def __init__(self, pe_hidden_size: int, prompt_hidden_size: int):
+        self.is_loaded = True
+        self.video_tower = _ZeroPositionalEncoder(pe_hidden_size)
+        self.prompt_encoder = _ZeroPromptEncoder(prompt_hidden_size)
+        self.video_processor = None
+
+    def load_model(self, *args, **kwargs):
+        return None
+
+    def to(self, *args, **kwargs):
+        return self
+
+
 def _run_official_llava_branch(
     *,
     llava_repo: Path,
@@ -400,6 +439,47 @@ def _run_official_llava_branch(
         device_map={"": str(device)} if str(device).startswith("cuda") else {"": "cpu"},
     )
     llava_model.eval()
+
+    patch_info = {
+        "video_tower_missing": False,
+        "injected_dummy_video_tower": False,
+        "dummy_video_pe_hidden_size": None,
+        "dummy_prompt_hidden_size": None,
+        "patched_encode_images": False,
+        "patched_encode_prompts": False,
+    }
+    if hasattr(llava_model, "get_video_tower"):
+        try:
+            vt = llava_model.get_video_tower()
+        except Exception:
+            vt = None
+        if vt is None:
+            patch_info["video_tower_missing"] = True
+            pe_hidden_size = int(getattr(llava_model.config, "mm_hidden_size", 1024))
+            prompt_hidden_size = int(getattr(llava_model.config, "hidden_size", 4096))
+            try:
+                llava_model.get_model().video_tower = _DummyVideoTower(pe_hidden_size, prompt_hidden_size)
+                patch_info["injected_dummy_video_tower"] = True
+                patch_info["dummy_video_pe_hidden_size"] = float(pe_hidden_size)
+                patch_info["dummy_prompt_hidden_size"] = float(prompt_hidden_size)
+            except Exception:
+                patch_info["injected_dummy_video_tower"] = False
+
+            def _encode_images_no_video(self, images):
+                image_features = self.get_model().get_vision_tower()(images)
+                image_features = self.get_model().mm_projector(image_features)
+                return image_features
+
+            def _encode_prompts_no_video(self, clicks):
+                if not isinstance(clicks, torch.Tensor):
+                    raise TypeError(f"clicks must be torch.Tensor, got {type(clicks)}")
+                hidden = int(getattr(self.config, "hidden_size", 4096))
+                return clicks.new_zeros((clicks.shape[0], hidden))
+
+            llava_model.encode_images = types.MethodType(_encode_images_no_video, llava_model)
+            llava_model.encode_prompts = types.MethodType(_encode_prompts_no_video, llava_model)
+            patch_info["patched_encode_images"] = True
+            patch_info["patched_encode_prompts"] = True
 
     mm_use_im_start_end = bool(getattr(llava_model.config, "mm_use_im_start_end", False))
     mm_use_im_patch_token = bool(getattr(llava_model.config, "mm_use_im_patch_token", True))
@@ -495,6 +575,7 @@ def _run_official_llava_branch(
         topk_tokens=topk_tokens,
     )
 
+    model_name = str(getattr(llava_model.config, "_name_or_path", "")) or str(llava_ckpt)
     info = {
         "official_model_name": model_name,
         "official_mm_use_im_start_end": float(mm_use_im_start_end),
@@ -503,6 +584,7 @@ def _run_official_llava_branch(
         "official_vis_shape": tuple(vis_tokens.shape),
         "official_lang_tokens_mean": float(lang_mask.float().sum(dim=1).mean().item()),
         "official_query_count_mean": float(qmask_official.float().sum(dim=1).mean().item()),
+        "official_patch_info": patch_info,
     }
     return {
         "vision_tokens": vis_tokens.to(dtype=torch.float32),
@@ -855,6 +937,7 @@ def main() -> None:
             result["official_llava_mask_stats"] = None
             result["current_vs_official_alpha_diff"] = None
             result["official_llava_error"] = str(e)
+            result["official_llava_error_traceback"] = traceback.format_exc()
 
     result["llava_alt_available"] = llava_alt_ok
     print(json.dumps(result, ensure_ascii=False, indent=2))
