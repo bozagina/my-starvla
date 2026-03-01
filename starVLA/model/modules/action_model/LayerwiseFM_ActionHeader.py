@@ -268,6 +268,34 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         default=False,
         metadata={"help": "If true, compare masked vs uniform-mask feedback in probe (light mode)."},
     )
+    feedback_mask_contrast_enabled: bool = field(
+        default=False,
+        metadata={"help": "Enable masked-vs-unmasked contrast loss for feedback quality supervision."},
+    )
+    feedback_mask_contrast_weight: float = field(
+        default=0.0,
+        metadata={"help": "Weight for masked-vs-unmasked contrast loss term."},
+    )
+    feedback_mask_contrast_margin: float = field(
+        default=0.0,
+        metadata={"help": "Margin in masked-vs-unmasked contrast objective."},
+    )
+    feedback_mask_contrast_beta: float = field(
+        default=40.0,
+        metadata={"help": "Softplus slope for masked-vs-unmasked contrast objective."},
+    )
+    feedback_mask_contrast_start_step: int = field(
+        default=0,
+        metadata={"help": "Start step (delta-action alpha schedule step) for contrast loss activation."},
+    )
+    feedback_mask_contrast_detach_unmasked: bool = field(
+        default=True,
+        metadata={"help": "Detach unmasked branch loss in contrast term to avoid degrading reference branch."},
+    )
+    feedback_mask_contrast_detach_base: bool = field(
+        default=True,
+        metadata={"help": "Detach base velocity when computing contrast branch to focus gradients on feedback path."},
+    )
     feedback_in_context_enabled: bool = field(
         default=True,
         metadata={"help": "If false, do not inject feedback tokens into cross-attention context (keep task_tokens only)."},
@@ -534,6 +562,27 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         )
         self.feedback_probe_compare_unmasked = bool(
             _cfg_get(action_config, "feedback_probe_compare_unmasked", False)
+        )
+        self.feedback_mask_contrast_enabled = bool(
+            _cfg_get(action_config, "feedback_mask_contrast_enabled", False)
+        )
+        self.feedback_mask_contrast_weight = float(
+            max(0.0, float(_cfg_get(action_config, "feedback_mask_contrast_weight", 0.0)))
+        )
+        self.feedback_mask_contrast_margin = float(
+            _cfg_get(action_config, "feedback_mask_contrast_margin", 0.0)
+        )
+        self.feedback_mask_contrast_beta = float(
+            max(1e-6, float(_cfg_get(action_config, "feedback_mask_contrast_beta", 40.0)))
+        )
+        self.feedback_mask_contrast_start_step = int(
+            max(0, int(_cfg_get(action_config, "feedback_mask_contrast_start_step", 0)))
+        )
+        self.feedback_mask_contrast_detach_unmasked = bool(
+            _cfg_get(action_config, "feedback_mask_contrast_detach_unmasked", True)
+        )
+        self.feedback_mask_contrast_detach_base = bool(
+            _cfg_get(action_config, "feedback_mask_contrast_detach_base", True)
         )
         self._feedback_probe_step = 0
         self.feedback_in_context_enabled = bool(
@@ -1937,6 +1986,85 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             except Exception:
                 feedback_probe_metrics["feedback_probe_error"] = 1.0
         feedback_probe_metrics["feedback_probe_step"] = float(self._feedback_probe_step)
+        mask_contrast_metrics: Dict[str, float] = {
+            "feedback_mask_contrast_enabled": 1.0 if self.feedback_mask_contrast_enabled else 0.0,
+            "feedback_mask_contrast_active": 0.0,
+            "feedback_mask_contrast_available": 0.0,
+            "feedback_mask_contrast_weight": float(self.feedback_mask_contrast_weight),
+            "feedback_mask_contrast_margin": float(self.feedback_mask_contrast_margin),
+            "feedback_mask_contrast_beta": float(self.feedback_mask_contrast_beta),
+            "feedback_mask_contrast_start_step": float(self.feedback_mask_contrast_start_step),
+            "feedback_mask_contrast_detach_unmasked": 1.0 if self.feedback_mask_contrast_detach_unmasked else 0.0,
+            "feedback_mask_contrast_detach_base": 1.0 if self.feedback_mask_contrast_detach_base else 0.0,
+            "feedback_mask_contrast_step": float(int(self._feedback_delta_action_schedule_step.item())),
+            "feedback_mask_contrast_loss_masked": 0.0,
+            "feedback_mask_contrast_loss_unmasked": 0.0,
+            "feedback_mask_contrast_loss_unmasked_ref": 0.0,
+            "feedback_mask_contrast_raw_diff": 0.0,
+            "feedback_mask_contrast_margin_term": 0.0,
+            "feedback_mask_contrast_term": 0.0,
+            "feedback_mask_contrast_effective_norm_masked": 0.0,
+            "feedback_mask_contrast_effective_norm_unmasked": 0.0,
+            "feedback_mask_contrast_weighted": 0.0,
+        }
+        mask_contrast_loss = None
+        contrast_step = int(self._feedback_delta_action_schedule_step.item())
+        if self.feedback_mask_contrast_enabled and self.feedback_mask_contrast_weight > 0.0:
+            if not self.training:
+                mask_contrast_metrics["feedback_mask_contrast_skip_not_training"] = 1.0
+            elif self.feedback_in_context_enabled:
+                # Current contrast implementation targets delta-action branch only.
+                mask_contrast_metrics["feedback_mask_contrast_skip_context_enabled"] = 1.0
+            elif not self.feedback_delta_action_enabled:
+                mask_contrast_metrics["feedback_mask_contrast_skip_delta_action_disabled"] = 1.0
+            elif contrast_step < self.feedback_mask_contrast_start_step:
+                mask_contrast_metrics["feedback_mask_contrast_skip_before_start"] = 1.0
+            elif not isinstance(feedback_tokens, torch.Tensor):
+                mask_contrast_metrics["feedback_mask_contrast_skip_missing_masked"] = 1.0
+            elif not isinstance(feedback_tokens_unmasked, torch.Tensor):
+                mask_contrast_metrics["feedback_mask_contrast_skip_missing_unmasked"] = 1.0
+            else:
+                contrast_base = pred_velocity_base.detach() if self.feedback_mask_contrast_detach_base else pred_velocity_base
+                pred_velocity_masked_cmp, delta_action_metrics_masked_cmp, _ = self._apply_feedback_delta_action(
+                    pred_velocity_base=contrast_base,
+                    feedback_tokens=feedback_tokens,
+                    valid_tk_mask=valid_tk_mask,
+                    enable_delta_action=True,
+                )
+                pred_velocity_unmasked_cmp, delta_action_metrics_unmasked_cmp, _ = self._apply_feedback_delta_action(
+                    pred_velocity_base=contrast_base,
+                    feedback_tokens=feedback_tokens_unmasked,
+                    valid_tk_mask=valid_tk_mask,
+                    enable_delta_action=True,
+                )
+                loss_masked_cmp = ((pred_velocity_masked_cmp - velocity.detach()) ** 2).mean()
+                loss_unmasked_cmp = ((pred_velocity_unmasked_cmp - velocity.detach()) ** 2).mean()
+                loss_unmasked_ref = (
+                    loss_unmasked_cmp.detach()
+                    if self.feedback_mask_contrast_detach_unmasked
+                    else loss_unmasked_cmp
+                )
+                margin_term = loss_masked_cmp - loss_unmasked_ref + float(self.feedback_mask_contrast_margin)
+                beta = float(max(self.feedback_mask_contrast_beta, 1e-6))
+                mask_contrast_loss = F.softplus(beta * margin_term) / beta
+                mask_contrast_metrics["feedback_mask_contrast_available"] = 1.0
+                mask_contrast_metrics["feedback_mask_contrast_active"] = 1.0
+                mask_contrast_metrics["feedback_mask_contrast_loss_masked"] = float(loss_masked_cmp.detach().item())
+                mask_contrast_metrics["feedback_mask_contrast_loss_unmasked"] = float(loss_unmasked_cmp.detach().item())
+                mask_contrast_metrics["feedback_mask_contrast_loss_unmasked_ref"] = float(
+                    loss_unmasked_ref.detach().item()
+                )
+                mask_contrast_metrics["feedback_mask_contrast_raw_diff"] = float(
+                    (loss_masked_cmp.detach() - loss_unmasked_cmp.detach()).item()
+                )
+                mask_contrast_metrics["feedback_mask_contrast_margin_term"] = float(margin_term.detach().item())
+                mask_contrast_metrics["feedback_mask_contrast_term"] = float(mask_contrast_loss.detach().item())
+                mask_contrast_metrics["feedback_mask_contrast_effective_norm_masked"] = float(
+                    delta_action_metrics_masked_cmp.get("delta_action_effective_norm_mean", 0.0)
+                )
+                mask_contrast_metrics["feedback_mask_contrast_effective_norm_unmasked"] = float(
+                    delta_action_metrics_unmasked_cmp.get("delta_action_effective_norm_mean", 0.0)
+                )
         loss_dyn = world_guidance["loss_dyn"]
         loss_geo = world_guidance["loss_geo"]
         loss_align = world_guidance.get("loss_align", loss_cfm.new_tensor(0.0))
@@ -1948,6 +2076,10 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             + loss_weights["loss_w_geo"] * loss_geo
             + loss_weights["loss_w_reg"] * loss_reg
         )
+        if isinstance(mask_contrast_loss, torch.Tensor) and self.feedback_mask_contrast_weight > 0.0:
+            weighted_contrast = float(self.feedback_mask_contrast_weight) * mask_contrast_loss
+            total_loss = total_loss + weighted_contrast
+            mask_contrast_metrics["feedback_mask_contrast_weighted"] = float(weighted_contrast.detach().item())
         self._last_loss_breakdown = {
             "loss_cfm": float(loss_cfm.detach().item()),
             "loss_dyn": float(loss_dyn.detach().item()),
@@ -2037,6 +2169,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 self._last_loss_breakdown["drift_norm_p95"] = float(drift_p95)
         self._last_loss_breakdown.update(delta_action_metrics)
         self._last_loss_breakdown.update(feedback_probe_metrics)
+        self._last_loss_breakdown.update(mask_contrast_metrics)
         self._maybe_advance_feedback_alpha_schedule()
         self._maybe_advance_feedback_delta_action_alpha_schedule()
         self._record_health("forward/loss_total", total_loss.unsqueeze(0))

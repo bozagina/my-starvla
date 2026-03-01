@@ -1931,10 +1931,14 @@ class MapAnythingLlava3D_PI(baseframework):
                     seed=feedback_ablation_seed,
                 )
                 debug_metrics.update(feedback_ablation_stats)
-                if (
-                    bool(getattr(self.action_model, "feedback_probe_compare_unmasked", False))
-                    and feedback_ablation_mode == "none"
-                ):
+                need_unmasked_feedback = bool(
+                    getattr(self.action_model, "feedback_probe_compare_unmasked", False)
+                    or getattr(self.action_model, "feedback_mask_contrast_enabled", False)
+                )
+                debug_metrics["debug/causal_feedback/unmasked_feedback_requested"] = (
+                    1.0 if need_unmasked_feedback else 0.0
+                )
+                if need_unmasked_feedback and feedback_ablation_mode == "none":
                     try:
                         feedback_tokens_unmasked_repeated, _, _ = self._build_causal_feedback_tokens(
                             task_tokens=task_tokens_repeated,
@@ -1948,10 +1952,14 @@ class MapAnythingLlava3D_PI(baseframework):
                             language_query_mask=language_query_mask_repeated,
                             force_uniform_mask=True,
                         )
+                        debug_metrics["debug/causal_feedback/unmasked_feedback_available"] = (
+                            1.0 if isinstance(feedback_tokens_unmasked_repeated, torch.Tensor) else 0.0
+                        )
                         debug_metrics["debug/causal_feedback/probe_unmasked_feedback_available"] = (
                             1.0 if isinstance(feedback_tokens_unmasked_repeated, torch.Tensor) else 0.0
                         )
                     except Exception:
+                        debug_metrics["debug/causal_feedback/unmasked_feedback_error"] = 1.0
                         debug_metrics["debug/causal_feedback/probe_unmasked_feedback_error"] = 1.0
                 feedback_aux_loss, feedback_aux_stats = self._compute_causal_feedback_aux_loss(
                     feedback_tokens=feedback_tokens_repeated,
